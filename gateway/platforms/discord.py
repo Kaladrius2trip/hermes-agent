@@ -85,6 +85,22 @@ def _clean_discord_id(entry: str) -> str:
     return entry.strip()
 
 
+def _discord_role_ids(member: Any) -> List[str]:
+    """Return Discord role IDs attached to a guild member-like object."""
+    role_ids: List[str] = []
+    for role in getattr(member, "roles", None) or []:
+        try:
+            is_default = getattr(role, "is_default", None)
+            if callable(is_default) and is_default():
+                continue
+        except Exception:
+            pass
+        role_id = getattr(role, "id", None)
+        if role_id is not None:
+            role_ids.append(str(role_id))
+    return role_ids
+
+
 def check_discord_requirements() -> bool:
     """Check if Discord dependencies are available.
 
@@ -3459,6 +3475,8 @@ class DiscordAdapter(BasePlatformAdapter):
             user_name=interaction.user.display_name,
             thread_id=thread_id,
             chat_topic=chat_topic,
+            guild_id=str(getattr(getattr(interaction, "guild", None), "id", "") or "") or None,
+            user_role_ids=_discord_role_ids(interaction.user),
         )
 
         msg_type = MessageType.COMMAND if text.startswith("/") else MessageType.TEXT
@@ -3541,6 +3559,8 @@ class DiscordAdapter(BasePlatformAdapter):
             user_name=interaction.user.display_name,
             thread_id=thread_id,
             chat_topic=chat_topic,
+            guild_id=str(getattr(getattr(interaction, "guild", None), "id", "") or "") or None,
+            user_role_ids=_discord_role_ids(interaction.user),
         )
 
         _parent_channel = self._thread_parent_channel(getattr(interaction, "channel", None))
@@ -4630,6 +4650,7 @@ class DiscordAdapter(BasePlatformAdapter):
             chat_topic=chat_topic,
             is_bot=getattr(message.author, "bot", False),
             guild_id=str(guild.id) if guild else None,
+            user_role_ids=_discord_role_ids(message.author),
             parent_chat_id=parent_channel_id,
             message_id=str(message.id),
         )

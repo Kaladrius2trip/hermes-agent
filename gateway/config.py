@@ -856,6 +856,18 @@ def load_gateway_config() -> GatewayConfig:
                     bridged["group_allow_from"] = platform_cfg["group_allow_from"]
                 if "group_allow_admin_from" in platform_cfg:
                     bridged["group_allow_admin_from"] = platform_cfg["group_allow_admin_from"]
+                if plat == Platform.DISCORD:
+                    if "allowed_users" in platform_cfg:
+                        bridged["allowed_users"] = platform_cfg["allowed_users"]
+                    if "allowed_roles" in platform_cfg:
+                        bridged["allowed_roles"] = platform_cfg["allowed_roles"]
+                    if "private_context_admin_only" in platform_cfg:
+                        bridged["private_context_admin_only"] = bool(platform_cfg["private_context_admin_only"])
+                    if "private_context_safe_toolsets" in platform_cfg:
+                        val = platform_cfg["private_context_safe_toolsets"]
+                        if isinstance(val, str):
+                            val = [s.strip() for s in val.split(",") if s.strip()]
+                        bridged["private_context_safe_toolsets"] = list(val or [])
                 if "group_user_allowed_commands" in platform_cfg:
                     bridged["group_user_allowed_commands"] = platform_cfg["group_user_allowed_commands"]
                 if plat in {Platform.DISCORD, Platform.SLACK} and "channel_skill_bindings" in platform_cfg:
@@ -954,6 +966,18 @@ def load_gateway_config() -> GatewayConfig:
                     if isinstance(ac, list):
                         ac = ",".join(str(v) for v in ac)
                     os.environ["DISCORD_ALLOWED_CHANNELS"] = str(ac)
+                # allowed_users: Discord user IDs allowed to use the bot/admin-private context.
+                au = discord_cfg.get("allowed_users")
+                if au is not None and not os.getenv("DISCORD_ALLOWED_USERS"):
+                    if isinstance(au, list):
+                        au = ",".join(str(v) for v in au)
+                    os.environ["DISCORD_ALLOWED_USERS"] = str(au)
+                # allowed_roles: Discord role IDs allowed to use the bot (OR with allowed users)
+                ar = discord_cfg.get("allowed_roles")
+                if ar is not None and not os.getenv("DISCORD_ALLOWED_ROLES"):
+                    if isinstance(ar, list):
+                        ar = ",".join(str(v) for v in ar)
+                    os.environ["DISCORD_ALLOWED_ROLES"] = str(ar)
                 # no_thread_channels: channels where bot responds directly without creating thread
                 ntc = discord_cfg.get("no_thread_channels")
                 if ntc is not None and not os.getenv("DISCORD_NO_THREAD_CHANNELS"):
