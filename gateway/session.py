@@ -89,6 +89,7 @@ class SessionSource:
     chat_id_alt: Optional[str] = None  # Signal group internal ID
     is_bot: bool = False  # True when the message author is a bot/webhook (Discord)
     guild_id: Optional[str] = None  # Discord guild / Slack workspace / Matrix server scope
+    user_role_ids: Optional[List[str]] = None  # Discord role IDs observed on the triggering message
     parent_chat_id: Optional[str] = None  # Parent channel when chat_id refers to a thread
     message_id: Optional[str] = None  # ID of the triggering message (for pin/reply/react)
     
@@ -130,6 +131,8 @@ class SessionSource:
             d["chat_id_alt"] = self.chat_id_alt
         if self.guild_id:
             d["guild_id"] = self.guild_id
+        if self.user_role_ids:
+            d["user_role_ids"] = [str(role_id) for role_id in self.user_role_ids]
         if self.parent_chat_id:
             d["parent_chat_id"] = self.parent_chat_id
         if self.message_id:
@@ -150,6 +153,7 @@ class SessionSource:
             user_id_alt=data.get("user_id_alt"),
             chat_id_alt=data.get("chat_id_alt"),
             guild_id=data.get("guild_id"),
+            user_role_ids=[str(role_id) for role_id in data.get("user_role_ids") or []],
             parent_chat_id=data.get("parent_chat_id"),
             message_id=data.get("message_id"),
         )
@@ -263,6 +267,29 @@ def build_session_context_prompt(
         "## Current Session Context",
         "",
     ]
+
+    # Public identity is safe to inject in shared gateway sessions. Keep it
+    # separate from private SOUL.md / agent.system_prompt so Discord privacy
+    # gates can strip owner context without making the bot forget its public
+    # name.
+    try:
+        from hermes_cli.config import cfg_get, load_config
+        _cfg = load_config()
+        public_name = str(cfg_get(_cfg, "agent", "public_name", default="") or "").strip()
+        public_identity_prompt = str(
+            cfg_get(_cfg, "agent", "public_identity_prompt", default="") or ""
+        ).strip()
+    except Exception:
+        public_name = ""
+        public_identity_prompt = ""
+
+    if public_name or public_identity_prompt:
+        lines.append("**Public identity:**")
+        if public_name:
+            lines.append(f"- Your public agent name is {public_name}.")
+        if public_identity_prompt:
+            lines.append(f"- {public_identity_prompt}")
+        lines.append("")
 
     # Source info
     platform_name = context.source.platform.value.title()

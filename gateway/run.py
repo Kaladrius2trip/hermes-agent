@@ -66,6 +66,45 @@ _AGENT_CACHE_IDLE_TTL_SECS = 3600.0  # evict agents idle for >1h
 _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
+_DISCORD_PRIVATE_CONTEXT_DEFAULT_SAFE_TOOLSETS = frozenset({
+    "clarify",
+    "code_execution",
+    "image_gen",
+    "search",
+    "todo",
+    "tts",
+    "vision",
+    "web",
+})
+_DISCORD_PRIVATE_CONTEXT_BLOCKED_TOOLSETS = frozenset({
+    "cronjob",
+    "delegation",
+    "discord_admin",
+    "file",
+    "memory",
+    "messaging",
+    "session_search",
+    "skills",
+    "terminal",
+})
+
+
+def _coerce_string_list(raw: Any) -> List[str]:
+    """Normalize YAML/env list-ish values into stripped strings."""
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        items = raw.split(",")
+    elif isinstance(raw, (list, tuple, set, frozenset)):
+        items = raw
+    else:
+        items = [raw]
+    out: List[str] = []
+    for item in items:
+        text = str(item).strip()
+        if text:
+            out.append(text)
+    return out
 
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"("  # transient/auxiliary status that should stay in logs, not Telegram chat
@@ -11688,6 +11727,12 @@ class GatewayRunner:
 
             from hermes_cli.tools_config import _get_platform_tools
             enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+            (
+                enabled_toolsets,
+                skip_memory,
+                skip_context_files,
+                _privacy_restricted,
+            ) = self._discord_effective_agent_privacy(source, enabled_toolsets)
             agent_cfg = user_config.get("agent") or {}
             disabled_toolsets = agent_cfg.get("disabled_toolsets") or None
 
@@ -11722,6 +11767,8 @@ class GatewayRunner:
                     max_iterations=max_iterations,
                     quiet_mode=True,
                     verbose_logging=False,
+                    skip_memory=skip_memory,
+                    skip_context_files=skip_context_files,
                     enabled_toolsets=enabled_toolsets,
                     disabled_toolsets=disabled_toolsets,
                     reasoning_config=reasoning_config,
@@ -15006,6 +15053,67 @@ class GatewayRunner:
             out["tools.registry_generation"] = None
         return out
 
+    def _discord_platform_extra(self) -> dict:
+        """Return Discord PlatformConfig.extra defensively."""
+        cfg = getattr(self, "config", None)
+        platforms = getattr(cfg, "platforms", None)
+        platform_cfg = None
+        if platforms is not None:
+            try:
+                platform_cfg = platforms.get(Platform.DISCORD)
+            except Exception:
+                platform_cfg = None
+        extra = getattr(platform_cfg, "extra", None)
+        return extra if isinstance(extra, dict) else {}
+
+    def _discord_source_is_admin(self, source: "SessionSource", platform_extra: dict) -> bool:
+        """True when a Discord source may receive private context/tools."""
+        if not source or getattr(source, "platform", None) != Platform.DISCORD:
+            return False
+        user_id = str(getattr(source, "user_id", "") or "").strip()
+        if not user_id:
+            return False
+
+        chat_type = str(getattr(source, "chat_type", "") or "").lower()
+        is_dm = chat_type in {"", "dm", "direct", "private"}
+        admin_ids = set(_coerce_string_list(platform_extra.get("allowed_users")))
+        admin_ids.update(_coerce_string_list(os.getenv("DISCORD_ALLOWED_USERS", "")))
+        admin_ids.update(_coerce_string_list(os.getenv("GATEWAY_ALLOWED_USERS", "")))
+        if is_dm:
+            admin_ids.update(_coerce_string_list(platform_extra.get("allow_admin_from")))
+        else:
+            admin_ids.update(_coerce_string_list(platform_extra.get("allow_admin_from")))
+            admin_ids.update(_coerce_string_list(platform_extra.get("group_allow_admin_from")))
+        if user_id in admin_ids:
+            return True
+        return False
+
+    def _discord_effective_agent_privacy(
+        self,
+        source: "SessionSource",
+        enabled_toolsets: list,
+    ) -> tuple[list, bool, bool, bool]:
+        """Apply the Discord private-context gate to per-message agent args."""
+        effective_toolsets = list(enabled_toolsets or [])
+        if not source or getattr(source, "platform", None) != Platform.DISCORD:
+            return effective_toolsets, False, False, False
+
+        extra = self._discord_platform_extra()
+        if not is_truthy_value(extra.get("private_context_admin_only"), default=False):
+            return effective_toolsets, False, False, False
+        if self._discord_source_is_admin(source, extra):
+            return effective_toolsets, False, False, False
+
+        configured_safe = set(_coerce_string_list(extra.get("private_context_safe_toolsets")))
+        safe_toolsets = configured_safe or set(_DISCORD_PRIVATE_CONTEXT_DEFAULT_SAFE_TOOLSETS)
+        effective_toolsets = sorted(
+            toolset
+            for toolset in effective_toolsets
+            if toolset in safe_toolsets
+            and toolset not in _DISCORD_PRIVATE_CONTEXT_BLOCKED_TOOLSETS
+        )
+        return effective_toolsets, True, True, True
+
     @staticmethod
     def _agent_config_signature(
         model: str,
@@ -16442,6 +16550,17 @@ class GatewayRunner:
             if self._ephemeral_system_prompt:
                 combined_ephemeral = (combined_ephemeral + "\n\n" + self._ephemeral_system_prompt).strip()
 
+            (
+                effective_enabled_toolsets,
+                skip_memory,
+                skip_context_files,
+                discord_private_context_restricted,
+            ) = self._discord_effective_agent_privacy(source, enabled_toolsets)
+            if discord_private_context_restricted:
+                # Preserve public platform/session context, but remove private
+                # global and per-channel prompts for non-admin Discord users.
+                combined_ephemeral = (context_prompt or "").strip()
+
             # Re-read .env and config for fresh credentials (gateway is long-lived,
             # keys may change without restart). Keep config.yaml authoritative for
             # runtime budget settings bridged into env vars.
@@ -16581,12 +16700,18 @@ class GatewayRunner:
             # Check agent cache — reuse the AIAgent from the previous message
             # in this session to preserve the frozen system prompt and tool
             # schemas for prompt cache hits.
+            _cache_keys = self._extract_cache_busting_config(user_config)
+            _cache_keys.update({
+                "discord.private_context_restricted": discord_private_context_restricted,
+                "agent.skip_memory": skip_memory,
+                "agent.skip_context_files": skip_context_files,
+            })
             _sig = self._agent_config_signature(
                 turn_route["model"],
                 turn_route["runtime"],
-                enabled_toolsets,
+                effective_enabled_toolsets,
                 combined_ephemeral,
-                cache_keys=self._extract_cache_busting_config(user_config),
+                cache_keys=_cache_keys,
             )
             agent = None
             _cache_lock = getattr(self, "_agent_cache_lock", None)
@@ -16614,7 +16739,9 @@ class GatewayRunner:
                     max_iterations=max_iterations,
                     quiet_mode=True,
                     verbose_logging=False,
-                    enabled_toolsets=enabled_toolsets,
+                    skip_memory=skip_memory,
+                    skip_context_files=skip_context_files,
+                    enabled_toolsets=effective_enabled_toolsets,
                     disabled_toolsets=disabled_toolsets,
                     ephemeral_system_prompt=combined_ephemeral or None,
                     prefill_messages=self._prefill_messages or None,
