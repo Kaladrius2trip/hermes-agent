@@ -62,6 +62,7 @@ AUTHOR_MAP = {
     "nidhi2894@gmail.com": "nidhi-singh02",
     "30312689+aashizpoudel@users.noreply.github.com": "aashizpoudel",
     "oleksii.lisikh@gmail.com": "olisikh",
+    "jithendranaidunara@gmail.com": "JithendraNara",
     "jeremy@geocaching.com": "outdoorsea",
     "leone.parise@gmail.com": "leoneparise",
     "mr@shu.io": "mrshu",
@@ -72,6 +73,7 @@ AUTHOR_MAP = {
     "teknium@nousresearch.com": "teknium1",
     "piyushvp1@gmail.com": "thelumiereguy",
     "421774554@qq.com": "wuli666",
+    "twebefy@gmail.com": "tw2818",
     "harish.kukreja@gmail.com": "counterposition",
     "korkyzer@gmail.com": "Korkyzer",
     "1046611633@qq.com": "zhengyn0001",
@@ -265,6 +267,7 @@ AUTHOR_MAP = {
     "yuxiangl490@gmail.com": "y0shua1ee",
     "manmit0x@gmail.com": "0xDevNinja",
     "stevekelly622@gmail.com": "steezkelly",
+    "brian@dralth.com": "btorresgil",
     "momowind@gmail.com": "momowind",
     "clockwork-codex@users.noreply.github.com": "misery-hl",
     "207811921+misery-hl@users.noreply.github.com": "misery-hl",
@@ -753,6 +756,7 @@ AUTHOR_MAP = {
     "zhujianxyz@gmail.com": "opriz",
     "tuancanhnguyen706@gmail.com": "xxxigm",
     "asurla@nvidia.com": "anniesurla",
+    "kchantharuan@nvidia.com": "nv-kasikritc",
     "limkuan24@gmail.com": "WideLee",
     "aviralarora002@gmail.com": "AviArora02-commits",
     "draixagent@gmail.com": "draix",
@@ -1073,6 +1077,7 @@ AUTHOR_MAP = {
     "16034932+Arkmusn@users.noreply.github.com": "Arkmusn",  # PR #25559 salvage (approvals.timeout from config)
     "nidhi2894@gmail.com": "nidhi-singh02",  # PR #2752 salvage (slack whitespace-only IndexError guard)
     "38173192+nidhi-singh02@users.noreply.github.com": "nidhi-singh02",
+    "Jaaneek@users.noreply.github.com": "Jaaneek",  # PR #26457 (xAI Grok OAuth provider)
 }
 
 
