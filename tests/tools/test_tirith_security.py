@@ -90,6 +90,88 @@ class TestExitCodeMapping:
         assert result["summary"] == "shortened URL"
 
 
+class TestLocalPlainHttpSuppression:
+    def _run_with_plain_http_finding(self, url, *, rule_id="plain_http_url"):
+        finding = {
+            "rule_id": rule_id,
+            "severity": "high",
+            "title": "Plain HTTP URL in execution context",
+            "description": f"URL '{url}'",
+        }
+        with patch("tools.tirith_security._load_security_config") as mock_cfg, \
+             patch("tools.tirith_security.subprocess.run") as mock_run:
+            mock_cfg.return_value = {"tirith_enabled": True, "tirith_path": "tirith",
+                                     "tirith_timeout": 5, "tirith_fail_open": True}
+            mock_run.return_value = _mock_run(1, _json_stdout([finding], "plain HTTP"))
+            return check_command_security(f"curl {url}")
+
+    @pytest.mark.parametrize("url", [
+        "http://localhost:8644/health",
+        "http://127.0.0.1:8644/health",
+        "http://[::1]:8644/health",
+        "http://host.docker.internal:8644/health",
+        "http://gateway.docker.internal:8644/health",
+        "http://host.containers.internal:8644/health",
+        "http://host.lima.internal:8644/health",
+    ])
+    def test_local_and_docker_plain_http_findings_are_allowed(self, url):
+        result = self._run_with_plain_http_finding(url)
+        assert result["action"] == "allow"
+        assert result["findings"] == []
+        assert result["summary"] == "local plain HTTP URL(s) ignored"
+
+    @pytest.mark.parametrize("url", [
+        "http://host.docker.internal.evil.com:8644/health",
+        "http://example.com/health",
+        "http://10.0.0.5:8644/health",
+        "http://host.docker.internal:8644/health?token=secret",
+        "http://user:pass@host.docker.internal:8644/health",
+    ])
+    def test_external_or_secret_plain_http_findings_still_block(self, url):
+        result = self._run_with_plain_http_finding(url)
+        assert result["action"] == "block"
+        assert len(result["findings"]) == 1
+
+    @patch("tools.tirith_security.subprocess.run")
+    @patch("tools.tirith_security._load_security_config")
+    def test_mixed_findings_drop_only_local_plain_http(self, mock_cfg, mock_run):
+        mock_cfg.return_value = {"tirith_enabled": True, "tirith_path": "tirith",
+                                 "tirith_timeout": 5, "tirith_fail_open": True}
+        findings = [
+            {
+                "rule_id": "plain_http_url",
+                "severity": "high",
+                "title": "Plain HTTP URL in execution context",
+                "description": "URL 'http://host.docker.internal:8644/health'",
+            },
+            {"rule_id": "homograph_url", "severity": "high", "title": "Homograph URL"},
+        ]
+        mock_run.return_value = _mock_run(1, _json_stdout(findings, "two findings"))
+        result = check_command_security("curl http://host.docker.internal:8644/health")
+        assert result["action"] == "block"
+        assert result["findings"] == [findings[1]]
+
+    @patch("tools.tirith_security.subprocess.run")
+    @patch("tools.tirith_security._load_security_config")
+    def test_real_finding_after_display_cap_still_blocks(self, mock_cfg, mock_run):
+        mock_cfg.return_value = {"tirith_enabled": True, "tirith_path": "tirith",
+                                 "tirith_timeout": 5, "tirith_fail_open": True}
+        local_finding = {
+            "rule_id": "plain_http_url",
+            "severity": "high",
+            "title": "Plain HTTP URL in execution context",
+            "description": "URL 'http://host.docker.internal:8644/health'",
+        }
+        real_finding = {"rule_id": "homograph_url", "severity": "high", "title": "Homograph URL"}
+        findings = [dict(local_finding, description=f"URL 'http://host.docker.internal:{8000 + i}/health'")
+                    for i in range(_tirith_mod._MAX_FINDINGS)]
+        findings.append(real_finding)
+        mock_run.return_value = _mock_run(1, _json_stdout(findings, "many findings"))
+        result = check_command_security("curl http://host.docker.internal:8644/health")
+        assert result["action"] == "block"
+        assert result["findings"] == [real_finding]
+
+
 # ---------------------------------------------------------------------------
 # JSON parse failure (exit code still wins)
 # ---------------------------------------------------------------------------

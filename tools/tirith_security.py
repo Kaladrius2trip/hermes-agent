@@ -21,10 +21,12 @@ never blocks.
 """
 
 import hashlib
+import ipaddress
 import json
 import logging
 import os
 import platform
+import re
 import shutil
 import stat
 import subprocess
@@ -33,6 +35,7 @@ import tempfile
 import threading
 import time
 import urllib.request
+from urllib.parse import parse_qsl, urlparse
 
 from hermes_constants import get_hermes_home
 
@@ -726,6 +729,116 @@ def ensure_installed(*, log_failures: bool = True):
 _MAX_FINDINGS = 50
 _MAX_SUMMARY_LEN = 500
 
+_PLAIN_HTTP_RULE_HINTS = ("plain_http", "plain http", "http_url", "http url")
+_LOCAL_HTTP_HOSTS = {
+    "localhost",
+    "localhost.localdomain",
+    "host.docker.internal",
+    "gateway.docker.internal",
+    "host.containers.internal",
+    "gateway.containers.internal",
+    "host.lima.internal",
+}
+_SECRET_QUERY_HINTS = (
+    "access_token",
+    "api_key",
+    "apikey",
+    "auth",
+    "authorization",
+    "bearer",
+    "client_secret",
+    "credential",
+    "jwt",
+    "key",
+    "passwd",
+    "password",
+    "secret",
+    "session",
+    "token",
+)
+_URL_RE = re.compile(r"https?://[^\s'\"<>`)]+", re.IGNORECASE)
+
+
+def _is_loopback_host(host: str) -> bool:
+    """Return True for exact loopback hostnames/IPs only."""
+    normalized = (host or "").strip("[]").lower().rstrip(".")
+    if normalized in _LOCAL_HTTP_HOSTS:
+        return True
+    try:
+        return ipaddress.ip_address(normalized).is_loopback
+    except ValueError:
+        return False
+
+
+def _url_has_secret_material(parsed) -> bool:
+    """Detect credentials or obvious secret/auth query params in a parsed URL."""
+    if parsed.username or parsed.password:
+        return True
+    for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+        haystack = f"{key}={value}".lower()
+        if any(hint in haystack for hint in _SECRET_QUERY_HINTS):
+            return True
+    return False
+
+
+def _is_safe_local_plain_http_url(url: str) -> bool:
+    """Local/Docker HTTP URLs are same trust boundary as loopback for scans."""
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
+    if parsed.scheme.lower() != "http" or not parsed.hostname:
+        return False
+    if not _is_loopback_host(parsed.hostname):
+        return False
+    if _url_has_secret_material(parsed):
+        return False
+    return True
+
+
+def _is_plain_http_finding(finding: dict) -> bool:
+    text = " ".join(
+        str(finding.get(key, ""))
+        for key in ("rule_id", "title", "description", "message", "summary")
+    ).lower()
+    return any(hint in text for hint in _PLAIN_HTTP_RULE_HINTS)
+
+
+def _is_ignorable_local_plain_http_finding(finding: dict) -> bool:
+    """Suppress tirith plain-HTTP findings for exact loopback/Docker hosts.
+
+    Keep warning/block when URL carries credentials/query secrets, when hostname
+    is merely similar (e.g. host.docker.internal.evil.com), or when finding has
+    no parseable URL.  This makes host.docker.internal behave like loopback
+    without weakening external plain-HTTP detection.
+    """
+    if not _is_plain_http_finding(finding):
+        return False
+    urls = []
+    for key in ("url", "value", "description", "message", "title"):
+        value = finding.get(key)
+        if isinstance(value, str):
+            if value.startswith("http://") or value.startswith("https://"):
+                urls.append(value)
+            urls.extend(_URL_RE.findall(value))
+    # Dedupe while preserving order.
+    urls = list(dict.fromkeys(urls))
+    if not urls:
+        return False
+    return all(_is_safe_local_plain_http_url(url) for url in urls)
+
+
+def _filter_ignorable_tirith_findings(action: str, findings: list[dict], summary: str) -> tuple[str, list[dict], str]:
+    """Drop benign local plain-HTTP findings and downgrade if none remain."""
+    if action not in {"warn", "block"} or not findings:
+        return action, findings, summary
+    remaining = [f for f in findings if not _is_ignorable_local_plain_http_finding(f)]
+    if len(remaining) == len(findings):
+        return action, findings, summary
+    if remaining:
+        return action, remaining, summary
+    return "allow", [], "local plain HTTP URL(s) ignored"
+
 
 def check_command_security(command: str) -> dict:
     """Run tirith security scan on a command.
@@ -829,7 +942,8 @@ def check_command_security(command: str) -> dict:
     try:
         data = json.loads(result.stdout) if result.stdout.strip() else {}
         raw_findings = data.get("findings", [])
-        findings = raw_findings[:_MAX_FINDINGS]
+        if isinstance(raw_findings, list):
+            findings = raw_findings
         summary = (data.get("summary", "") or "")[:_MAX_SUMMARY_LEN]
     except (json.JSONDecodeError, AttributeError):
         # JSON parse failure degrades findings/summary, not the verdict
@@ -851,6 +965,8 @@ def check_command_security(command: str) -> dict:
             findings = []
             summary = ""
 
+    action, findings, summary = _filter_ignorable_tirith_findings(action, findings, summary)
+    findings = findings[:_MAX_FINDINGS]
     return {"action": action, "findings": findings, "summary": summary}
 
 
