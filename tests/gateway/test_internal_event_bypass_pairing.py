@@ -133,8 +133,12 @@ async def test_internal_event_bypasses_authorization(monkeypatch, tmp_path):
     monkeypatch.setattr(GatewayRunner, "_is_user_authorized", tracking_auth)
 
     # Stop execution before the agent runner so the test doesn't block in
-    # run_in_executor.  Auth check happens before _handle_message_with_agent.
+    # run_in_executor.  Auth/ACL checks happen before _handle_message_with_agent.
+    reached_handler = False
+
     async def _raise(*_a, **_kw):
+        nonlocal reached_handler
+        reached_handler = True
         raise RuntimeError("sentinel — stop here")
     monkeypatch.setattr(GatewayRunner, "_handle_message_with_agent", _raise)
 
@@ -143,6 +147,7 @@ async def test_internal_event_bypasses_authorization(monkeypatch, tmp_path):
     except RuntimeError:
         pass  # Expected sentinel
 
+    assert reached_handler, "internal events should bypass ACL chat gate and reach agent dispatch"
     assert not auth_called, (
         "_is_user_authorized should NOT be called for internal events"
     )
@@ -372,6 +377,7 @@ async def test_non_internal_event_without_user_triggers_pairing(monkeypatch, tmp
     # module-level dotenv in gateway/run.py from the real ~/.hermes/.env).
     monkeypatch.delenv("DISCORD_ALLOW_ALL_USERS", raising=False)
     monkeypatch.delenv("DISCORD_ALLOWED_USERS", raising=False)
+    monkeypatch.delenv("DISCORD_ALLOWED_ROLES", raising=False)
     monkeypatch.delenv("GATEWAY_ALLOW_ALL_USERS", raising=False)
     monkeypatch.delenv("GATEWAY_ALLOWED_USERS", raising=False)
 

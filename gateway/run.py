@@ -1551,6 +1551,42 @@ def _parse_session_key(session_key: str) -> "dict | None":
     return None
 
 
+def _truncate_process_output_for_notification(output: str, limit: int) -> str:
+    """Return ANSI-stripped process output tail, preferring line boundaries."""
+    from tools.ansi_strip import strip_ansi
+
+    clean = strip_ansi(output or "")
+    if len(clean) <= limit:
+        return clean
+
+    tail = clean[-limit:]
+    newline = tail.find("\n")
+    if newline != -1:
+        tail = tail[newline + 1:]
+    return f"[… output truncated — showing last {len(tail)} chars]\n{tail}"
+
+
+def _format_background_process_text_notification(
+    session_id: str,
+    *,
+    exit_code: object = None,
+    output: str = "",
+    output_limit: int = 1000,
+    running: bool = False,
+) -> str:
+    """Format direct user-facing background-process watcher messages."""
+    clean_output = _truncate_process_output_for_notification(output, output_limit)
+    if running:
+        return (
+            f"Background process {session_id} is still running.\n"
+            f"New output:\n{clean_output}"
+        )
+    return (
+        f"Background process {session_id} finished with exit code {exit_code}.\n"
+        f"Final output:\n{clean_output}"
+    )
+
+
 def _format_gateway_process_notification(evt: dict) -> "str | None":
     """Format a watch pattern event from completion_queue into a [IMPORTANT:] message."""
     evt_type = evt.get("type", "completion")
@@ -1710,6 +1746,17 @@ class GatewayRunner:
     def __init__(self, config: Optional[GatewayConfig] = None):
         global _gateway_runner_ref
         self.config = config or load_gateway_config()
+        try:
+            from gateway.acl import ACLStore, collect_bootstrap_super_admins
+            self.acl_store = ACLStore()
+            self._acl_bootstrap_super_admins = collect_bootstrap_super_admins(
+                getattr(self.config, "platforms", {}) or {}
+            )
+        except Exception as exc:
+            logger.warning("Gateway ACL initialization failed; ACL will deny Discord non-discovery access: %s", exc)
+            self.acl_store = None
+            from gateway.acl import BootstrapSuperAdmins
+            self._acl_bootstrap_super_admins = BootstrapSuperAdmins.empty()
         self.adapters: Dict[Platform, BasePlatformAdapter] = {}
         self._warn_if_docker_media_delivery_is_risky()
         _gateway_runner_ref = _weakref.ref(self)
@@ -3117,6 +3164,62 @@ class GatewayRunner:
             return
         merge_pending_message_event(adapter._pending_messages, session_key, event)
 
+    def _running_agent_acl_tools_covered_by_source(
+        self,
+        source: SessionSource,
+        running_agent: Any,
+    ) -> bool:
+        """True when ``source`` may inject text into ``running_agent`` mid-run."""
+        platform = source.platform.value if hasattr(source.platform, "value") else str(source.platform or "")
+        if platform.lower() != "discord" or getattr(self, "acl_store", None) is None:
+            return True
+        if running_agent is None or running_agent is _AGENT_PENDING_SENTINEL:
+            return False
+        try:
+            policy = self._resolve_acl_policy_for_source(source)
+        except Exception as exc:
+            logger.warning("ACL resolve failed for busy-session steer; queueing instead: %s", exc)
+            return False
+        if not getattr(policy, "can_chat", False):
+            return False
+        running_tools = getattr(running_agent, "valid_tool_names", None)
+        if running_tools is None:
+            # Fail closed for steer. Queue path preserves source and will run a
+            # normal ACL-resolved turn after the current run completes.
+            return False
+        requester_tools = set(getattr(policy, "allowed_tool_names", set()) or [])
+        missing = set(running_tools or set()) - requester_tools
+        if missing:
+            logger.info(
+                "Busy-session steer downgraded to queue: user=%s missing running-agent tools=%s",
+                getattr(policy, "user_id", "") or getattr(source, "user_id", "") or "unknown",
+                ",".join(sorted(missing)[:20]),
+            )
+            return False
+        return True
+
+    async def _send_busy_acl_denial(self, event: MessageEvent, message: str) -> None:
+        adapter = self.adapters.get(event.source.platform)
+        if not adapter:
+            return
+        reply_anchor = self._reply_anchor_for_event(event)
+        thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
+        try:
+            await adapter._send_with_retry(
+                chat_id=event.source.chat_id,
+                content=message,
+                reply_to=(
+                    reply_anchor
+                    if event.source.platform == Platform.TELEGRAM
+                    and event.source.chat_type == "dm"
+                    and event.source.thread_id
+                    else (None if event.source.platform == Platform.TELEGRAM and event.source.thread_id else event.message_id)
+                ),
+                metadata=thread_meta,
+            )
+        except Exception as exc:
+            logger.debug("Failed to send busy-session ACL denial: %s", exc)
+
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
         # --- Authorization gate (#17775) ---
         # The cold path (_handle_message) checks _is_user_authorized before
@@ -3133,6 +3236,18 @@ class GatewayRunner:
                 session_key,
             )
             return True  # handled (silently dropped); do not fall through
+
+        if not bool(getattr(event, "internal", False)):
+            _acl_denied = self._check_acl_access(event.source, None)
+            if _acl_denied is not None:
+                logger.info(
+                    "Dropping busy-session message denied by ACL: user=%s platform=%s session=%s",
+                    event.source.user_id,
+                    event.source.platform.value if event.source.platform else "unknown",
+                    session_key,
+                )
+                await self._send_busy_acl_denial(event, _acl_denied)
+                return True
 
         # --- Draining case (gateway restarting/stopping) ---
         if self._draining:
@@ -3209,6 +3324,7 @@ class GatewayRunner:
                 and running_agent is not None
                 and running_agent is not _AGENT_PENDING_SENTINEL
                 and hasattr(running_agent, "steer")
+                and self._running_agent_acl_tools_covered_by_source(event.source, running_agent)
             )
             if can_steer:
                 try:
@@ -6973,7 +7089,11 @@ class GatewayRunner:
                 _confirm_choice = "cancel"
             if _confirm_choice is not None:
                 _resolved = await _slash_confirm_mod.resolve(
-                    _quick_key, _pending_confirm.get("confirm_id"), _confirm_choice,
+                    _quick_key,
+                    str(_pending_confirm.get("confirm_id") or ""),
+                    _confirm_choice,
+                    requester_platform=source.platform.value if source.platform else "",
+                    requester_user_id=source.user_id or "",
                 )
                 return _resolved or ""
             # Stale pending + unrelated command: drop the pending state so
@@ -7043,6 +7163,9 @@ class GatewayRunner:
 
         if _quick_key in self._running_agents:
             if event.get_command() == "status":
+                # /status is intentionally pre-gate on the running-agent
+                # fast-path so users can inspect session state even when
+                # slash command access is otherwise restricted.
                 return await self._handle_status_command(event)
 
             # Resolve the command once for all early-intercept checks below.
@@ -7052,6 +7175,12 @@ class GatewayRunner:
             )
             _evt_cmd = event.get_command()
             _cmd_def_inner = _resolve_cmd_inner(_evt_cmd) if _evt_cmd else None
+
+            if not _evt_cmd or _cmd_def_inner is None:
+                if not is_internal:
+                    _denied = self._check_acl_access(source, None)
+                    if _denied is not None:
+                        return _denied
 
             # Slash command access control on the running-agent fast-path.
             # Mirrors the cold-path gate further below so non-admin users
@@ -7066,6 +7195,9 @@ class GatewayRunner:
 
             if _cmd_def_inner and _cmd_def_inner.name == "restart":
                 return await self._handle_restart_command(event)
+
+            if _cmd_def_inner and _cmd_def_inner.name == "acl":
+                return await self._handle_acl_command(event)
 
             # /stop must hard-kill the session when an agent is running.
             # A soft interrupt (agent.interrupt()) doesn't help when the agent
@@ -7147,6 +7279,18 @@ class GatewayRunner:
                         )
                         adapter._pending_messages[_quick_key] = queued_event
                     return "Agent still starting — /steer queued for the next turn."
+                if not self._running_agent_acl_tools_covered_by_source(source, running_agent):
+                    adapter = self.adapters.get(source.platform)
+                    if adapter:
+                        queued_event = MessageEvent(
+                            text=steer_text,
+                            message_type=MessageType.TEXT,
+                            source=event.source,
+                            message_id=event.message_id,
+                            channel_prompt=event.channel_prompt,
+                        )
+                        adapter._pending_messages[_quick_key] = queued_event
+                    return "Running agent has a broader tool policy — /steer queued for the next turn."
                 if running_agent and hasattr(running_agent, "steer"):
                     try:
                         accepted = running_agent.steer(steer_text)
@@ -7506,6 +7650,9 @@ class GatewayRunner:
         if canonical == "whoami":
             return await self._handle_whoami_command(event)
 
+        if canonical == "acl":
+            return await self._handle_acl_command(event)
+
         if canonical == "status":
             return await self._handle_status_command(event)
 
@@ -7783,6 +7930,10 @@ class GatewayRunner:
                     # built-ins (command may be an alias target set by the
                     # quick-command block above, so _cmd_def can be stale).
                     if command.replace("_", "-") not in GATEWAY_KNOWN_COMMANDS:
+                        if not is_internal:
+                            _acl_chat_denied = self._check_acl_access(source, None)
+                            if _acl_chat_denied is not None:
+                                return _acl_chat_denied
                         logger.warning(
                             "Unrecognized slash command /%s from %s — "
                             "replying with unknown-command notice",
@@ -7808,6 +7959,11 @@ class GatewayRunner:
             if self._should_send_telegram_lobby_reminder(source):
                 return self._telegram_topic_root_lobby_message()
             return None
+
+        if not is_internal:
+            _acl_chat_denied = self._check_acl_access(source, None)
+            if _acl_chat_denied is not None:
+                return _acl_chat_denied
 
         # ── Claim this session before any await ───────────────────────
         # Between here and _run_agent registering the real AIAgent, there
@@ -8755,6 +8911,7 @@ class GatewayRunner:
                 run_generation=run_generation,
                 event_message_id=self._reply_anchor_for_event(event),
                 channel_prompt=event.channel_prompt,
+                acl_bypass=bool(getattr(event, "internal", False)),
             )
 
             # Stop persistent typing indicator now that the agent is done
@@ -9472,6 +9629,135 @@ class GatewayRunner:
         return "\n".join(lines)
 
 
+    def _acl_scope_for_source(self, source: SessionSource) -> str:
+        chat_type = str(getattr(source, "chat_type", "") or "dm").lower()
+        return "dm" if chat_type in {"dm", "direct", "private"} else "channel"
+
+    def _acl_channel_id_for_source(self, source: SessionSource) -> Optional[str]:
+        parent = str(getattr(source, "parent_chat_id", None) or "").strip()
+        if parent:
+            return parent
+        if getattr(source, "thread_id", None):
+            return None
+        return str(getattr(source, "chat_id", None) or "").strip() or None
+
+    def _resolve_acl_policy_for_source(self, source: SessionSource):
+        """Resolve gateway ACL v1 policy for a message source."""
+        from gateway.acl import ACLRequest, BootstrapSuperAdmins, DISCOVERY_SLASH_COMMANDS, EffectiveACLPolicy, resolve_acl
+
+        platform = source.platform.value if hasattr(source.platform, "value") else str(source.platform or "")
+        scope = self._acl_scope_for_source(source)
+        channel_id = self._acl_channel_id_for_source(source)
+        store = getattr(self, "acl_store", None)
+        if store is None:
+            # Lazily recover for bare test runners or transient init failures.
+            # If recovery also fails, fail closed without throwing through the
+            # gateway message path.
+            try:
+                from gateway.acl import ACLStore
+                store = ACLStore()
+                self.acl_store = store
+            except Exception as exc:
+                logger.warning("Gateway ACL store recovery failed; denying Discord ACL access: %s", exc)
+                return EffectiveACLPolicy(
+                    platform=str(platform or "").strip().lower(),
+                    user_id=str(getattr(source, "user_id", None) or ""),
+                    scope=scope,
+                    scope_id=channel_id if scope == "channel" else None,
+                    can_chat=False,
+                    groups=set(),
+                    allowed_slash_commands=set(DISCOVERY_SLASH_COMMANDS),
+                    allowed_tool_names=set(),
+                    bootstrap_super_admin=False,
+                    denied_reason="acl_store_unavailable",
+                )
+        bootstrap = getattr(self, "_acl_bootstrap_super_admins", None)
+        if bootstrap is None:
+            from gateway.acl import collect_bootstrap_super_admins
+            bootstrap = collect_bootstrap_super_admins(getattr(self.config, "platforms", {}) or {})
+            self._acl_bootstrap_super_admins = bootstrap
+        request = ACLRequest(
+            platform=platform,
+            user_id=getattr(source, "user_id", None),
+            role_ids=getattr(source, "user_role_ids", None) or [],
+            scope=scope,
+            channel_id=channel_id,
+            thread_id=getattr(source, "thread_id", None),
+            chat_type=getattr(source, "chat_type", None),
+        )
+        return resolve_acl(store, request, bootstrap=bootstrap)
+
+    def _check_acl_access(
+        self,
+        source: SessionSource,
+        canonical_cmd: Optional[str],
+        *,
+        policy=None,
+    ) -> Optional[str]:
+        """Return an ACL denial message for Discord gateway access, else None."""
+        platform = source.platform.value if hasattr(source.platform, "value") else str(source.platform or "")
+        if platform.lower() != "discord":
+            return None
+        # Real GatewayRunner.__init__ sets acl_store. If a bare harness or
+        # partially-initialized runner lacks it, fail closed rather than
+        # accidentally bypassing ACL.
+        if getattr(self, "acl_store", None) is None:
+            if canonical_cmd and str(canonical_cmd).lstrip("/").replace("_", "-").lower() in {"help", "whoami"}:
+                return None
+            if canonical_cmd:
+                cmd = str(canonical_cmd).lstrip("/").replace("_", "-").lower()
+                return f"⛔ /{cmd} denied by ACL: ACL store unavailable. Ask an owner to check gateway logs."
+            return "⛔ Chat denied by ACL: ACL store unavailable. Ask an owner to check gateway logs."
+        policy = policy or self._resolve_acl_policy_for_source(source)
+        if getattr(policy, "bootstrap_super_admin", False):
+            return None
+        if canonical_cmd:
+            cmd = str(canonical_cmd).lstrip("/").replace("_", "-").lower()
+            if cmd in getattr(policy, "allowed_slash_commands", set()):
+                return None
+            try:
+                store = getattr(self, "acl_store", None)
+                if store is not None:
+                    store.audit_event(
+                        "slash.denied",
+                        platform=getattr(policy, "platform", platform.lower()),
+                        actor_platform=getattr(policy, "platform", platform.lower()),
+                        actor_user_id=getattr(policy, "user_id", "") or "",
+                        subject_type="user",
+                        subject_id=getattr(policy, "user_id", "") or "",
+                        scope=getattr(policy, "scope", ""),
+                        scope_id=getattr(policy, "scope_id", None),
+                        access_name=cmd,
+                        allowed=False,
+                        reason="missing_slash_command_capability",
+                    )
+            except Exception:
+                pass
+            return (
+                f"⛔ /{cmd} denied by ACL: missing slash command capability "
+                f"'{cmd}'. Ask an owner to grant access."
+            )
+        if getattr(policy, "can_chat", False):
+            return None
+        if getattr(policy, "denied_reason", None) == "no_acl_membership":
+            return (
+                "⛔ Chat denied by ACL: no ACL membership for this Discord scope. "
+                "Ask an owner to grant access."
+            )
+        return "⛔ Chat denied by ACL. Ask an owner to grant access."
+
+    def _acl_agent_cache_keys(self, policy) -> dict:
+        return {
+            "acl.platform": getattr(policy, "platform", ""),
+            "acl.scope": getattr(policy, "scope", ""),
+            "acl.scope_id": getattr(policy, "scope_id", None) or "",
+            "acl.can_chat": bool(getattr(policy, "can_chat", False)),
+            "acl.groups": sorted(getattr(policy, "groups", set()) or []),
+            "acl.allowed_slash_commands": sorted(getattr(policy, "allowed_slash_commands", set()) or []),
+            "acl.allowed_tool_names": sorted(getattr(policy, "allowed_tool_names", set()) or []),
+            "acl.bootstrap_super_admin": bool(getattr(policy, "bootstrap_super_admin", False)),
+        }
+
     def _check_slash_access(
         self, source: SessionSource, canonical_cmd: str
     ) -> Optional[str]:
@@ -9489,41 +9775,190 @@ class GatewayRunner:
 
         if not canonical_cmd:
             return None
-        policy = _policy_for_source(self.config, source)
-        if not policy.enabled or policy.can_run(source.user_id, canonical_cmd):
-            return None
-        logger.info(
-            "Slash command /%s denied for %s:%s (not admin, not in user_allowed_commands)",
-            canonical_cmd,
-            source.platform.value if source.platform else "?",
-            source.user_id,
-        )
-        allowed_preview = sorted(policy.user_allowed_commands)
-        if allowed_preview:
-            suffix = (
-                "You can run: "
-                + ", ".join(f"/{c}" for c in allowed_preview[:12])
-                + ("…" if len(allowed_preview) > 12 else "")
-                + ". Use /whoami for the full list."
-            )
-        else:
-            suffix = (
-                "No slash commands are enabled for non-admins on this "
-                "platform. Ask an admin to add you to allow_admin_from "
-                "or to set user_allowed_commands."
-            )
-        return f"⛔ /{canonical_cmd} is admin-only here. {suffix}"
+        cmd = str(canonical_cmd).lstrip("/").replace("_", "-").lower()
 
+        # ACL v1 bootstrap authority comes from explicit platform user IDs
+        # (e.g. DISCORD_ALLOWED_USERS / allow_admin_from), not from the
+        # legacy slash_access user_allowed_commands gate. Let bootstrap
+        # super-admins reach /acl even when slash_access is enabled.
+        if cmd == "acl" and hasattr(self, "acl_store") and getattr(self, "acl_store", None) is not None:
+            try:
+                acl_policy = self._resolve_acl_policy_for_source(source)
+                if getattr(acl_policy, "bootstrap_super_admin", False):
+                    return None
+            except Exception:
+                pass
+
+        policy = _policy_for_source(self.config, source)
+        if policy.enabled and not policy.can_run(source.user_id, cmd):
+            logger.info(
+                "Slash command /%s denied for %s:%s (not admin, not in user_allowed_commands)",
+                cmd,
+                source.platform.value if source.platform else "?",
+                source.user_id,
+            )
+            allowed_preview = sorted(policy.user_allowed_commands)
+            if allowed_preview:
+                suffix = (
+                    "You can run: "
+                    + ", ".join(f"/{c}" for c in allowed_preview[:12])
+                    + ("…" if len(allowed_preview) > 12 else "")
+                    + ". Use /whoami for the full list."
+                )
+            else:
+                suffix = (
+                    "No slash commands are enabled for non-admins on this "
+                    "platform. Ask an admin to add you to allow_admin_from "
+                    "or to set user_allowed_commands."
+                )
+            return f"⛔ /{cmd} is admin-only here. {suffix}"
+        return self._check_acl_access(source, cmd)
+
+
+    def _acl_command_context_for_source(self, source: SessionSource):
+        from gateway.acl import ACLCommandContext
+
+        platform = source.platform.value if hasattr(source.platform, "value") else str(source.platform or "")
+        return ACLCommandContext(
+            platform=platform,
+            channel_id=self._acl_channel_id_for_source(source),
+            scope=self._acl_scope_for_source(source),
+            thread_id=getattr(source, "thread_id", None),
+        )
+
+    def _format_acl_command_target(self, command) -> str:
+        action = getattr(command, "action", "")
+        if action in {"grant_membership", "revoke_membership"}:
+            verb = "grant" if action == "grant_membership" else "revoke"
+            scope = getattr(command, "scope", None) or "dm"
+            scope_id = getattr(command, "scope_id", None)
+            scope_label = f"{scope}:{scope_id}" if scope_id else scope
+            return (
+                f"{verb} {getattr(command, 'subject_type', 'user')} "
+                f"{getattr(command, 'subject_id', '')} -> {getattr(command, 'group_name', '')} "
+                f"in {scope_label}"
+            )
+        if action == "create_group":
+            return f"create group {getattr(command, 'group_name', '')}"
+        if action == "grant_group_access":
+            return f"grant group {getattr(command, 'group_name', '')} access {getattr(command, 'access_name', '')}"
+        return str(getattr(command, "raw", "") or action)
+
+    def _format_acl_show_subject(self, command, *, platform: str = "discord") -> str:
+        subject_type = getattr(command, "subject_type", None) or "user"
+        subject_id = getattr(command, "subject_id", None) or ""
+        platform = str(platform or "discord").lower()
+        rows = self.acl_store.list_memberships(
+            platform=platform,
+            subject_type=subject_type,
+            subject_id=subject_id,
+        )
+        lines = [f"ACL subject: {platform} {subject_type} {subject_id}"]
+        if not rows:
+            lines.append("memberships: none")
+            return "\n".join(lines)
+        lines.append("memberships:")
+        for row in rows:
+            scope = f"{row.scope}:{row.scope_id}" if row.scope_id else row.scope
+            lines.append(f"- {row.group_name} in {scope}")
+        return "\n".join(lines)
+
+    def _format_acl_audit(self, *, limit: int = 20) -> str:
+        rows = self.acl_store.audit(limit=limit)
+        if not rows:
+            return "ACL audit: empty"
+        lines = ["ACL audit (newest first):"]
+        for row in rows:
+            subject = ""
+            if row.subject_id:
+                subject = f" {row.subject_type}:{row.subject_id}"
+            scope = ""
+            if row.scope:
+                scope = f" {row.scope}{(':' + row.scope_id) if row.scope_id else ''}"
+            access = f" {row.access_name}" if row.access_name else ""
+            actor = f" by {row.actor_platform}:{row.actor_user_id}" if row.actor_user_id else ""
+            reason = f" ({row.reason})" if row.reason else ""
+            lines.append(f"- #{row.id} {row.action}{subject}{scope}{access}{actor}{reason}")
+        return "\n".join(lines)
+
+    async def _handle_acl_command(self, event: MessageEvent) -> str:
+        """Handle /acl management. Bootstrap super-admin only in v1."""
+        from gateway.acl import apply_acl_command, format_acl_policy, parse_acl_command
+
+        source = event.source
+        platform = source.platform.value if hasattr(source.platform, "value") else str(source.platform or "")
+        if platform.lower() != "discord":
+            return "⛔ /acl is Discord-only in ACL v1."
+
+        policy = self._resolve_acl_policy_for_source(source)
+        if not getattr(policy, "bootstrap_super_admin", False):
+            try:
+                self.acl_store.audit_event(
+                    "acl.command.denied",
+                    platform=getattr(policy, "platform", ""),
+                    actor_platform=getattr(policy, "platform", ""),
+                    actor_user_id=getattr(policy, "user_id", ""),
+                    allowed=False,
+                    reason="requires_bootstrap_super_admin",
+                )
+            except Exception:
+                pass
+            return "⛔ /acl denied: requires bootstrap super-admin."
+
+        try:
+            command = parse_acl_command(event.text or "/acl show", self._acl_command_context_for_source(source))
+        except ValueError as exc:
+            return f"Usage error: {exc}"
+
+        if command.action == "show":
+            if getattr(command, "subject_id", None):
+                return self._format_acl_show_subject(command, platform=platform)
+            return "ACL effective policy:\n" + format_acl_policy(policy)
+
+        if command.action == "audit":
+            return self._format_acl_audit()
+
+        if not getattr(command, "requires_confirmation", False):
+            return "Unsupported /acl command."
+
+        actor_user_id = getattr(source, "user_id", "") or ""
+        target = self._format_acl_command_target(command)
+
+        async def _on_confirm(choice: str):
+            if choice == "cancel":
+                return "🟡 /acl cancelled. No ACL changes written."
+            try:
+                return apply_acl_command(
+                    self.acl_store,
+                    command,
+                    actor_platform=platform,
+                    actor_user_id=actor_user_id,
+                    platform=platform,
+                )
+            except Exception as exc:
+                return f"⚠️ /acl failed: {exc}"
+
+        prompt_message = (
+            "⚠️ **Confirm /acl**\n\n"
+            f"Mutation: `{target}`\n\n"
+            "This writes to the gateway ACL SQLite store. Confirmation is requester-only: "
+            "only the same platform user who requested this mutation can approve or cancel it.\n\n"
+            "Text fallback: reply `/approve` to apply once, or `/cancel` to abort."
+        )
+        result = await self._request_slash_confirm(
+            event=event,
+            command="acl",
+            title="/acl",
+            message=prompt_message,
+            handler=_on_confirm,
+            requester_bound=True,
+        )
+        return result or ""
 
     async def _handle_whoami_command(self, event: MessageEvent) -> str:
-        """Handle /whoami — show the user's slash command access on this scope.
-
-        Always works (it's in the always-allowed floor of slash_access).
-        Reports: platform, scope (DM vs group), the user's tier
-        (admin / user / unrestricted), and the slash commands they can
-        actually run on this scope.
-        """
+        """Handle /whoami — show slash-command and ACL state for this source."""
         from gateway.slash_access import policy_for_source as _policy_for_source
+        from gateway.acl import format_acl_policy
 
         source = event.source
         policy = _policy_for_source(self.config, source)
@@ -9533,38 +9968,43 @@ class GatewayRunner:
         user_id = (source.user_id if source else None) or "?"
 
         if not policy.enabled:
-            return (
+            legacy = (
                 f"**You** — {platform} ({scope})\n"
                 f"User ID: `{user_id}`\n"
                 f"Tier: unrestricted (no admin list configured for this scope)\n"
                 f"Slash commands: all available"
             )
-
-        if policy.is_admin(user_id):
-            return (
+        elif policy.is_admin(user_id):
+            legacy = (
                 f"**You** — {platform} ({scope})\n"
                 f"User ID: `{user_id}`\n"
                 f"Tier: **admin**\n"
                 f"Slash commands: all available"
             )
+        else:
+            # Non-admin user. Show what's actually reachable.
+            floor = ["help", "whoami"]  # mirrors slash_access._ALWAYS_ALLOWED_FOR_USERS
+            configured = sorted(policy.user_allowed_commands)
+            # Combine + dedupe, preserve order: floor first, then operator additions.
+            seen: set[str] = set()
+            runnable: list[str] = []
+            for c in floor + configured:
+                if c not in seen:
+                    seen.add(c)
+                    runnable.append(c)
+            runnable_str = ", ".join(f"/{c}" for c in runnable) if runnable else "(none)"
+            legacy = (
+                f"**You** — {platform} ({scope})\n"
+                f"User ID: `{user_id}`\n"
+                f"Tier: user\n"
+                f"Slash commands you can run: {runnable_str}"
+            )
 
-        # Non-admin user. Show what's actually reachable.
-        floor = ["help", "whoami"]  # mirrors slash_access._ALWAYS_ALLOWED_FOR_USERS
-        configured = sorted(policy.user_allowed_commands)
-        # Combine + dedupe, preserve order: floor first, then operator additions.
-        seen: set[str] = set()
-        runnable: list[str] = []
-        for c in floor + configured:
-            if c not in seen:
-                seen.add(c)
-                runnable.append(c)
-        runnable_str = ", ".join(f"/{c}" for c in runnable) if runnable else "(none)"
-        return (
-            f"**You** — {platform} ({scope})\n"
-            f"User ID: `{user_id}`\n"
-            f"Tier: user\n"
-            f"Slash commands you can run: {runnable_str}"
-        )
+        acl_store = getattr(self, "acl_store", None)
+        if acl_store is not None:
+            acl_policy = self._resolve_acl_policy_for_source(source)
+            return legacy + "\n\nACL\n" + format_acl_policy(acl_policy)
+        return legacy
 
 
     async def _handle_kanban_command(self, event: MessageEvent) -> str:
@@ -13662,6 +14102,7 @@ class GatewayRunner:
         title: str,
         message: str,
         handler,
+        requester_bound: bool = False,
     ) -> Optional[str]:
         """Ask the user to confirm an expensive slash command.
 
@@ -13692,7 +14133,17 @@ class GatewayRunner:
 
         # Register the pending confirm FIRST so a super-fast button click
         # cannot race the send_slash_confirm return.
-        _slash_confirm_mod.register(session_key, confirm_id, command, handler)
+        register_kwargs = {}
+        if requester_bound:
+            requester_platform = source.platform.value if source.platform else ""
+            requester_user_id = source.user_id or ""
+            if not requester_platform or not requester_user_id:
+                return "⛔ Confirmation denied: requester identity unavailable."
+            register_kwargs = {
+                "requester_platform": requester_platform,
+                "requester_user_id": requester_user_id,
+            }
+        _slash_confirm_mod.register(session_key, confirm_id, command, handler, **register_kwargs)
 
         adapter = self.adapters.get(source.platform)
         metadata = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
@@ -14892,22 +15343,15 @@ class GatewayRunner:
             if session.exited:
                 # --- Agent-triggered completion: inject synthetic message ---
                 # Skip if the agent already consumed the result via wait/poll/log
-                from tools.process_registry import process_registry as _pr_check
-                if agent_notify and not _pr_check.is_completion_consumed(session_id):
-                    from tools.ansi_strip import strip_ansi
-                    _raw = strip_ansi(session.output_buffer) if session.output_buffer else ""
-                    # Truncate at line boundaries so notifications never start
-                    # mid-line (fixes #23284). Keep the last ~2000 chars but
-                    # snap to the nearest preceding newline, then prepend a
-                    # truncation marker when output was cut.
-                    _LIMIT = 2000
-                    if len(_raw) > _LIMIT:
-                        _tail = _raw[-_LIMIT:]
-                        _nl = _tail.find("\n")
-                        _tail = _tail[_nl + 1:] if _nl != -1 else _tail
-                        _out = f"[… output truncated — showing last {len(_tail)} chars]\n{_tail}"
-                    else:
-                        _out = _raw
+                if agent_notify:
+                    from tools.process_registry import process_registry as _pr_check
+                    if _pr_check.is_completion_consumed(session_id):
+                        logger.info(
+                            "Process %s completion already consumed; suppressing completion notification",
+                            session_id,
+                        )
+                        break
+                    _out = _truncate_process_output_for_notification(session.output_buffer, 2000)
                     synth_text = (
                         f"[IMPORTANT: Background process {session_id} completed "
                         f"(exit code {session.exit_code}).\n"
@@ -14963,10 +15407,11 @@ class GatewayRunner:
                     or (notify_mode == "error" and session.exit_code not in {0, None})
                 )
                 if should_notify:
-                    new_output = session.output_buffer[-1000:] if session.output_buffer else ""
-                    message_text = (
-                        f"[Background process {session_id} finished with exit code {session.exit_code}~ "
-                        f"Here's the final output:\n{new_output}]"
+                    message_text = _format_background_process_text_notification(
+                        session_id,
+                        exit_code=session.exit_code,
+                        output=session.output_buffer,
+                        output_limit=1000,
                     )
                     adapter = None
                     for p, a in self.adapters.items():
@@ -14984,10 +15429,11 @@ class GatewayRunner:
             elif has_new_output and notify_mode == "all" and not agent_notify:
                 # New output available -- deliver status update (only in "all" mode)
                 # Skip periodic updates for agent_notify watchers (they only care about completion)
-                new_output = session.output_buffer[-500:] if session.output_buffer else ""
-                message_text = (
-                    f"[Background process {session_id} is still running~ "
-                    f"New output:\n{new_output}]"
+                message_text = _format_background_process_text_notification(
+                    session_id,
+                    output=session.output_buffer,
+                    output_limit=500,
+                    running=True,
                 )
                 adapter = None
                 for p, a in self.adapters.items():
@@ -15846,6 +16292,7 @@ class GatewayRunner:
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
         channel_prompt: Optional[str] = None,
+        acl_bypass: bool = False,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -15871,6 +16318,15 @@ class GatewayRunner:
                 run_generation=run_generation,
                 event_message_id=event_message_id,
             )
+
+        source_platform = source.platform.value if hasattr(source.platform, "value") else str(source.platform or "")
+        if not acl_bypass and source_platform.lower() == "discord" and getattr(self, "acl_store", None) is None:
+            return {
+                "final_response": self._check_acl_access(source, None) or "⛔ Chat denied by ACL.",
+                "messages": [],
+                "api_calls": 0,
+                "tools": [],
+            }
 
         from run_agent import AIAgent
         import queue
@@ -16556,6 +17012,18 @@ class GatewayRunner:
                 skip_context_files,
                 discord_private_context_restricted,
             ) = self._discord_effective_agent_privacy(source, enabled_toolsets)
+            acl_policy = None
+            allowed_tool_names = None
+            if not acl_bypass and source.platform == Platform.DISCORD and getattr(self, "acl_store", None) is not None:
+                acl_policy = self._resolve_acl_policy_for_source(source)
+                if not getattr(acl_policy, "can_chat", False):
+                    return {
+                        "final_response": self._check_acl_access(source, None, policy=acl_policy) or "⛔ Chat denied by ACL.",
+                        "messages": [],
+                        "api_calls": 0,
+                        "tools": [],
+                    }
+                allowed_tool_names = sorted(getattr(acl_policy, "allowed_tool_names", set()) or [])
             if discord_private_context_restricted:
                 # Preserve public platform/session context, but remove private
                 # global and per-channel prompts for non-admin Discord users.
@@ -16706,6 +17174,8 @@ class GatewayRunner:
                 "agent.skip_memory": skip_memory,
                 "agent.skip_context_files": skip_context_files,
             })
+            if acl_policy is not None:
+                _cache_keys.update(self._acl_agent_cache_keys(acl_policy))
             _sig = self._agent_config_signature(
                 turn_route["model"],
                 turn_route["runtime"],
@@ -16743,6 +17213,7 @@ class GatewayRunner:
                     skip_context_files=skip_context_files,
                     enabled_toolsets=effective_enabled_toolsets,
                     disabled_toolsets=disabled_toolsets,
+                    allowed_tool_names=allowed_tool_names,
                     ephemeral_system_prompt=combined_ephemeral or None,
                     prefill_messages=self._prefill_messages or None,
                     reasoning_config=reasoning_config,

@@ -27,7 +27,7 @@ import asyncio
 import logging
 import threading
 import time
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, Iterable, List, Optional, Tuple
 
 from tools.registry import discover_builtin_tools, registry
 from toolsets import resolve_toolset, validate_toolset
@@ -265,20 +265,29 @@ def get_tool_definitions(
     enabled_toolsets: List[str] = None,
     disabled_toolsets: List[str] = None,
     quiet_mode: bool = False,
+    allowed_tool_names: Optional[Iterable[str]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Get tool definitions for model API calls with toolset-based filtering.
 
-    All tools must be part of a toolset to be accessible.
+    All tools must be part of a toolset to be accessible.  When
+    allowed_tool_names is provided, the final schema list is intersected with
+    those exact concrete tool names.  An explicit empty allowlist means no
+    tools.
 
     Args:
         enabled_toolsets: Only include tools from these toolsets.
         disabled_toolsets: Exclude tools from these toolsets (if enabled_toolsets is None).
         quiet_mode: Suppress status prints.
+        allowed_tool_names: Optional exact ACL allowlist of concrete tool names.
 
     Returns:
         Filtered list of OpenAI-format tool definitions.
     """
+    allowed_tool_names_tuple = (
+        None if allowed_tool_names is None else tuple(str(t) for t in allowed_tool_names)
+    )
+
     # Fast path: memoized result when the caller doesn't need stdout prints.
     # The cache key captures every argument-level input; the registry
     # generation captures registry mutations (MCP refresh, plugin load).
@@ -298,6 +307,7 @@ def get_tool_definitions(
         cache_key = (
             frozenset(enabled_toolsets) if enabled_toolsets is not None else None,
             frozenset(disabled_toolsets) if disabled_toolsets else None,
+            frozenset(allowed_tool_names_tuple) if allowed_tool_names_tuple is not None else None,
             registry._generation,
             cfg_fp,
             bool(os.environ.get("HERMES_KANBAN_TASK")),
@@ -312,7 +322,7 @@ def get_tool_definitions(
             # schemas are treated as read-only by all known callers.
             return list(cached)
 
-    result = _compute_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode)
+    result = _compute_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode, allowed_tool_names_tuple)
     if quiet_mode:
         # Cache the freshly-computed list, but hand callers a shallow copy so
         # downstream mutations (e.g. run_agent appending memory/LCM tool
@@ -330,6 +340,7 @@ def _compute_tool_definitions(
     enabled_toolsets: List[str] = None,
     disabled_toolsets: List[str] = None,
     quiet_mode: bool = False,
+    allowed_tool_names: Optional[Iterable[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Uncached implementation of :func:`get_tool_definitions`."""
     # Determine which tool names the caller wants
@@ -390,6 +401,13 @@ def _compute_tool_definitions(
 
     # Ask the registry for schemas (only returns tools whose check_fn passes)
     filtered_tools = registry.get_definitions(tools_to_include, quiet=quiet_mode)
+
+    if allowed_tool_names is not None:
+        allowed_names = {str(name) for name in allowed_tool_names}
+        filtered_tools = [
+            tool_def for tool_def in filtered_tools
+            if tool_def.get("function", {}).get("name") in allowed_names
+        ]
 
     # The set of tool names that actually passed check_fn filtering.
     # Use this (not tools_to_include) for any downstream schema that references
@@ -766,6 +784,13 @@ def handle_function_call(
     """
     # Coerce string arguments to their schema-declared types (e.g. "42"→42)
     function_args = coerce_tool_args(function_name, function_args)
+
+    if enabled_tools is not None and function_name not in set(enabled_tools):
+        return json.dumps({
+            "error": (
+                f"Tool '{function_name}' denied by ACL: missing capability '{function_name}'."
+            )
+        }, ensure_ascii=False)
 
     try:
         if function_name in _AGENT_LOOP_TOOLS:

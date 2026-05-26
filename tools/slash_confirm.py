@@ -24,6 +24,7 @@ synchronous variant — see ``_prompt_slash_confirm`` there.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import threading
 import time
@@ -53,11 +54,17 @@ def register(
     confirm_id: str,
     command: str,
     handler: Callable[[str], Awaitable[Optional[str]]],
+    *,
+    requester_platform: Optional[str] = None,
+    requester_user_id: Optional[str] = None,
 ) -> None:
     """Register a pending slash-command confirmation.
 
     Overwrites any prior pending confirm for the same ``session_key`` — the
-    user invoking a new confirmable command supersedes the stale one.
+    user invoking a new confirmable command supersedes the stale one.  When a
+    requester identity is supplied, resolve() only accepts approval/cancel from
+    the same platform user; this is used for ACL mutations where another user in
+    the channel must not be able to approve a pending change.
     """
     with _lock:
         _pending[session_key] = {
@@ -65,6 +72,8 @@ def register(
             "command": command,
             "handler": handler,
             "created_at": time.time(),
+            "requester_platform": str(requester_platform or ""),
+            "requester_user_id": str(requester_user_id or ""),
         }
 
 
@@ -101,6 +110,9 @@ async def resolve(
     confirm_id: str,
     choice: str,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
+    *,
+    requester_platform: Optional[str] = None,
+    requester_user_id: Optional[str] = None,
 ) -> Optional[str]:
     """Resolve a pending confirm.
 
@@ -108,6 +120,9 @@ async def resolve(
     Returns the handler's output string (to be sent as a follow-up
     message), or ``None`` if the confirm was stale, already resolved, or
     the confirm_id doesn't match.
+
+    If the pending entry has requester identity, a mismatched requester is
+    rejected without consuming the pending confirmation.
 
     Safe to call from an asyncio callback (button click) or from the
     gateway's message intercept path.
@@ -119,6 +134,13 @@ async def resolve(
         if entry.get("confirm_id") != confirm_id:
             # Stale confirm_id — superseded by a newer prompt on the same session.
             return None
+        bound_platform = str(entry.get("requester_platform") or "")
+        bound_user = str(entry.get("requester_user_id") or "")
+        if bound_platform or bound_user:
+            got_platform = str(requester_platform or "")
+            got_user = str(requester_user_id or "")
+            if got_platform != bound_platform or got_user != bound_user:
+                return "Only the requester can approve or cancel this pending command."
         # Pop before we run the handler to prevent duplicate callbacks
         # (e.g. button double-click) from running it twice.
         _pending.pop(session_key, None)
@@ -138,6 +160,52 @@ async def resolve(
         )
         return f"❌ Error handling confirmation: {exc}"
     return result if isinstance(result, str) else None
+
+
+async def resolve_for_requester(
+    session_key: str,
+    confirm_id: str,
+    choice: str,
+    timeout: float = DEFAULT_TIMEOUT_SECONDS,
+    *,
+    requester_platform: Optional[str] = None,
+    requester_user_id: Optional[str] = None,
+) -> Optional[str]:
+    """Resolve a pending confirm with requester identity when supported.
+
+    Some gateway tests and third-party adapters monkeypatch ``resolve`` with
+    the old 3-argument signature. Keep those call sites compatible while the
+    real primitive enforces requester binding.
+    """
+    try:
+        signature = inspect.signature(resolve)
+        params = signature.parameters
+        has_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+        supports_timeout = "timeout" in params or has_varkw
+        supports_requester_binding = (
+            ("requester_platform" in params and "requester_user_id" in params)
+            or has_varkw
+        )
+    except (TypeError, ValueError):
+        supports_timeout = True
+        supports_requester_binding = True
+
+    if not supports_requester_binding or not supports_timeout:
+        if requester_platform or requester_user_id:
+            return (
+                "Requester-bound confirmation cannot be verified by the legacy "
+                "resolver; command not approved."
+            )
+        return await resolve(session_key, confirm_id, choice)
+
+    return await resolve(
+        session_key,
+        confirm_id,
+        choice,
+        timeout=timeout,
+        requester_platform=requester_platform,
+        requester_user_id=requester_user_id,
+    )
 
 
 def resolve_sync_compat(

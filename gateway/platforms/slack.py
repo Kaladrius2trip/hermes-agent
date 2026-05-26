@@ -2463,7 +2463,13 @@ class SlackAdapter(BasePlatformAdapter):
         # Resolve via the module-level primitive and post any follow-up.
         try:
             from tools import slash_confirm as _slash_confirm_mod
-            result_text = await _slash_confirm_mod.resolve(session_key, confirm_id, choice)
+            result_text = await _slash_confirm_mod.resolve_for_requester(
+                session_key,
+                confirm_id,
+                choice,
+                requester_platform="slack",
+                requester_user_id=user_id,
+            )
             if result_text:
                 post_kwargs: Dict[str, Any] = {
                     "channel": channel_id,

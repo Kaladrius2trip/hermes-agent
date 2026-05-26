@@ -19,8 +19,10 @@ Coverage targets:
 from __future__ import annotations
 
 from datetime import datetime
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
+import tempfile
 
 import pytest
 
@@ -52,6 +54,7 @@ def _make_event(text: str, source: SessionSource) -> MessageEvent:
 def _make_runner(*, platform_extra: dict | None = None,
                  platform: Platform = Platform.DISCORD):
     from gateway.run import GatewayRunner
+    from gateway.acl import ACLStore, BootstrapSuperAdmins
 
     runner = object.__new__(GatewayRunner)
     runner.config = GatewayConfig(
@@ -90,6 +93,16 @@ def _make_runner(*, platform_extra: dict | None = None,
     runner.session_store.update_session = MagicMock()
     runner._running_agents = {}
     runner._running_agents_ts = {}
+    # These tests target legacy slash_access behavior. Provide a live ACL
+    # store plus explicit bootstrap admins so the newer fail-closed Discord
+    # ACL layer does not mask the slash_access assertions in this bare
+    # object.__new__ harness.
+    _acl_dir = Path(tempfile.mkdtemp(prefix="slash-access-acl-"))
+    runner._acl_test_dir = _acl_dir
+    runner.acl_store = ACLStore(_acl_dir / "acl.sqlite3")
+    runner._acl_bootstrap_super_admins = BootstrapSuperAdmins(
+        {"discord": frozenset({"111", "999", "anyone", "user1"})}
+    )
     runner._session_run_generation = {}
     runner._pending_messages = {}
     runner._pending_approvals = {}

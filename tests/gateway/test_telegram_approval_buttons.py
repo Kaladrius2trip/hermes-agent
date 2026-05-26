@@ -79,6 +79,10 @@ class _AuthRunner:
 # send_exec_approval — inline keyboard buttons
 # ===========================================================================
 
+def _assert_markdown_v2(parse_mode):
+    assert parse_mode == "MarkdownV2" or "MARKDOWN_V2" in repr(parse_mode)
+
+
 class TestTelegramExecApproval:
     """Test the send_exec_approval method sends InlineKeyboard buttons."""
 
@@ -214,7 +218,7 @@ class TestTelegramExecApproval:
         )
 
         assert result.success is True
-        assert "MARKDOWN_V2" in repr(sent["parse_mode"])
+        _assert_markdown_v2(sent["parse_mode"])
         assert "Fix \\[issue\\]\\_1" in sent["text"]
         assert "alpha\\_beta" in sent["text"]
 
@@ -356,7 +360,7 @@ class TestTelegramApprovalCallback:
                 await adapter._handle_callback_query(update, context)
 
         edit_kwargs = query.edit_message_text.call_args[1]
-        assert "MARKDOWN_V2" in repr(edit_kwargs["parse_mode"])
+        _assert_markdown_v2(edit_kwargs["parse_mode"])
         assert "Alice\\_Bob" in edit_kwargs["text"]
         assert "Approved once" in edit_kwargs["text"]
 

@@ -400,14 +400,16 @@ class TestBlockingApprovalE2E:
                 reset_current_session_key(token)
 
         t = threading.Thread(target=agent_thread)
-        t.start()
+        with patch("tools.approval._get_approval_config",
+                   return_value={"mode": "manual", "gateway_timeout": 5, "smart_enabled": False}):
+            t.start()
 
-        for _ in range(50):
-            if notified:
-                break
-            time.sleep(0.05)
+            for _ in range(100):
+                if notified:
+                    break
+                time.sleep(0.05)
 
-        assert len(notified) == 1
+            assert len(notified) == 1
         assert "rm -rf /important" in notified[0]["command"]
 
         resolve_gateway_approval(session_key, "once")

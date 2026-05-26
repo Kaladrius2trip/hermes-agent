@@ -522,7 +522,10 @@ def _rpc_server_loop(
                         sys.stdout = devnull
                         sys.stderr = devnull
                         result = handle_function_call(
-                            tool_name, tool_args, task_id=task_id
+                            tool_name,
+                            tool_args,
+                            task_id=task_id,
+                            enabled_tools=sorted(allowed_tools),
                         )
                     finally:
                         sys.stdout, sys.stderr = _real_stdout, _real_stderr
@@ -796,7 +799,10 @@ def _rpc_poll_loop(
                             sys.stdout = devnull
                             sys.stderr = devnull
                             tool_result = handle_function_call(
-                                tool_name, tool_args, task_id=task_id
+                                tool_name,
+                                tool_args,
+                                task_id=task_id,
+                                enabled_tools=sorted(allowed_tools),
                             )
                         finally:
                             sys.stdout, sys.stderr = _real_stdout, _real_stderr
@@ -854,10 +860,11 @@ def _execute_remote(
     timeout = _cfg.get("timeout", DEFAULT_TIMEOUT)
     max_tool_calls = _cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS)
 
-    session_tools = set(enabled_tools) if enabled_tools else set()
-    sandbox_tools = frozenset(SANDBOX_ALLOWED_TOOLS & session_tools)
-    if not sandbox_tools:
+    if enabled_tools is None:
         sandbox_tools = SANDBOX_ALLOWED_TOOLS
+    else:
+        session_tools = set(enabled_tools)
+        sandbox_tools = frozenset(SANDBOX_ALLOWED_TOOLS & session_tools)
 
     effective_task_id = task_id or "default"
     env, env_type = _get_or_create_env(effective_task_id)
@@ -1079,12 +1086,13 @@ def execute_code(
     timeout = _cfg.get("timeout", DEFAULT_TIMEOUT)
     max_tool_calls = _cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS)
 
-    # Determine which tools the sandbox can call
-    session_tools = set(enabled_tools) if enabled_tools else set()
-    sandbox_tools = frozenset(SANDBOX_ALLOWED_TOOLS & session_tools)
-
-    if not sandbox_tools:
+    # Determine which tools the sandbox can call.  None means legacy fallback
+    # to every sandbox-safe tool; an explicit empty list means no nested tools.
+    if enabled_tools is None:
         sandbox_tools = SANDBOX_ALLOWED_TOOLS
+    else:
+        session_tools = set(enabled_tools)
+        sandbox_tools = frozenset(SANDBOX_ALLOWED_TOOLS & session_tools)
 
     # --- Set up temp directory with hermes_tools.py and script.py ---
     tmpdir = tempfile.mkdtemp(prefix="hermes_sandbox_")
@@ -1709,15 +1717,37 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
     # terminal()'s filesystem/interpreter; strict mode retains the isolated
     # temp-dir staging and hermes-agent's own python.
     if mode == "strict":
-        cwd_note = (
-            "Scripts run in their own temp dir, not the session's CWD — use absolute paths "
-            "(os.path.expanduser('~/.hermes/.env')) or terminal()/read_file() for user files."
-        )
+        if "terminal" in enabled_sandbox_tools:
+            cwd_note = (
+                "Scripts run in their own temp dir, not the session's CWD — use absolute paths "
+                "(os.path.expanduser('~/.hermes/.env')) or terminal()/read_file() for user files."
+            )
+        else:
+            cwd_note = (
+                "Scripts run in their own temp dir, not the session's CWD — use absolute paths "
+                "(os.path.expanduser('~/.hermes/.env')) or read_file() for user files."
+            )
     else:
-        cwd_note = (
-            "Scripts run in the session's working directory with the active venv's python, "
-            "so project deps (pandas, etc.) and relative paths work like in terminal()."
-        )
+        if "terminal" in enabled_sandbox_tools:
+            cwd_note = (
+                "Scripts run in the session's working directory with the active venv's python, "
+                "so project deps (pandas, etc.) and relative paths work like in terminal()."
+            )
+        else:
+            cwd_note = (
+                "Scripts run in the session's working directory with the active venv's python, "
+                "so project deps (pandas, etc.) and relative paths work."
+            )
+
+    terminal_limit_note = (
+        "terminal() is foreground-only (no background or pty).\n\n"
+        if "terminal" in enabled_sandbox_tools else ""
+    )
+    json_parse_note = (
+        "  json_parse(text: str) — json.loads with strict=False; use for terminal() output with control chars\n"
+        if "terminal" in enabled_sandbox_tools
+        else "  json_parse(text: str) — json.loads with strict=False; use for tool output with control chars\n"
+    )
 
     description = (
         "Run a Python script that can call Hermes tools programmatically. "
@@ -1731,12 +1761,12 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
         f"Available via `from hermes_tools import ...`:\n\n"
         f"{tool_lines}\n\n"
         "Limits: 5-minute timeout, 50KB stdout cap, max 50 tool calls per script. "
-        "terminal() is foreground-only (no background or pty).\n\n"
+        f"{terminal_limit_note}"
         f"{cwd_note}\n\n"
         "Print your final result to stdout. Use Python stdlib (json, re, math, csv, "
         "datetime, collections, etc.) for processing between tool calls.\n\n"
         "Also available (no import needed — built into hermes_tools):\n"
-        "  json_parse(text: str) — json.loads with strict=False; use for terminal() output with control chars\n"
+        f"{json_parse_note}"
         "  shell_quote(s: str) — shlex.quote(); use when interpolating dynamic strings into shell commands\n"
         "  retry(fn, max_attempts=3, delay=2) — retry with exponential backoff for transient failures"
     )

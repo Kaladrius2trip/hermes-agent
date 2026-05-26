@@ -1,8 +1,10 @@
 """Tests for Discord channel_prompts resolution and injection."""
 
 import sys
+import tempfile
 import threading
 import types
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -32,6 +34,7 @@ import gateway.run as gateway_run
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionSource
+from gateway.acl import ACLStore, BootstrapSuperAdmins
 
 
 class _CapturingAgent:
@@ -85,6 +88,17 @@ def _make_runner():
     runner._session_model_overrides = {}
     runner.hooks = SimpleNamespace(loaded_hooks=False)
     runner.config = SimpleNamespace(streaming=None)
+    runner.acl_store = ACLStore(Path(tempfile.mkdtemp()) / "acl.sqlite3")
+    runner._acl_bootstrap_super_admins = BootstrapSuperAdmins.empty()
+    for user_id in ("user-1", "guest-1", "owner-1"):
+        runner.acl_store.grant_membership(
+            platform="discord",
+            subject_type="user",
+            subject_id=user_id,
+            group_name="default",
+            scope="channel",
+            scope_id="12345",
+        )
     runner.session_store = SimpleNamespace(
         get_or_create_session=lambda source: SimpleNamespace(session_id="session-1"),
         load_transcript=lambda session_id: [],
@@ -544,6 +558,41 @@ async def test_private_context_agent_cache_isolated_by_admin_status(monkeypatch,
     assert _CapturingAgent.init_calls[0].get("skip_memory") is not True
     assert _CapturingAgent.init_calls[1]["skip_memory"] is True
     assert set(_CapturingAgent.init_calls[1]["enabled_toolsets"]) == {"web"}
+
+
+@pytest.mark.asyncio
+async def test_run_agent_passes_acl_allowed_tool_names_to_agent(monkeypatch, tmp_path):
+    _install_fake_agent(monkeypatch)
+    from gateway.acl import ACLStore, BootstrapSuperAdmins
+
+    runner = _make_runner()
+    runner.acl_store = ACLStore(tmp_path / "acl.sqlite3")
+    runner._acl_bootstrap_super_admins = BootstrapSuperAdmins.empty()
+    runner.acl_store.grant_membership(
+        platform="discord",
+        subject_type="user",
+        subject_id="user-1",
+        group_name="default",
+        scope="channel",
+        scope_id="12345",
+    )
+    _patch_run_agent_runtime(monkeypatch, tmp_path, {"web", "terminal", "file", "todo", "clarify"})
+
+    _CapturingAgent.last_init = None
+    source = _make_source()
+    result = await runner._run_agent(
+        message="hi",
+        context_prompt="Context prompt",
+        history=[],
+        source=source,
+        session_id="session-1",
+        session_key="agent:main:discord:thread:12345",
+        channel_prompt="Channel prompt",
+    )
+
+    assert result["final_response"] == "ok"
+    assert _CapturingAgent.last_init["allowed_tool_names"] == ["clarify", "todo"]
+    assert "terminal" not in _CapturingAgent.last_init["allowed_tool_names"]
 
 
 @pytest.mark.asyncio

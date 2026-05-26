@@ -1348,6 +1348,21 @@ def merge_pending_message_event(
     """
     existing = pending_messages.get(session_key)
     if existing:
+        def _source_identity(src: Any) -> tuple[str, str]:
+            raw_platform = getattr(src, "platform", "") if src is not None else ""
+            platform = str(getattr(raw_platform, "value", raw_platform) or "")
+            return (platform, str(getattr(src, "user_id", "") or ""))
+
+        # Never merge pending turns from different requesters. The pending
+        # event's source drives the next turn's ACL; merging a lower-user text
+        # into a higher-user pending media event would replay that lower-user
+        # request under the higher user's tool policy.
+        if _source_identity(getattr(existing, "source", None)) != _source_identity(getattr(event, "source", None)):
+            pending_messages[session_key] = event
+            return
+        # Same requester: keep latest source metadata (roles/display/thread attrs)
+        # for the eventual ACL/context resolution.
+        existing.source = event.source
         existing_is_photo = getattr(existing, "message_type", None) == MessageType.PHOTO
         incoming_is_photo = event.message_type == MessageType.PHOTO
         existing_has_media = bool(existing.media_urls)

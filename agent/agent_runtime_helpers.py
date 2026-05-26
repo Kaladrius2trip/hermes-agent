@@ -1553,6 +1553,14 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     tools. Used by the concurrent execution path; the sequential path retains
     its own inline invocation for backward-compatible display handling.
     """
+    valid_tool_names = getattr(agent, "valid_tool_names", None) or set()
+    if function_name not in valid_tool_names:
+        return json.dumps({
+            "error": (
+                f"Tool '{function_name}' denied by ACL: missing capability '{function_name}'."
+            )
+        }, ensure_ascii=False)
+
     # Check plugin hooks for a block directive before executing anything.
     block_message: Optional[str] = None
     if not pre_tool_block_checked:
@@ -1631,7 +1639,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             function_name, function_args, effective_task_id,
             tool_call_id=tool_call_id,
             session_id=agent.session_id or "",
-            enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
+            enabled_tools=list(agent.valid_tool_names),
             skip_pre_tool_call_hook=True,
         )
 

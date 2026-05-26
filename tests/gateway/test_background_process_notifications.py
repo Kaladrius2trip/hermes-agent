@@ -24,8 +24,9 @@ from gateway.run import GatewayRunner, _parse_session_key
 class _FakeRegistry:
     """Return pre-canned sessions, then None once exhausted."""
 
-    def __init__(self, sessions):
+    def __init__(self, sessions, consumed_ids=None):
         self._sessions = list(sessions)
+        self._consumed_ids = set(consumed_ids or [])
 
     def get(self, session_id):
         if self._sessions:
@@ -33,7 +34,7 @@ class _FakeRegistry:
         return None
 
     def is_completion_consumed(self, session_id):
-        return False
+        return session_id in self._consumed_ids
 
 
 def _build_runner(monkeypatch, tmp_path, mode: str) -> GatewayRunner:
@@ -355,6 +356,77 @@ async def test_agent_notification_no_message_id_is_tolerated(monkeypatch, tmp_pa
     adapter.handle_message.assert_awaited_once()
     synth_event = adapter.handle_message.await_args.args[0]
     assert synth_event.message_id is None
+
+
+@pytest.mark.asyncio
+async def test_agent_notification_consumed_completion_stays_silent(monkeypatch, tmp_path):
+    """notify_on_complete must not fall back to raw chat spam after the
+    agent already consumed the completion via wait/poll/log."""
+    import tools.process_registry as pr_module
+
+    sessions = [SimpleNamespace(
+        output_buffer="done\n", exited=True, exit_code=0, command="sleep 1",
+    )]
+    monkeypatch.setattr(
+        pr_module,
+        "process_registry",
+        _FakeRegistry(sessions, consumed_ids={"proc_consumed"}),
+    )
+
+    async def _instant_sleep(*_a, **_kw):
+        pass
+    monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    adapter = runner.adapters[Platform.TELEGRAM]
+
+    watcher = {
+        "session_id": "proc_consumed",
+        "check_interval": 0,
+        "session_key": "agent:main:telegram:dm:123:24296",
+        "platform": "telegram",
+        "chat_id": "123",
+        "thread_id": "24296",
+        "notify_on_complete": True,
+    }
+    await runner._run_process_watcher(watcher)
+
+    assert getattr(adapter.handle_message, "await_count") == 0
+    assert getattr(adapter.send, "await_count") == 0
+
+
+@pytest.mark.asyncio
+async def test_text_completion_notification_is_clean_and_line_truncated(monkeypatch, tmp_path):
+    """Direct text watcher notifications should not expose wrapper artifacts
+    like '0~ Here's' or start the captured output in the middle of a line."""
+    import tools.process_registry as pr_module
+
+    noisy_output = "first line\n" + ("x" * 1200) + "\nlast line\n"
+    sessions = [SimpleNamespace(
+        output_buffer=noisy_output,
+        exited=True,
+        exit_code=0,
+        command="python noisy.py",
+    )]
+    monkeypatch.setattr(pr_module, "process_registry", _FakeRegistry(sessions))
+
+    async def _instant_sleep(*_a, **_kw):
+        pass
+    monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+
+    runner = _build_runner(monkeypatch, tmp_path, "result")
+    adapter = runner.adapters[Platform.TELEGRAM]
+
+    await runner._run_process_watcher(_watcher_dict(session_id="proc_clean"))
+
+    send_mock = adapter.send
+    assert getattr(send_mock, "await_count") == 1
+    sent_message = getattr(send_mock, "await_args").args[1]
+    assert sent_message.startswith("Background process proc_clean finished with exit code 0.\n")
+    assert "0~ Here's" not in sent_message
+    assert "Final output:\n[… output truncated" in sent_message
+    assert "\nlast line\n" in sent_message
+    assert "xxxxxxxxxxxxxxxxxxxx" not in sent_message
 
 
 @pytest.mark.asyncio

@@ -5192,8 +5192,12 @@ def _define_discord_view_classes() -> None:
             # returns a follow-up message, post it in the same channel.
             try:
                 from tools import slash_confirm as _slash_confirm_mod
-                result_text = await _slash_confirm_mod.resolve(
-                    self.session_key, self.confirm_id, choice,
+                result_text = await _slash_confirm_mod.resolve_for_requester(
+                    self.session_key,
+                    self.confirm_id,
+                    choice,
+                    requester_platform="discord",
+                    requester_user_id=str(getattr(interaction.user, "id", "") or ""),
                 )
                 if result_text:
                     await interaction.followup.send(result_text)

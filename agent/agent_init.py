@@ -192,6 +192,7 @@ def init_agent(
     skip_context_files: bool = False,
     load_soul_identity: bool = False,
     skip_memory: bool = False,
+    allowed_tool_names: Optional[List[str]] = None,
     session_db=None,
     parent_session_id: str = None,
     iteration_budget: "IterationBudget" = None,
@@ -279,6 +280,7 @@ def init_agent(
     agent.background_review_callback = None  # Optional sync callback for gateway delivery
     agent.skip_context_files = skip_context_files
     agent.load_soul_identity = load_soul_identity
+    agent.allowed_tool_names = list(allowed_tool_names) if allowed_tool_names is not None else None
     agent.pass_session_id = pass_session_id
     agent._credential_pool = credential_pool
     agent.log_prefix_chars = log_prefix_chars
@@ -909,6 +911,7 @@ def init_agent(
         enabled_toolsets=enabled_toolsets,
         disabled_toolsets=disabled_toolsets,
         quiet_mode=agent.quiet_mode,
+        allowed_tool_names=allowed_tool_names,
     )
     
     # Show tool configuration and store valid tool names for validation
@@ -1148,6 +1151,10 @@ def init_agent(
     # through _ra().get_tool_definitions()).  Duplicate function names cause
     # 400 errors on providers that enforce unique names (e.g. Xiaomi
     # MiMo via Nous Portal).
+    _acl_allowed_tool_names = (
+        None if allowed_tool_names is None else {str(name) for name in allowed_tool_names}
+    )
+
     #
     # Respect the platform's enabled_toolsets configuration (#5544):
     #   enabled_toolsets is None        → no filter, inject (backward compat)
@@ -1167,6 +1174,8 @@ def init_agent(
         }
         for _schema in agent._memory_manager.get_all_tool_schemas():
             _tname = _schema.get("name", "")
+            if _acl_allowed_tool_names is not None and _tname not in _acl_allowed_tool_names:
+                continue
             if _tname and _tname in _existing_tool_names:
                 continue  # already registered via plugin path
             _wrapped = {"type": "function", "function": _schema}
@@ -1493,6 +1502,8 @@ def init_agent(
         }
         for _schema in agent.context_compressor.get_tool_schemas():
             _tname = _schema.get("name", "")
+            if _acl_allowed_tool_names is not None and _tname not in _acl_allowed_tool_names:
+                continue
             if _tname and _tname in _existing_tool_names:
                 continue  # already registered via plugin/cache path
             _wrapped = {"type": "function", "function": _schema}

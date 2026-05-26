@@ -153,6 +153,97 @@ class TestResolve:
         assert calls == ["once"]
         assert (r1 == "ran") ^ (r2 == "ran")
 
+    @pytest.mark.asyncio
+    async def test_resolve_for_requester_fails_closed_with_legacy_resolver(self, monkeypatch):
+        calls = []
+
+        async def legacy_resolve(session_key, confirm_id, choice):
+            calls.append((session_key, confirm_id, choice))
+            return "approved without requester check"
+
+        monkeypatch.setattr(slash_confirm, "resolve", legacy_resolve)
+
+        result = await slash_confirm.resolve_for_requester(
+            "sess1",
+            "cid1",
+            "once",
+            requester_platform="discord",
+            requester_user_id="intruder",
+        )
+
+        assert result is not None
+        assert "Requester-bound confirmation cannot be verified" in result
+        assert calls == []
+
+    @pytest.mark.asyncio
+    async def test_resolve_for_requester_keeps_legacy_fallback_when_unbound(self, monkeypatch):
+        calls = []
+
+        async def legacy_resolve(session_key, confirm_id, choice):
+            calls.append((session_key, confirm_id, choice))
+            return "legacy ok"
+
+        monkeypatch.setattr(slash_confirm, "resolve", legacy_resolve)
+
+        result = await slash_confirm.resolve_for_requester("sess1", "cid1", "once")
+
+        assert result == "legacy ok"
+        assert calls == [("sess1", "cid1", "once")]
+
+    @pytest.mark.asyncio
+    async def test_resolve_for_requester_rejects_cross_platform_same_user(self):
+        calls = []
+
+        async def handler(choice):
+            calls.append(choice)
+            return "ran"
+
+        slash_confirm.register(
+            "sess1",
+            "cid1",
+            "acl",
+            handler,
+            requester_platform="discord",
+            requester_user_id="owner",
+        )
+
+        result = await slash_confirm.resolve_for_requester(
+            "sess1",
+            "cid1",
+            "once",
+            requester_platform="slack",
+            requester_user_id="owner",
+        )
+
+        assert isinstance(result, str)
+        assert "Only the requester" in result
+        assert calls == []
+        assert slash_confirm.get_pending("sess1") is not None
+
+    @pytest.mark.asyncio
+    async def test_resolve_for_requester_propagates_modern_resolver_typeerror(self, monkeypatch):
+        async def modern_resolve(
+            session_key,
+            confirm_id,
+            choice,
+            timeout=slash_confirm.DEFAULT_TIMEOUT_SECONDS,
+            *,
+            requester_platform=None,
+            requester_user_id=None,
+        ):
+            raise TypeError("requester_platform internal bug")
+
+        monkeypatch.setattr(slash_confirm, "resolve", modern_resolve)
+
+        with pytest.raises(TypeError, match="internal bug"):
+            await slash_confirm.resolve_for_requester(
+                "sess1",
+                "cid1",
+                "once",
+                requester_platform="discord",
+                requester_user_id="owner",
+            )
+
 
 class TestClear:
     def test_clear_removes_entry(self):

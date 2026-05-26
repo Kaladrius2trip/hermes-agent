@@ -3245,8 +3245,12 @@ class TelegramAdapter(BasePlatformAdapter):
                 # message in the same chat.
                 try:
                     from tools import slash_confirm as _slash_confirm_mod
-                    result_text = await _slash_confirm_mod.resolve(
-                        session_key, confirm_id, choice,
+                    result_text = await _slash_confirm_mod.resolve_for_requester(
+                        session_key,
+                        confirm_id,
+                        choice,
+                        requester_platform="telegram",
+                        requester_user_id=str(getattr(query.from_user, "id", "") or ""),
                     )
                     if result_text and query.message:
                         # Inherit the prompt message's topic. Supergroup forums

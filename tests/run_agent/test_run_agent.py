@@ -2259,6 +2259,17 @@ class TestConcurrentToolExecution:
             )
             assert result == "result"
 
+    def test_invoke_tool_treats_none_valid_tool_names_as_empty_allowlist(self, agent):
+        """Concurrent path should deny cleanly if valid_tool_names is accidentally None."""
+        agent.valid_tool_names = None
+
+        with patch("run_agent.handle_function_call", side_effect=AssertionError("should not run")):
+            result = agent._invoke_tool("web_search", {"q": "test"}, "task-1")
+
+        assert json.loads(result) == {
+            "error": "Tool 'web_search' denied by ACL: missing capability 'web_search'."
+        }
+
     def test_sequential_tool_callbacks_fire_in_order(self, agent):
         tool_call = _mock_tool_call(name="web_search", arguments='{"query":"hello"}', call_id="c1")
         mock_msg = _mock_assistant_msg(content="", tool_calls=[tool_call])

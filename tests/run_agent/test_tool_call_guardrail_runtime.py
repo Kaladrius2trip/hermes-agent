@@ -86,6 +86,32 @@ def _hard_stop_config(**overrides) -> dict:
     return cfg
 
 
+def test_sequential_executor_preserves_explicit_empty_tool_allowlist():
+    agent = _make_agent()
+    setattr(agent, "valid_tool_names", set())
+    tc = _mock_tool_call("read_file", json.dumps({"path": "secret.txt"}), "c-empty-acl")
+    msg = SimpleNamespace(content="", tool_calls=[tc])
+    messages = []
+
+    with patch("run_agent.handle_function_call", return_value=json.dumps({"error": "denied"})) as mock_hfc:
+        agent._execute_tool_calls_sequential(msg, messages, "task-1")
+
+    assert mock_hfc.call_args.kwargs["enabled_tools"] == []
+
+
+def test_sequential_executor_treats_none_valid_tool_names_as_empty_allowlist():
+    agent = _make_agent()
+    setattr(agent, "valid_tool_names", None)
+    tc = _mock_tool_call("read_file", json.dumps({"path": "secret.txt"}), "c-none-acl")
+    msg = SimpleNamespace(content="", tool_calls=[tc])
+    messages = []
+
+    with patch("run_agent.handle_function_call", return_value=json.dumps({"error": "denied"})) as mock_hfc:
+        agent._execute_tool_calls_sequential(msg, messages, "task-1")
+
+    assert mock_hfc.call_args.kwargs["enabled_tools"] == []
+
+
 def test_default_sequential_path_warns_repeated_exact_failure_without_blocking_execution():
     agent = _make_agent("web_search")
     args = {"query": "same"}

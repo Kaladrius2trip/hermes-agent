@@ -3,8 +3,10 @@
 import asyncio
 import importlib
 import sys
+import tempfile
 import time
 import types
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -12,6 +14,7 @@ import pytest
 from gateway.config import Platform, PlatformConfig, StreamingConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
 from gateway.session import SessionSource
+from gateway.acl import ACLStore, BootstrapSuperAdmins
 
 
 class ProgressCaptureAdapter(BasePlatformAdapter):
@@ -237,6 +240,17 @@ def _make_runner(adapter):
     runner._running_agents = {}
     runner._session_run_generation = {}
     runner.hooks = SimpleNamespace(loaded_hooks=False)
+    runner.acl_store = ACLStore(Path(tempfile.mkdtemp()) / "acl.sqlite3")
+    runner._acl_bootstrap_super_admins = BootstrapSuperAdmins.empty()
+    for user_id in ("user-1", "progress-user"):
+        runner.acl_store.grant_membership(
+            platform="discord",
+            subject_type="user",
+            subject_id=user_id,
+            group_name="default",
+            scope="dm",
+            scope_id=None,
+        )
     runner.config = SimpleNamespace(
         thread_sessions_per_user=False,
         group_sessions_per_user=False,
@@ -1104,6 +1118,7 @@ async def test_run_agent_drops_tool_progress_after_generation_invalidation(monke
         platform=Platform.DISCORD,
         chat_id="dm-1",
         chat_type="dm",
+        user_id="progress-user",
         thread_id=None,
     )
     session_key = "agent:main:discord:dm:dm-1"
@@ -1165,6 +1180,7 @@ async def test_run_agent_drops_interim_commentary_after_generation_invalidation(
         platform=Platform.DISCORD,
         chat_id="dm-2",
         chat_type="dm",
+        user_id="progress-user",
         thread_id=None,
     )
     session_key = "agent:main:discord:dm:dm-2"
