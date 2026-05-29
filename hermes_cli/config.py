@@ -1442,6 +1442,13 @@ DEFAULT_CONFIG = {
         # Flip to true only if you trust delegated work to run dangerous cmds
         # without human review (cron pipelines, batch automation, etc.).
         "subagent_auto_approve": False,
+        # Named delegation categories (capability layer). Each category bundles a
+        # provider/model + runtime budget + toolset scope so callers delegate by
+        # intent ("quick", "deep", …) instead of wiring providers ad hoc. Empty by
+        # default — legacy single-provider delegation keeps working untouched.
+        # Resolved by tools/delegation_categories.resolve_delegation_category.
+        "default_category": "",
+        "categories": {},
     },
 
     # Ephemeral prefill messages file — JSON list of {role, content} dicts
