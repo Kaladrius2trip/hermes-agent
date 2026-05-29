@@ -160,6 +160,60 @@ hermes -w -q "Fix issue #123"
 
 For parallel agents, open multiple terminals and run `hermes -w` in each — every invocation gets its own worktree and branch automatically.
 
+## Running non-root Claude Code against a root-owned worktree
+
+Some WSL/Hermes operator setups launch Claude Code through a non-root wrapper such as `/usr/local/bin/claude-yolo`. If Hermes itself runs as `root`, do **not** rely on broad ACL traversal through `/root` or `/root/.hermes` for the worktree's git metadata. Hermes CLI commands may tighten permissions on `~/.hermes`, which can reset ACL masks and make a later non-root `git status` fail with `fatal: not a git repository: (null)`.
+
+Use a scoped bind layout instead:
+
+1. Bind only the intended worktree to a non-root-visible checkout path.
+2. Bind only the source repository's shared `.git` metadata to a non-root-visible metadata path.
+3. Rewrite only that worktree's `.git` pointer to the bound metadata path.
+4. Add narrow `safe.directory` entries for those exact paths. Do not use `safe.directory='*'`.
+5. Run a preflight after a harmless Hermes CLI command before launching Claude Code.
+
+Example local runbook (adjust paths for your worktree):
+
+```bash
+ROOT_WORKTREE=/root/.config/superpowers/worktrees/hermes-agent/feat-openagent-capability-layer
+CLAUDE_WORKTREE=/home/claude-yolo/workspaces/hermes-agent-openagent-capability-layer
+LIVE_GIT=/home/claude-yolo/workspaces/hermes-agent-live-git
+CLAUDE_USER=claude-yolo
+
+# Capture git paths before rewriting the worktree .git pointer.
+WORKTREE_GITDIR=$(git -C "$ROOT_WORKTREE" rev-parse --absolute-git-dir)
+WORKTREE_GITDIR_NAME=$(basename "$WORKTREE_GITDIR")
+SOURCE_COMMON_GIT=$(git -C "$ROOT_WORKTREE" rev-parse --path-format=absolute --git-common-dir)
+
+sudo mkdir -p "$CLAUDE_WORKTREE" "$LIVE_GIT"
+sudo mount --bind "$ROOT_WORKTREE" "$CLAUDE_WORKTREE"
+sudo mount --bind "$SOURCE_COMMON_GIT" "$LIVE_GIT"
+
+# Rewrite only this checkout's .git pointer. Do not rewrite the source repo .git.
+printf 'gitdir: %s/worktrees/%s\n' "$LIVE_GIT" "$WORKTREE_GITDIR_NAME" | sudo tee "$ROOT_WORKTREE/.git" >/dev/null
+
+runuser -u "$CLAUDE_USER" -- git config --global --add safe.directory "$ROOT_WORKTREE"
+runuser -u "$CLAUDE_USER" -- git config --global --add safe.directory "$CLAUDE_WORKTREE"
+runuser -u "$CLAUDE_USER" -- git config --global --add safe.directory "$LIVE_GIT"
+```
+
+Then verify the exact setup with the read-only preflight script:
+
+```bash
+# Optional but recommended: include a harmless Hermes command to catch permission resets.
+python scripts/claude_yolo_worktree_preflight.py \
+  --worktree "$ROOT_WORKTREE" \
+  --live-git "$LIVE_GIT" \
+  --user "$CLAUDE_USER" \
+  --hermes-command "hermes --version"
+
+runuser -u "$CLAUDE_USER" -- git -C "$ROOT_WORKTREE" status --short --branch
+runuser -u "$CLAUDE_USER" -- git -C "$CLAUDE_WORKTREE" status --short --branch
+git -C "$ROOT_WORKTREE" status --short --branch
+```
+
+Launch `/usr/local/bin/claude-yolo` from `$CLAUDE_WORKTREE`, not from the private root path. The script is verification-only: it does not mount, change ACLs, edit git config, or expose credentials.
+
 ## Putting It All Together
 
 - Use **git worktrees** to give each Hermes session its own clean checkout.
