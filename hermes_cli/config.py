@@ -1508,6 +1508,14 @@ DEFAULT_CONFIG = {
         # External hub installs (trusted/community sources) are always
         # scanned regardless of this setting.
         "guard_agent_created": False,
+        # Skill-scoped MCP servers (Phase 4 MVP). When a skill declares an
+        # `mcp:` manifest in its frontmatter, skill_view surfaces it for
+        # inspection, but servers are only built/registered when this is on.
+        # Off by default: starting MCP servers on skill load runs skill-author
+        # commands with skill-author-chosen env, so it stays opt-in.
+        "mcp": {
+            "enabled": False,
+        },
     },
 
     # Curator — background skill maintenance.

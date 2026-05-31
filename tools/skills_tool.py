@@ -179,6 +179,34 @@ def _collect_prerequisite_values(
     )
 
 
+def _skill_mcp_source(skill_md: Path, skill_name: str) -> str:
+    """Return the trust bucket used for skill-scoped MCP manifests.
+
+    User skills in SKILLS_DIR are allowed to request MCP env names unless the
+    hub lock says they came from a lower-trust community source. External/project
+    skills are lower-trust by path and may not request env passthrough in the
+    Phase 4 MVP.
+    """
+    try:
+        skill_md.resolve().relative_to(SKILLS_DIR.resolve())
+    except Exception:
+        return "project"
+
+    try:
+        from tools.skills_hub import HubLockFile
+
+        entry = HubLockFile().get_installed(skill_name)
+    except Exception:
+        return "project"
+
+    if isinstance(entry, dict):
+        trust_level = str(entry.get("trust_level") or "").strip().lower()
+        if trust_level not in {"builtin", "trusted", "user"}:
+            return "project"
+
+    return "user"
+
+
 def _normalize_setup_metadata(frontmatter: Dict[str, Any]) -> Dict[str, Any]:
     setup = frontmatter.get("setup")
     if not isinstance(setup, dict):
@@ -1118,6 +1146,32 @@ def skill_view(
                 ensure_ascii=False,
             )
 
+        # ── Skill-scoped MCP manifest (Phase 4 MVP) ──────────────────
+        # Surface a declared `mcp:` manifest for inspection. skill_view never
+        # starts servers — registration is a separate, config-gated step.
+        # Project skills (loaded from external_dirs, not the trusted user
+        # skills dir) are lower-trust and may NOT request env passthrough.
+        mcp_manifest = parsed_frontmatter.get("mcp")
+        if isinstance(mcp_manifest, dict):
+            skill_source = _skill_mcp_source(skill_md, resolved_name)
+
+            if skill_source == "project":
+                requested_env: List[str] = []
+                for server in (mcp_manifest.get("servers") or {}).values():
+                    if isinstance(server, dict):
+                        requested_env.extend(server.get("env_allowlist") or [])
+                if requested_env:
+                    return json.dumps(
+                        {
+                            "success": False,
+                            "error": (
+                                "project skills cannot request MCP env_allowlist: "
+                                + ", ".join(requested_env)
+                            ),
+                        },
+                        ensure_ascii=False,
+                    )
+
         # If a specific file path is requested, read that instead
         if file_path and skill_dir:
             from tools.path_security import validate_within_dir, has_traversal_component
@@ -1403,6 +1457,9 @@ def skill_view(
             if setup_needed
             else SkillReadinessStatus.AVAILABLE.value,
         }
+
+        if isinstance(mcp_manifest, dict):
+            result["mcp"] = mcp_manifest
 
         setup_help = next((e["help"] for e in required_env_vars if e.get("help")), None)
         if setup_help:

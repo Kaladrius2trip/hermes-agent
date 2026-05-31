@@ -3313,6 +3313,120 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
 # Public API
 # ---------------------------------------------------------------------------
 
+def build_skill_mcp_servers(
+    skill_name: str,
+    mcp_manifest: Dict[str, Any],
+    *,
+    skill_source: str = "project",
+) -> Dict[str, dict]:
+    """Translate a skill's ``mcp:`` manifest into scoped server configs.
+
+    Each entry is keyed ``skill:<skill_name>:<server_name>`` so skill-provided
+    servers can never collide with or shadow globally-configured ones. The
+    skill-author-facing fields are mapped to the register_mcp_servers shape:
+
+    * ``env_allowlist`` -> ``env`` (resolved from the current process env)
+    * ``tools_allowlist`` -> ``tools: {"include": [...]}}``
+
+    Fails closed:
+
+    * Project-source skills may not request ``env_allowlist`` at all (they are
+      lower-trust than user skills), raising ``ValueError``.
+    * A requested env var that is missing or empty raises ``ValueError`` — we
+      never start a server with a half-populated credential set.
+
+    Error messages name the offending variables but never their values.
+    """
+    servers_in = (mcp_manifest or {}).get("servers") or {}
+    out: Dict[str, dict] = {}
+
+    allowed_server_keys = {
+        "command",
+        "args",
+        "url",
+        "headers",
+        "cwd",
+        "enabled",
+        "connect_timeout",
+        "tool_timeout",
+        "timeout",
+        "tools",
+        "utility_tools",
+        "supports_parallel_tool_calls",
+    }
+
+    for server_name, raw in servers_in.items():
+        raw_cfg = dict(raw or {})
+        env_allowlist = list(raw_cfg.get("env_allowlist") or [])
+        tools_allowlist = list(raw_cfg.get("tools_allowlist") or [])
+        cfg = {k: v for k, v in raw_cfg.items() if k in allowed_server_keys}
+
+        if env_allowlist and skill_source != "user":
+            source_label = str(skill_source or "unknown")
+            raise ValueError(
+                f"{source_label} skills cannot request MCP env_allowlist: "
+                + ", ".join(env_allowlist)
+            )
+
+        env: Dict[str, str] = {}
+        bad: List[str] = []
+        for var in env_allowlist:
+            raw_value = os.getenv(var)
+            value = raw_value.strip() if isinstance(raw_value, str) else raw_value
+            if not value:
+                bad.append(var)
+            else:
+                env[var] = value
+        if bad:
+            raise ValueError(
+                "skill MCP env_allowlist variables are missing or empty: "
+                + ", ".join(bad)
+            )
+        if env:
+            cfg["env"] = env
+
+        if tools_allowlist:
+            cfg["tools"] = {"include": tools_allowlist}
+
+        safe_skill_name = sanitize_mcp_name_component(skill_name)
+        safe_server_name = sanitize_mcp_name_component(server_name)
+        out[f"skill:{safe_skill_name}:{safe_server_name}"] = cfg
+
+    return out
+
+
+def register_skill_mcp_servers(
+    skill_name: str,
+    mcp_manifest: Dict[str, Any],
+    *,
+    skill_source: str = "project",
+) -> List[str]:
+    """Build and register a skill's scoped MCP servers (gated by config).
+
+    Returns the empty list when skill-scoped MCP is disabled (the default).
+    Building may raise ``ValueError`` for invalid/over-privileged manifests;
+    see ``build_skill_mcp_servers``.
+    """
+    enabled = False
+    try:
+        from hermes_cli.config import load_config, cfg_get
+
+        skills_cfg = load_config().get("skills", {})
+        enabled = _parse_boolish(cfg_get(skills_cfg, "mcp", "enabled"), default=False)
+    except Exception:
+        logger.debug("Could not read skill-scoped MCP config; leaving disabled", exc_info=True)
+        enabled = False
+
+    if not enabled:
+        logger.debug("Skill-scoped MCP disabled -- not registering %s servers", skill_name)
+        return []
+
+    servers = build_skill_mcp_servers(
+        skill_name, mcp_manifest, skill_source=skill_source
+    )
+    return register_mcp_servers(servers)
+
+
 def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
     """Connect to explicit MCP servers and register their tools.
 
