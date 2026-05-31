@@ -96,6 +96,22 @@ from urllib.parse import urlparse
 logger = logging.getLogger(__name__)
 
 
+_SKILL_MCP_SERVER_KEYS = frozenset(
+    {
+        "command",
+        "args",
+        "cwd",
+        "enabled",
+        "connect_timeout",
+        "tool_timeout",
+        "timeout",
+        "env_allowlist",
+        "tools_allowlist",
+        "trust",
+    }
+)
+
+
 # ---------------------------------------------------------------------------
 # Stdio subprocess stderr redirection
 # ---------------------------------------------------------------------------
@@ -3337,29 +3353,48 @@ def build_skill_mcp_servers(
 
     Error messages name the offending variables but never their values.
     """
-    servers_in = (mcp_manifest or {}).get("servers") or {}
+    manifest = mcp_manifest or {}
+    if not isinstance(manifest, dict):
+        raise ValueError("mcp manifest must be a mapping")
+    unsupported_manifest_keys = sorted(set(manifest) - {"servers"})
+    if unsupported_manifest_keys:
+        raise ValueError(
+            "unsupported MCP manifest keys: " + ", ".join(unsupported_manifest_keys)
+        )
+    servers_in = manifest.get("servers") or {}
+    if not isinstance(servers_in, dict):
+        raise ValueError("mcp.servers must be a mapping")
     out: Dict[str, dict] = {}
 
-    allowed_server_keys = {
+    runtime_server_keys = {
         "command",
         "args",
-        "url",
-        "headers",
         "cwd",
         "enabled",
         "connect_timeout",
         "tool_timeout",
         "timeout",
-        "tools",
-        "utility_tools",
-        "supports_parallel_tool_calls",
     }
 
     for server_name, raw in servers_in.items():
+        if not isinstance(raw, dict):
+            raise ValueError(f"server '{server_name}' config must be a mapping")
         raw_cfg = dict(raw or {})
-        env_allowlist = list(raw_cfg.get("env_allowlist") or [])
-        tools_allowlist = list(raw_cfg.get("tools_allowlist") or [])
-        cfg = {k: v for k, v in raw_cfg.items() if k in allowed_server_keys}
+        unsupported_keys = sorted(set(raw_cfg) - _SKILL_MCP_SERVER_KEYS)
+        if unsupported_keys:
+            raise ValueError(
+                f"unsupported MCP manifest keys for server '{server_name}': "
+                + ", ".join(unsupported_keys)
+            )
+        raw_env_allowlist = raw_cfg.get("env_allowlist") or []
+        raw_tools_allowlist = raw_cfg.get("tools_allowlist") or []
+        if not isinstance(raw_env_allowlist, list):
+            raise ValueError("env_allowlist must be a list of env variable names")
+        if not isinstance(raw_tools_allowlist, list):
+            raise ValueError("tools_allowlist must be a list of MCP tool names")
+        env_allowlist = [str(var) for var in raw_env_allowlist]
+        tools_allowlist = [str(tool) for tool in raw_tools_allowlist]
+        cfg = {k: v for k, v in raw_cfg.items() if k in runtime_server_keys}
 
         if env_allowlist and skill_source != "user":
             source_label = str(skill_source or "unknown")

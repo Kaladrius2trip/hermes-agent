@@ -85,6 +85,56 @@ class TestSkillViewMcpManifest:
         assert "SKILL_MCP_TOKEN" in result["error"]
         assert "project-secret-token" not in json.dumps(result, ensure_ascii=False)
 
+    def test_skill_view_rejects_raw_mcp_env_without_leaking_values(self, tmp_path, monkeypatch):
+        """Skill-scoped MCP manifests must not surface literal env/headers secrets."""
+        _create_skill(
+            tmp_path,
+            "raw-env-triage",
+            """mcp:
+  servers:
+    raw-secret:
+      command: gh
+      env:
+        GITHUB_TOKEN: literal-secret-value
+      headers:
+        Authorization: "Bearer header-secret-value"
+""",
+        )
+        monkeypatch.setattr("tools.skills_tool.SKILLS_DIR", tmp_path)
+
+        from tools.skills_tool import skill_view
+
+        result = json.loads(skill_view("raw-env-triage"))
+
+        assert result["success"] is False
+        assert "unsupported MCP manifest keys" in result["error"]
+        assert "env" in result["error"]
+        assert "headers" in result["error"]
+        assert "literal-secret-value" not in json.dumps(result, ensure_ascii=False)
+        assert "header-secret-value" not in json.dumps(result, ensure_ascii=False)
+
+    def test_skill_view_rejects_top_level_mcp_env_without_leaking_values(self, tmp_path, monkeypatch):
+        """Unexpected top-level MCP keys must not be mirrored through skill_view."""
+        _create_skill(
+            tmp_path,
+            "raw-top-level-env",
+            """mcp:
+  env:
+    GITHUB_TOKEN: literal-secret-value
+  servers: {}
+""",
+        )
+        monkeypatch.setattr("tools.skills_tool.SKILLS_DIR", tmp_path)
+
+        from tools.skills_tool import skill_view
+
+        result = json.loads(skill_view("raw-top-level-env"))
+
+        assert result["success"] is False
+        assert "unsupported MCP manifest keys" in result["error"]
+        assert "env" in result["error"]
+        assert "literal-secret-value" not in json.dumps(result, ensure_ascii=False)
+
     def test_hub_community_skill_in_user_dir_with_mcp_env_allowlist_is_rejected(
         self, tmp_path, monkeypatch
     ):
@@ -213,6 +263,60 @@ class TestSkillMcpServerBuilder:
         assert "EMPTY_SKILL_MCP_TOKEN" in message
         assert "secret-token-value" not in message
 
+    def test_build_skill_mcp_servers_rejects_string_env_allowlist(self, monkeypatch):
+        """env_allowlist must be a list of env names, not an arbitrary scalar."""
+        from tools.mcp_tool import build_skill_mcp_servers
+
+        monkeypatch.setenv("SKILL_MCP_TOKEN", "secret-token-value")
+
+        with pytest.raises(ValueError) as excinfo:
+            build_skill_mcp_servers(
+                "github-triage",
+                {
+                    "servers": {
+                        "github-readonly": {
+                            "command": "gh",
+                            "env_allowlist": "SKILL_MCP_TOKEN",
+                        }
+                    }
+                },
+                skill_source="user",
+            )
+
+        message = str(excinfo.value)
+        assert "env_allowlist must be a list of env variable names" in message
+        assert "secret-token-value" not in message
+
+    def test_build_skill_mcp_servers_rejects_top_level_env_without_leaking_values(self):
+        """Unexpected top-level MCP keys fail closed before server startup."""
+        from tools.mcp_tool import build_skill_mcp_servers
+
+        with pytest.raises(ValueError) as excinfo:
+            build_skill_mcp_servers(
+                "github-triage",
+                {
+                    "env": {"GITHUB_TOKEN": "literal-secret-value"},
+                    "servers": {},
+                },
+                skill_source="user",
+            )
+
+        message = str(excinfo.value)
+        assert "unsupported MCP manifest keys" in message
+        assert "env" in message
+        assert "literal-secret-value" not in message
+
+    def test_build_skill_mcp_servers_rejects_non_mapping_server_config(self):
+        """Server entries must be mappings so strings cannot crash with opaque errors."""
+        from tools.mcp_tool import build_skill_mcp_servers
+
+        with pytest.raises(ValueError, match="server 'github-readonly' config must be a mapping"):
+            build_skill_mcp_servers(
+                "github-triage",
+                {"servers": {"github-readonly": "gh"}},
+                skill_source="user",
+            )
+
     def test_project_source_cannot_build_mcp_server_with_env_allowlist(self, monkeypatch):
         from tools.mcp_tool import build_skill_mcp_servers
 
@@ -284,6 +388,33 @@ class TestSkillMcpServerBuilder:
         message = str(excinfo.value)
         assert "WHITESPACE_SKILL_MCP_TOKEN" in message
         assert "   " not in message
+
+    def test_skill_mcp_safe_env_excludes_unallowlisted_parent_secret(self, monkeypatch):
+        """Skill MCP env mapping does not make unrelated process secrets inherited."""
+        from tools.mcp_tool import _build_safe_env, build_skill_mcp_servers
+
+        monkeypatch.setenv("SKILL_MCP_TOKEN", "secret-token-value")
+        monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "unrelated-parent-secret")
+
+        servers = build_skill_mcp_servers(
+            "github-triage",
+            {
+                "servers": {
+                    "github-readonly": {
+                        "command": "gh",
+                        "env_allowlist": ["SKILL_MCP_TOKEN"],
+                    }
+                }
+            },
+            skill_source="user",
+        )
+
+        child_env = _build_safe_env(
+            servers["skill:github_triage:github_readonly"].get("env")
+        )
+        assert child_env["SKILL_MCP_TOKEN"] == "secret-token-value"
+        assert "AWS_SECRET_ACCESS_KEY" not in child_env
+        assert "unrelated-parent-secret" not in json.dumps(child_env, ensure_ascii=False)
 
     def test_build_skill_mcp_servers_sanitizes_scoped_server_key(self):
         from tools.mcp_tool import build_skill_mcp_servers
@@ -378,3 +509,34 @@ class TestSkillMcpExplicitActivation:
                 }
             }
         )
+
+    def test_register_skill_mcp_servers_does_not_log_env_values_before_dispatch(
+        self, monkeypatch, caplog
+    ):
+        """Registration helper must not log allowlisted env values while building configs."""
+        import logging
+
+        from tools.mcp_tool import register_skill_mcp_servers
+
+        monkeypatch.setenv("SKILL_MCP_TOKEN", "secret-token-value")
+        manifest = {
+            "servers": {
+                "github-readonly": {
+                    "command": "gh",
+                    "env_allowlist": ["SKILL_MCP_TOKEN"],
+                }
+            }
+        }
+
+        caplog.set_level(logging.DEBUG, logger="tools.mcp_tool")
+        with (
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={"skills": {"mcp": {"enabled": True}}},
+            ),
+            patch("tools.mcp_tool.register_mcp_servers", return_value=[]) as register_mcp,
+        ):
+            register_skill_mcp_servers("github-triage", manifest, skill_source="user")
+
+        register_mcp.assert_called_once()
+        assert "secret-token-value" not in caplog.text

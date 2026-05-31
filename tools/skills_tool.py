@@ -84,6 +84,22 @@ from agent.skill_utils import EXCLUDED_SKILL_DIRS as _EXCLUDED_SKILL_DIRS
 logger = logging.getLogger(__name__)
 
 
+_SKILL_MCP_SERVER_KEYS = frozenset(
+    {
+        "command",
+        "args",
+        "cwd",
+        "enabled",
+        "connect_timeout",
+        "tool_timeout",
+        "timeout",
+        "env_allowlist",
+        "tools_allowlist",
+        "trust",
+    }
+)
+
+
 # All skills live in ~/.hermes/skills/ (seeded from bundled skills/ on install).
 # This is the single source of truth -- agent edits, hub installs, and bundled
 # skills all coexist here without polluting the git repo.
@@ -1155,11 +1171,65 @@ def skill_view(
         if isinstance(mcp_manifest, dict):
             skill_source = _skill_mcp_source(skill_md, resolved_name)
 
+            unsupported_manifest_keys = sorted(set(mcp_manifest) - {"servers"})
+            if unsupported_manifest_keys:
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": (
+                            "unsupported MCP manifest keys: "
+                            + ", ".join(unsupported_manifest_keys)
+                        ),
+                    },
+                    ensure_ascii=False,
+                )
+
+            servers_manifest = mcp_manifest.get("servers") or {}
+            if not isinstance(servers_manifest, dict):
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": "mcp.servers must be a mapping",
+                    },
+                    ensure_ascii=False,
+                )
+
+            for server_name, server in servers_manifest.items():
+                if not isinstance(server, dict):
+                    return json.dumps(
+                        {
+                            "success": False,
+                            "error": f"server '{server_name}' config must be a mapping",
+                        },
+                        ensure_ascii=False,
+                    )
+                unsupported_keys = sorted(set(server) - _SKILL_MCP_SERVER_KEYS)
+                if unsupported_keys:
+                    return json.dumps(
+                        {
+                            "success": False,
+                            "error": (
+                                "unsupported MCP manifest keys for server "
+                                f"'{server_name}': " + ", ".join(unsupported_keys)
+                            ),
+                        },
+                        ensure_ascii=False,
+                    )
+
             if skill_source == "project":
                 requested_env: List[str] = []
-                for server in (mcp_manifest.get("servers") or {}).values():
+                for server in servers_manifest.values():
                     if isinstance(server, dict):
-                        requested_env.extend(server.get("env_allowlist") or [])
+                        env_allowlist = server.get("env_allowlist") or []
+                        if not isinstance(env_allowlist, list):
+                            return json.dumps(
+                                {
+                                    "success": False,
+                                    "error": "env_allowlist must be a list of env variable names",
+                                },
+                                ensure_ascii=False,
+                            )
+                        requested_env.extend(str(v) for v in env_allowlist)
                 if requested_env:
                     return json.dumps(
                         {
