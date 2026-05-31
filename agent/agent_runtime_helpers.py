@@ -1700,6 +1700,9 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             session_id=agent.session_id or "",
             enabled_tools=list(agent.valid_tool_names),
             skip_pre_tool_call_hook=True,
+            enabled_toolsets=getattr(agent, "enabled_toolsets", None),
+            disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+            allowed_tool_names=getattr(agent, "allowed_tool_names", None),
         )
 
 
