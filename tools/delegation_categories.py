@@ -98,6 +98,7 @@ def _inactive_result(parent_toolsets, requested_toolsets) -> Dict[str, Any]:
         "category": "",
         "provider": "",
         "model": "",
+        "recipe": "",
         "reasoning_effort": "",
         "toolsets": toolsets,
         "max_iterations": None,
@@ -125,7 +126,7 @@ def resolve_delegation_category(
             further narrowing on top of the category + parent scope.
 
     Returns:
-        A dict with keys ``category``, ``provider``, ``model``,
+        A dict with keys ``category``, ``provider``, ``model``, ``recipe``,
         ``reasoning_effort``, ``toolsets``, ``max_iterations``,
         ``child_timeout_seconds``, ``fallback_chain`` and ``fallback_metadata``.
 
@@ -196,6 +197,7 @@ def resolve_delegation_category(
         "category": name,
         "provider": spec.get("provider", ""),
         "model": spec.get("model", ""),
+        "recipe": spec.get("recipe", ""),
         "reasoning_effort": spec.get("reasoning_effort", ""),
         "toolsets": toolsets,
         "max_iterations": spec.get("max_iterations"),

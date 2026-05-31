@@ -35,6 +35,7 @@ from tools.delegation_categories import (
     DelegationCategoryConfigError,
     resolve_delegation_category,
 )
+from tools.agent_recipes import get_builtin_recipe, render_agent_recipe
 
 # Sentinel value used by the runtime provider system for providers that are
 # not natively known (named custom providers, third-party aggregators, etc.).
@@ -611,6 +612,8 @@ def _build_child_system_prompt(
     role: str = "leaf",
     max_spawn_depth: int = 2,
     child_depth: int = 1,
+    agent_recipe: Optional[str] = None,
+    recipe_values: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Build a focused system prompt for a child agent.
 
@@ -676,6 +679,18 @@ def _build_child_system_prompt(
             f"NOTE: You are at depth {child_depth}. The delegation tree "
             f"is capped at max_spawn_depth={max_spawn_depth}. {child_note}"
         )
+    if agent_recipe and str(agent_recipe).strip():
+        values = dict(recipe_values or {})
+        values.setdefault("goal", goal)
+        values.setdefault("context", context or "")
+        values.setdefault("role", role)
+        values.setdefault("workspace_path", workspace_path or "")
+        values.setdefault("child_depth", child_depth)
+        values.setdefault("max_spawn_depth", max_spawn_depth)
+        values.setdefault("category", "")
+        values.setdefault("toolsets", "")
+        recipe = get_builtin_recipe(str(agent_recipe).strip())
+        parts.append("\n" + render_agent_recipe(recipe, **values))
     return "\n".join(parts)
 
 
@@ -928,6 +943,7 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    agent_recipe: Optional[str] = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -997,6 +1013,13 @@ def _build_child_agent(
         role=effective_role,
         max_spawn_depth=max_spawn,
         child_depth=child_depth,
+        agent_recipe=agent_recipe,
+        recipe_values={
+            "category": (delegation_category or {}).get("category", ""),
+            "toolsets": child_toolsets,
+            "model": model or getattr(parent_agent, "model", ""),
+            "provider": override_provider or getattr(parent_agent, "provider", ""),
+        },
     )
     # Extract parent's API key so subagents inherit auth (e.g. Nous Portal).
     parent_api_key = getattr(parent_agent, "api_key", None)
@@ -1183,13 +1206,17 @@ def _build_child_agent(
                 override_child_timeout_seconds,
             )
     if delegation_category and delegation_category.get("category"):
+        category_metadata = {
+            "category": delegation_category.get("category"),
+            "fallback_metadata": delegation_category.get("fallback_metadata", {}),
+        }
+        recipe_name = str(delegation_category.get("recipe") or agent_recipe or "").strip()
+        if recipe_name:
+            category_metadata["recipe"] = recipe_name
         setattr(
             child,
             "_delegation_category",
-            {
-                "category": delegation_category.get("category"),
-                "fallback_metadata": delegation_category.get("fallback_metadata", {}),
-            },
+            category_metadata,
         )
 
     # Share a credential pool with the child when possible so subagents can
@@ -2105,6 +2132,12 @@ def delegate_task(
             return tool_error(str(exc))
 
         runtime_max_iter = resolved_category.get("max_iterations") or default_max_iter
+        runtime_recipe = str(resolved_category.get("recipe") or cfg.get("recipe") or "").strip()
+        if runtime_recipe:
+            try:
+                get_builtin_recipe(runtime_recipe)
+            except KeyError as exc:
+                return tool_error(str(exc))
         task_runtimes.append(
             {
                 "toolsets": resolved_category.get("toolsets"),
@@ -2113,6 +2146,7 @@ def delegate_task(
                 "max_iterations": runtime_max_iter,
                 "reasoning_effort": resolved_category.get("reasoning_effort") or None,
                 "child_timeout_seconds": resolved_category.get("child_timeout_seconds"),
+                "recipe": runtime_recipe or None,
             }
         )
 
@@ -2168,6 +2202,7 @@ def delegate_task(
                     else (acp_args if acp_args is not None else creds.get("args"))
                 ),
                 role=effective_role,
+                agent_recipe=runtime["recipe"],
             )
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names
