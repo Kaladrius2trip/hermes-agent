@@ -6207,6 +6207,13 @@ def cmd_kanban(args):
     return kanban_command(args)
 
 
+def cmd_team(args):
+    """Deterministic team-mode planner over Kanban."""
+    from hermes_cli.team import team_command
+
+    return team_command(args)
+
+
 def cmd_hooks(args):
     """Shell-hook inspection and management."""
     from hermes_cli.hooks import hooks_command
@@ -11013,7 +11020,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate",
         "model", "pairing", "plugins", "portal", "postinstall", "profile", "proxy",
         "send", "sessions", "setup",
-        "skills", "slack", "status", "tools", "uninstall", "update",
+        "skills", "slack", "status", "team", "tools", "uninstall", "update",
         "version", "webhook", "whatsapp", "chat", "secrets", "security",
         # Help-ish invocations — plugin commands not being listed in
         # top-level --help is an acceptable trade-off for skipping an
@@ -12261,6 +12268,14 @@ def main():
 
     kanban_parser = _build_kanban_parser(subparsers)
     kanban_parser.set_defaults(func=cmd_kanban)
+
+    # =========================================================================
+    # team command — deterministic team-mode planner over Kanban
+    # =========================================================================
+    from hermes_cli.team import build_parser as _build_team_parser
+
+    team_parser = _build_team_parser(subparsers)
+    team_parser.set_defaults(func=cmd_team)
 
     # =========================================================================
     # hooks command — shell-hook inspection and management
