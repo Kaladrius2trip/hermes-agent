@@ -672,11 +672,19 @@ def _cmd_plan(args: argparse.Namespace) -> int:
     created_by = getattr(args, "created_by", "user") or "user"
     board = getattr(args, "board", None)
 
-    teams_cfg = load_teams_config()
+    cfg = _config.load_config()
+    teams_cfg = load_teams_config(cfg)
     plan = build_team_plan(goal, team_name, teams_cfg)
 
+    try:
+        from tools.delegation_audit import build_team_plan_event, record_audit_event
+
+        record_audit_event(cfg, build_team_plan_event(plan))
+    except Exception:
+        pass
+
     if dry_run:
-        # No DB access at all on the dry-run path — guarantees zero writes.
+        # No DB access at all on the dry-run path — guarantees no task writes.
         if use_json:
             print(json.dumps({"dry_run": True, "plan": plan_to_dict(plan)},
                              indent=2, ensure_ascii=False))

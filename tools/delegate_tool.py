@@ -36,6 +36,7 @@ from tools.delegation_categories import (
     resolve_delegation_category,
 )
 from tools.agent_recipes import get_builtin_recipe, render_agent_recipe
+from tools.delegation_audit import build_delegation_run_event, record_audit_event
 
 # Sentinel value used by the runtime provider system for providers that are
 # not natively known (named custom providers, third-party aggregators, etc.).
@@ -2422,6 +2423,39 @@ def delegate_task(
             logger.debug("Subagent cost rollup failed", exc_info=True)
 
     total_duration = round(time.monotonic() - overall_start, 2)
+
+    # Local-only, opt-in audit bundle. Record safe run metadata after children
+    # finish; never include goal/context prompts or credential values.
+    for entry in results:
+        try:
+            idx = int(entry.get("task_index", 0) or 0)
+            runtime = task_runtimes[idx] if idx < len(task_runtimes) else {}
+            creds = runtime.get("creds") or {}
+            child = children[idx][2] if idx < len(children) else None
+            task = task_list[idx] if idx < len(task_list) else {}
+            record_audit_event(
+                cfg,
+                build_delegation_run_event(
+                    session_id=getattr(child, "session_id", None),
+                    parent_session_id=getattr(parent_agent, "session_id", None),
+                    category_requested=task.get("category"),
+                    resolved_category=runtime.get("category"),
+                    recipe=runtime.get("recipe"),
+                    provider=creds.get("provider"),
+                    model=creds.get("model") or getattr(child, "model", None),
+                    base_url=creds.get("base_url"),
+                    toolsets=runtime.get("toolsets"),
+                    child_timeout_seconds=runtime.get("child_timeout_seconds"),
+                    max_iterations=runtime.get("max_iterations"),
+                    status=entry.get("status"),
+                    result_summary=entry.get("summary"),
+                    error=entry.get("error"),
+                    task_index=idx,
+                    task_count=n_tasks,
+                ),
+            )
+        except Exception:
+            logger.debug("delegation audit event build failed", exc_info=True)
 
     return json.dumps(
         {

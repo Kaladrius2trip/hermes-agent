@@ -3443,10 +3443,12 @@ def register_skill_mcp_servers(
     see ``build_skill_mcp_servers``.
     """
     enabled = False
+    full_cfg: Dict[str, Any] = {}
     try:
         from hermes_cli.config import load_config, cfg_get
 
-        skills_cfg = load_config().get("skills", {})
+        full_cfg = load_config()
+        skills_cfg = full_cfg.get("skills", {})
         enabled = _parse_boolish(cfg_get(skills_cfg, "mcp", "enabled"), default=False)
     except Exception:
         logger.debug("Could not read skill-scoped MCP config; leaving disabled", exc_info=True)
@@ -3459,7 +3461,38 @@ def register_skill_mcp_servers(
     servers = build_skill_mcp_servers(
         skill_name, mcp_manifest, skill_source=skill_source
     )
-    return register_mcp_servers(servers)
+    registered = register_mcp_servers(servers)
+    try:
+        from tools.delegation_audit import build_mcp_env_decision_event, record_audit_event
+
+        allowed_names = sorted(
+            {
+                str(name)
+                for server_cfg in servers.values()
+                for name in ((server_cfg or {}).get("env") or {}).keys()
+            }
+        )
+        allowed_set = set(allowed_names)
+        stripped_count = sum(
+            1
+            for name in os.environ
+            if name not in _SAFE_ENV_KEYS
+            and not str(name).startswith("XDG_")
+            and name not in allowed_set
+        )
+        record_audit_event(
+            full_cfg,
+            build_mcp_env_decision_event(
+                allowed_names=allowed_names,
+                stripped_count=stripped_count,
+                decision="registered",
+                skill=skill_name,
+                source=skill_source,
+            ),
+        )
+    except Exception:
+        logger.debug("skill MCP audit event build failed", exc_info=True)
+    return registered
 
 
 def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:

@@ -1455,6 +1455,17 @@ DEFAULT_CONFIG = {
         # Resolved by tools/delegation_categories.resolve_delegation_category.
         "default_category": "",
         "categories": {},
+        # Local-only, privacy-safe delegation/observability audit bundle
+        # (P10 Phase 7). Disabled by default — when enabled, safe redacted
+        # event dicts (category routing, recipe, fallback, provider/model,
+        # toolsets, timeouts, result, team handoffs, MCP env decisions) are
+        # appended as JSONL. Never persists prompts/goals or credentials.
+        # Remote telemetry stays opt-in through the plugin system only.
+        # Resolved by tools/delegation_audit. Empty ``dir`` => Hermes logs dir.
+        "audit": {
+            "enabled": False,
+            "dir": "",
+        },
     },
 
     # Ephemeral prefill messages file — JSON list of {role, content} dicts
