@@ -54,6 +54,7 @@ QUARANTINE_DIR = HUB_DIR / "quarantine"
 AUDIT_LOG = HUB_DIR / "audit.log"
 TAPS_FILE = HUB_DIR / "taps.json"
 INDEX_CACHE_DIR = HUB_DIR / "index-cache"
+BACKUP_DIR = HUB_DIR / "backups"
 
 # Cache duration for remote index fetches
 INDEX_CACHE_TTL = 3600  # 1 hour
@@ -3087,6 +3088,7 @@ def ensure_hub_dirs() -> None:
     HUB_DIR.mkdir(parents=True, exist_ok=True)
     QUARANTINE_DIR.mkdir(exist_ok=True)
     INDEX_CACHE_DIR.mkdir(exist_ok=True)
+    BACKUP_DIR.mkdir(exist_ok=True)
     if not LOCK_FILE.exists():
         LOCK_FILE.write_text('{"version": 1, "installed": {}}\n')
     if not AUDIT_LOG.exists():
@@ -3118,6 +3120,320 @@ def quarantine_bundle(bundle: SkillBundle) -> Path:
             file_dest.write_text(file_content, encoding="utf-8")
 
     return dest
+
+
+_PERMISSIVE_LICENSES = {
+    "", "mit", "apache-2.0", "bsd-2-clause", "bsd-3-clause", "isc",
+    "mpl-2.0", "unlicense", "cc0-1.0", "public-domain",
+}
+
+
+def _read_frontmatter_file(path: Path) -> Tuple[Dict[str, Any], str]:
+    """Return YAML frontmatter dict and original content for a markdown skill file."""
+    content = path.read_text(encoding="utf-8")
+    metadata: Dict[str, Any] = {}
+    if content.startswith("---\n"):
+        end = content.find("\n---", 4)
+        if end != -1:
+            raw = content[4:end]
+            try:
+                parsed = yaml.safe_load(raw) or {}
+                if isinstance(parsed, dict):
+                    metadata = parsed
+            except yaml.YAMLError:
+                metadata = {}
+    return metadata, content
+
+
+def _license_warnings(metadata: Dict[str, Any]) -> List[Dict[str, str]]:
+    license_value = str(metadata.get("license", "")).strip()
+    if license_value.lower() in _PERMISSIVE_LICENSES:
+        return []
+    return [{
+        "code": "restrictive_license",
+        "message": f"License '{license_value}' may restrict reuse; review before publishing or sharing.",
+    }]
+
+
+def doctor_skill_path(path: Union[str, Path]) -> Dict[str, Any]:
+    """Inspect a skill directory or legacy flat markdown skill pack."""
+    source_path = Path(path).expanduser().resolve()
+    issues: List[Dict[str, str]] = []
+    warnings: List[Dict[str, str]] = []
+    metadata: Dict[str, Any] = {}
+    kind = "missing"
+    valid = False
+    suggested_action = "fix"
+
+    if not source_path.exists():
+        issues.append({"code": "path_missing", "message": f"Path does not exist: {source_path}"})
+    elif source_path.is_file():
+        kind = "flat_markdown" if source_path.suffix.lower() in {".md", ".markdown"} else "file"
+        if kind == "flat_markdown":
+            metadata, _ = _read_frontmatter_file(source_path)
+            warnings.extend(_license_warnings(metadata))
+            issues.append({
+                "code": "flat_markdown_requires_convert",
+                "message": "Flat markdown skills must be converted to a skill directory first.",
+            })
+            suggested_action = "convert_flat"
+        else:
+            issues.append({"code": "unsupported_file", "message": "Only markdown skill files can be imported directly."})
+    elif source_path.is_dir():
+        kind = "skill_directory"
+        skill_md = source_path / "SKILL.md"
+        if not skill_md.exists():
+            issues.append({"code": "missing_skill_md", "message": "Skill directory must contain SKILL.md."})
+        else:
+            metadata, _ = _read_frontmatter_file(skill_md)
+            if not metadata.get("name"):
+                issues.append({"code": "missing_name", "message": "SKILL.md frontmatter needs a name."})
+            if not metadata.get("description"):
+                issues.append({"code": "missing_description", "message": "SKILL.md frontmatter needs a description."})
+            warnings.extend(_license_warnings(metadata))
+            valid = not issues
+            suggested_action = "import" if valid else "fix"
+    else:
+        issues.append({"code": "unsupported_path", "message": f"Unsupported path type: {source_path}"})
+
+    return {
+        "valid": valid,
+        "kind": kind,
+        "metadata": metadata,
+        "issues": issues,
+        "warnings": warnings,
+        "suggested_action": suggested_action,
+        "provenance": {"source_path": str(source_path)},
+    }
+
+
+def convert_flat_skill(
+    path: Union[str, Path],
+    *,
+    output_dir: Optional[Union[str, Path]] = None,
+    dry_run: bool = False,
+    force: bool = False,
+) -> Dict[str, Any]:
+    """Convert a legacy flat markdown skill to ``<output>/<name>/SKILL.md``."""
+    source_path = Path(path).expanduser().resolve()
+    report = doctor_skill_path(source_path)
+    if report["kind"] != "flat_markdown":
+        raise ValueError(f"Not a flat markdown skill: {source_path}")
+
+    metadata = report.get("metadata") or {}
+    skill_name = _validate_skill_name(str(metadata.get("name") or source_path.stem))
+    category = str(metadata.get("category") or "").strip()
+    _, content = _read_frontmatter_file(source_path)
+    output_root = Path(output_dir).expanduser() if output_dir is not None else SKILLS_DIR
+    target_dir, install_rel_path = _target_for_import(output_root, category, skill_name)
+    target_file = target_dir / "SKILL.md"
+
+    from tools.skills_guard import scan_skill, should_allow_install
+
+    scan_result = scan_skill(source_path, source="community")
+    allowed, reason = should_allow_install(scan_result, force=force)
+    if not allowed:
+        raise ValueError(f"Flat skill conversion blocked by security scan: {reason}")
+
+    result = {
+        "skill_name": skill_name,
+        "source_path": str(source_path),
+        "target_path": str(target_file),
+        "install_path": install_rel_path,
+        "status": "would_convert" if dry_run else "converted",
+    }
+
+    if dry_run:
+        return result
+
+    if target_file.exists():
+        existing = target_file.read_text(encoding="utf-8")
+        if existing == content:
+            result["status"] = "already_converted"
+            return result
+        if not force:
+            raise ValueError(f"Target already exists with different content: {target_file}")
+
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target_file.write_text(content, encoding="utf-8")
+    return result
+
+
+def _relative_skill_files(skill_dir: Path) -> List[str]:
+    return sorted(
+        str(path.relative_to(skill_dir)).replace(os.sep, "/")
+        for path in skill_dir.rglob("*")
+        if path.is_file()
+    )
+
+
+def _reject_redirects_in_skill_tree(skill_dir: Path) -> None:
+    root = Path(skill_dir)
+    for entry in [root, *root.rglob("*")]:
+        if not _is_path_redirect(entry):
+            continue
+        try:
+            rel = entry.relative_to(root)
+        except ValueError:
+            rel = entry
+        raise ValueError(f"Skill import contains symlinks, which is not allowed: {rel}")
+
+
+def _target_for_import(output_root: Path, category: str, skill_name: str) -> Tuple[Path, str]:
+    safe_name = _validate_skill_name(skill_name)
+    safe_category = _validate_install_parent_path(category) if category else ""
+    rel_path = f"{safe_category}/{safe_name}" if safe_category else safe_name
+    target_dir = (output_root / rel_path).resolve(strict=False)
+    output_resolved = output_root.resolve(strict=False)
+    if not target_dir.is_relative_to(output_resolved):
+        raise ValueError(f"Unsafe import target: {target_dir}")
+    return target_dir, rel_path
+
+
+def import_skill_path(
+    path: Union[str, Path],
+    *,
+    output_dir: Optional[Union[str, Path]] = None,
+    dry_run: bool = False,
+    convert_flat: bool = False,
+    force: bool = False,
+) -> Dict[str, Any]:
+    """Import a local skill directory, or explicitly convert/import flat markdown."""
+    from tools.skills_guard import scan_skill, should_allow_install
+
+    raw_path = Path(path).expanduser()
+    if _is_path_redirect(raw_path):
+        raise ValueError(f"Skill import path is a symlink or redirected path: {raw_path}")
+
+    source_path = raw_path.resolve()
+    report = doctor_skill_path(source_path)
+    output_root = (Path(output_dir).expanduser() if output_dir is not None else SKILLS_DIR).resolve(strict=False)
+    provenance_source = source_path
+    provenance_kind = report["kind"]
+    converted_path: Optional[Path] = None
+
+    if report["kind"] == "flat_markdown":
+        if not convert_flat:
+            raise ValueError("flat_markdown skill pack requires --convert-flat before import")
+        converted = convert_flat_skill(source_path, output_dir=output_root, dry_run=dry_run, force=force)
+        if dry_run:
+            return {**converted, "status": "would_import", "kind": "flat_markdown"}
+        source_path = Path(converted["target_path"]).parent.resolve()
+        converted_path = source_path
+        report = doctor_skill_path(source_path)
+
+    if not report["valid"] or report["kind"] != "skill_directory":
+        issue_text = "; ".join(issue.get("message", "") for issue in report.get("issues", []))
+        raise ValueError(issue_text or f"Invalid skill pack: {source_path}")
+
+    metadata = dict(report.get("metadata") or {})
+    skill_name = _validate_skill_name(str(metadata.get("name") or source_path.name))
+    category = str(metadata.get("category") or "").strip()
+    target_dir, install_rel_path = _target_for_import(output_root, category, skill_name)
+
+    _reject_redirects_in_skill_tree(source_path)
+    files = _relative_skill_files(source_path)
+    provenance = {
+        "source_path": str(provenance_source),
+        "kind": provenance_kind,
+        "source_hash": content_hash(provenance_source),
+        "imported_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if converted_path is not None:
+        provenance["converted_path"] = str(converted_path)
+    result = {
+        "status": "would_import" if dry_run else "imported",
+        "skill_name": skill_name,
+        "source_path": str(source_path),
+        "target_path": str(target_dir),
+        "install_path": install_rel_path,
+        "provenance": provenance,
+    }
+    if dry_run:
+        return result
+
+    scan_result = scan_skill(source_path, source="community")
+    allowed, reason = should_allow_install(scan_result, force=force)
+    if not allowed:
+        raise ValueError(f"Skill import blocked by security scan: {reason}")
+
+    if target_dir.exists():
+        same_tree = target_dir.resolve(strict=False) == source_path.resolve(strict=False)
+        if not same_tree and not force:
+            raise ValueError(f"Target already exists: {target_dir}")
+        if not same_tree:
+            shutil.rmtree(target_dir)
+            target_dir.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(source_path, target_dir, symlinks=False)
+    else:
+        target_dir.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(source_path, target_dir, symlinks=False)
+
+    lock_metadata = dict(metadata)
+    lock_metadata["provenance"] = provenance
+    HubLockFile().record_install(
+        name=skill_name,
+        source="local",
+        identifier=f"local:{source_path}",
+        trust_level=scan_result.trust_level,
+        scan_verdict=scan_result.verdict,
+        skill_hash=content_hash(target_dir),
+        install_path=install_rel_path,
+        files=files,
+        metadata=lock_metadata,
+    )
+    append_audit_log(
+        "IMPORT", skill_name, "local", scan_result.trust_level,
+        scan_result.verdict, provenance["source_hash"],
+    )
+    return result
+
+
+def _backup_installed_skill(skill_name: str, install_path: Path, entry: dict) -> Path:
+    ensure_hub_dirs()
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    backup_dir = BACKUP_DIR / _validate_skill_name(skill_name) / stamp
+    backup_dir.mkdir(parents=True, exist_ok=False)
+    if install_path.exists():
+        shutil.copytree(install_path, backup_dir / "files", symlinks=False)
+    (backup_dir / "manifest.json").write_text(
+        json.dumps({"name": skill_name, "entry": entry}, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    return backup_dir
+
+
+def rollback_skill(skill_name: str) -> Dict[str, Any]:
+    """Restore latest backup created by uninstall/update lifecycle actions."""
+    safe_name = _validate_skill_name(skill_name)
+    root = BACKUP_DIR / safe_name
+    if not root.exists():
+        raise FileNotFoundError(f"No rollback backup found for '{safe_name}'")
+
+    backups = sorted(p for p in root.iterdir() if p.is_dir())
+    if not backups:
+        raise FileNotFoundError(f"No rollback backup found for '{safe_name}'")
+    backup_dir = backups[-1]
+    manifest = json.loads((backup_dir / "manifest.json").read_text(encoding="utf-8"))
+    entry = manifest["entry"]
+    install_path = _resolve_lock_install_path(entry.get("install_path", ""), safe_name)
+
+    if install_path.exists():
+        shutil.rmtree(install_path)
+    files_dir = backup_dir / "files"
+    if files_dir.exists():
+        install_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(files_dir, install_path, symlinks=False)
+
+    lock = HubLockFile()
+    data = lock.load()
+    data.setdefault("installed", {})[safe_name] = entry
+    lock.save(data)
+    append_audit_log(
+        "ROLLBACK", safe_name, entry.get("source", "unknown"),
+        entry.get("trust_level", "unknown"), "restored", str(backup_dir),
+    )
+    return {"status": "restored", "skill_name": safe_name, "backup_path": str(backup_dir), "install_path": str(install_path)}
 
 
 def install_from_quarantine(
@@ -3205,7 +3521,7 @@ def install_from_quarantine(
     return install_dir
 
 
-def uninstall_skill(skill_name: str) -> Tuple[bool, str]:
+def uninstall_skill(skill_name: str, dry_run: bool = False) -> Tuple[bool, str]:
     """Remove a hub-installed skill. Refuses to remove builtins."""
     lock = HubLockFile()
     entry = lock.get_installed(skill_name)
@@ -3226,13 +3542,21 @@ def uninstall_skill(skill_name: str) -> Tuple[bool, str]:
     except ValueError as exc:
         return False, f"Refusing to uninstall '{skill_name}': {exc}"
 
+    if dry_run:
+        return True, f"Would uninstall '{skill_name}' from {entry['install_path']}"
+
+    backup_path = _backup_installed_skill(skill_name, install_path, entry)
+
     if install_path.exists():
         shutil.rmtree(install_path)
 
     lock.record_uninstall(skill_name)
-    append_audit_log("UNINSTALL", skill_name, entry["source"], entry["trust_level"], "n/a", "user_request")
+    append_audit_log(
+        "UNINSTALL", skill_name, entry["source"], entry["trust_level"],
+        "n/a", f"user_request backup={backup_path}",
+    )
 
-    return True, f"Uninstalled '{skill_name}' from {entry['install_path']}"
+    return True, f"Uninstalled '{skill_name}' from {entry['install_path']} (backup: {backup_path})"
 
 
 def bundle_content_hash(bundle: SkillBundle) -> str:

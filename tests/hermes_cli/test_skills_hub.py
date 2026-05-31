@@ -1,4 +1,5 @@
 from io import StringIO
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -742,4 +743,132 @@ def test_do_search_json_flag_emits_full_identifiers(capsys):
     assert payload[0]["source"] == "browse-sh"
     # Table render must be suppressed — sink should be empty (no "Searching for:" header).
     assert "Searching for:" not in sink.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 CLI surfaces: doctor/import/convert/uninstall dry-run
+# ---------------------------------------------------------------------------
+
+
+def test_do_doctor_reports_flat_markdown_without_writing(tmp_path):
+    from hermes_cli import skills_hub as cli_hub
+
+    flat = tmp_path / "legacy.md"
+    flat.write_text(
+        "---\nname: legacy-skill\ndescription: flat skill\n---\n\n# Legacy\n",
+        encoding="utf-8",
+    )
+    sink = StringIO()
+    console = Console(file=sink, force_terminal=False, color_system=None)
+
+    cli_hub.do_doctor(str(flat), console=console)
+
+    output = sink.getvalue()
+    assert "flat_markdown" in output
+    assert "convert" in output.lower()
+    assert not (tmp_path / "legacy-skill").exists()
+
+
+def test_do_convert_dry_run_reports_target_without_writing(tmp_path):
+    from hermes_cli import skills_hub as cli_hub
+
+    flat = tmp_path / "legacy.md"
+    flat.write_text(
+        "---\nname: legacy-skill\ndescription: flat skill\n---\n\n# Legacy\n",
+        encoding="utf-8",
+    )
+    out = tmp_path / "skills"
+    sink = StringIO()
+    console = Console(file=sink, force_terminal=False, color_system=None)
+
+    cli_hub.do_convert(str(flat), output_dir=str(out), dry_run=True, console=console)
+
+    output = sink.getvalue()
+    assert "Would convert" in output
+    assert str(out / "legacy-skill" / "SKILL.md") in output
+    assert not (out / "legacy-skill").exists()
+
+
+def test_do_import_dry_run_blocks_flat_markdown_without_convert(tmp_path):
+    from hermes_cli import skills_hub as cli_hub
+
+    flat = tmp_path / "legacy.md"
+    flat.write_text(
+        "---\nname: legacy-skill\ndescription: flat skill\n---\n\n# Legacy\n",
+        encoding="utf-8",
+    )
+    sink = StringIO()
+    console = Console(file=sink, force_terminal=False, color_system=None)
+
+    cli_hub.do_import(str(flat), dry_run=True, convert_flat=False, console=console)
+
+    output = sink.getvalue().lower()
+    assert "flat_markdown" in output
+    assert "--convert-flat" in output
+
+
+def test_do_uninstall_dry_run_delegates_without_prompt(monkeypatch):
+    from hermes_cli import skills_hub as cli_hub
+    import tools.skills_hub as hub
+
+    calls = []
+    monkeypatch.setattr(hub, "uninstall_skill", lambda name, dry_run=False: calls.append((name, dry_run)) or (True, "Would uninstall demo"))
+    sink = StringIO()
+    console = Console(file=sink, force_terminal=False, color_system=None)
+
+    cli_hub.do_uninstall("demo", dry_run=True, console=console, skip_confirm=True)
+
+    assert calls == [("demo", True)]
+    assert "Would uninstall demo" in sink.getvalue()
+
+
+def test_do_update_dry_run_with_target_ref_does_not_install(monkeypatch):
+    from hermes_cli import skills_hub as cli_hub
+    import tools.skills_hub as hub
+
+    class Lock:
+        def get_installed(self, name):
+            assert name == "demo"
+            return {"name": "demo", "identifier": "owner/repo/skills/demo", "install_path": "demo"}
+
+    called = []
+    monkeypatch.setattr(hub, "HubLockFile", lambda: Lock())
+    monkeypatch.setattr(cli_hub, "do_install", lambda *args, **kwargs: called.append((args, kwargs)))
+    sink = StringIO()
+    console = Console(file=sink, force_terminal=False, color_system=None)
+
+    cli_hub.do_update(name="demo", to_ref="abc123", dry_run=True, console=console)
+
+    output = sink.getvalue()
+    assert "Would update" in output
+    assert "abc123" in output
+    assert called == []
+
+
+def test_skills_command_routes_lifecycle_actions(monkeypatch):
+    from hermes_cli import skills_hub as cli_hub
+
+    calls = []
+    monkeypatch.setattr(cli_hub, "do_doctor", lambda path: calls.append(("doctor", path)))
+    monkeypatch.setattr(cli_hub, "do_convert", lambda path, output_dir="", dry_run=False, force=False: calls.append(("convert", path, output_dir, dry_run, force)))
+    monkeypatch.setattr(cli_hub, "do_import", lambda path, dry_run=False, convert_flat=False, output_dir="", force=False: calls.append(("import", path, dry_run, convert_flat, output_dir, force)))
+    monkeypatch.setattr(cli_hub, "do_uninstall", lambda name, dry_run=False: calls.append(("uninstall", name, dry_run)))
+    monkeypatch.setattr(cli_hub, "do_update", lambda name=None, to_ref="", dry_run=False: calls.append(("update", name, to_ref, dry_run)))
+    monkeypatch.setattr(cli_hub, "do_rollback", lambda name: calls.append(("rollback", name)))
+
+    cli_hub.skills_command(SimpleNamespace(skills_action="doctor", path="/tmp/skill"))
+    cli_hub.skills_command(SimpleNamespace(skills_action="convert", path="/tmp/legacy.md", output="/tmp/out", dry_run=True, force=True))
+    cli_hub.skills_command(SimpleNamespace(skills_action="import", path="/tmp/legacy.md", dry_run=True, convert_flat=True, output="/tmp/out", force=False))
+    cli_hub.skills_command(SimpleNamespace(skills_action="uninstall", name="demo", dry_run=True))
+    cli_hub.skills_command(SimpleNamespace(skills_action="update", name="demo", to="abc123", dry_run=True))
+    cli_hub.skills_command(SimpleNamespace(skills_action="rollback", name="demo"))
+
+    assert calls == [
+        ("doctor", "/tmp/skill"),
+        ("convert", "/tmp/legacy.md", "/tmp/out", True, True),
+        ("import", "/tmp/legacy.md", True, True, "/tmp/out", False),
+        ("uninstall", "demo", True),
+        ("update", "demo", "abc123", True),
+        ("rollback", "demo"),
+    ]
 
