@@ -1,0 +1,90 @@
+# =============================================================================
+# Hermes Delegation Category Presets (safe, copy-paste examples)
+# =============================================================================
+# Clean-room notice:
+#   These categories and recipe names are Hermes-native concepts. Nothing here
+#   is copied from any external project's code or prompts; the names map only to
+#   the built-in recipes defined in tools/agent_recipes.py and the resolver in
+#   tools/delegation_categories.py.
+#
+# What this file is:
+#   A drop-in `delegation:` block you can merge into ~/.hermes/config.yaml to
+#   turn on the optional delegation capability layer. A category bundles a
+#   provider/model + runtime budget + toolset scope under a short intent name,
+#   so the agent can delegate by intent ("quick", "deep", "review", "visual",
+#   "writing") instead of wiring providers ad hoc on every call.
+#
+# Safety properties (enforced by resolve_delegation_category):
+#   * Every category sets `toolsets_mode: intersect`. Categories may only ever
+#     narrow toolset scope, never escalate it. The effective scope is
+#     category ∩ parent ∩ caller-requested.
+#   * No credentials live here. There are intentionally no secret, password, or
+#     direct endpoint keys. Provider/model values are plain identifiers; real
+#     credentials stay in ~/.hermes/.env (represented as [REDACTED] in prose).
+#   * No analytics or data collection of any kind.
+#
+# How to use:
+#   1. Copy the `delegation:` block below into ~/.hermes/config.yaml (merge it
+#      with any existing `delegation:` settings — `model`/`provider` still work).
+#   2. `default_category: quick` opts in globally for fast, narrow delegation.
+#      Set it to "" if you prefer per-call category selection only.
+#   3. Delete `default_category` and `categories` to revert to legacy behavior.
+# =============================================================================
+
+delegation:
+  # Opt-in switch. Set to a category name below to make every delegate_task
+  # default to that intent. Use "" for legacy/per-call-only routing.
+  default_category: quick
+
+  # Named delegation categories. Each one is optional and independent.
+  categories:
+    # quick — cheap/fast leaf work: small edits, lookups, mechanical fixes.
+    quick:
+      recipe: focused-executor          # read-write leaf, scoped to the goal
+      provider: openrouter              # example identifier only — no credentials
+      model: "google/gemini-3-flash-preview"
+      reasoning_effort: low
+      max_iterations: 20
+      child_timeout_seconds: 300
+      toolsets_mode: intersect          # narrow only, never escalate
+      toolsets: [file, search]
+      fallback_chain:
+        - provider: openrouter          # safe metadata only: provider/model IDs
+          model: "google/gemini-3-flash-preview"
+
+    # deep — long, high-effort work: multi-file refactors, hard debugging.
+    deep:
+      recipe: deep-worker               # read-write leaf with a generous budget
+      reasoning_effort: high
+      max_iterations: 80
+      child_timeout_seconds: 1200
+      toolsets_mode: intersect
+      toolsets: [file, search, terminal, web]
+
+    # review — read-only critique. Deliberately omits `terminal` so a reviewer
+    # cannot run or mutate anything; pairs with the critic-reviewer recipe.
+    review:
+      recipe: critic-reviewer           # read-only critic posture
+      reasoning_effort: high
+      max_iterations: 40
+      child_timeout_seconds: 600
+      toolsets_mode: intersect
+      toolsets: [file, search]          # no terminal — review must not execute
+
+    # visual — screenshots, diagrams, UI inspection, image understanding.
+    visual:
+      recipe: explorer                  # read-only investigator
+      reasoning_effort: medium
+      max_iterations: 30
+      child_timeout_seconds: 600
+      toolsets_mode: intersect
+      toolsets: [vision, browser, file]
+
+    # writing — drafting prose/docs from gathered sources.
+    writing:
+      recipe: researcher                # read-only gather-and-draft posture
+      reasoning_effort: medium
+      max_iterations: 40
+      child_timeout_seconds: 600
+      toolsets_mode: intersect
+      toolsets: [file, search, web]

@@ -884,6 +884,19 @@ delegation:
   # provider: "openrouter"                    # Override provider for subagents (empty = inherit parent)
   #                                           # Resolves full credentials (base_url, api_key) automatically.
   #                                           # Supported: openrouter, nous, zai, kimi-coding, minimax
+  # recipe: ""                               # Optional built-in prompt recipe; empty preserves legacy child prompts.
+  # default_category: ""                     # Optional capability category; empty keeps legacy behavior unless category= is passed.
+  # categories:                              # Optional named presets; see docs/config/delegation-category-presets.yaml.
+  #   quick:
+  #     recipe: focused-executor
+  #     reasoning_effort: low
+  #     max_iterations: 20
+  #     child_timeout_seconds: 300
+  #     toolsets_mode: intersect             # Categories narrow scope only; they never add tools.
+  #     toolsets: [file, search]
+  #     fallback_chain:                      # Optional provider/model identifiers only; no credentials.
+  #       - provider: openrouter
+  #         model: "google/gemini-3-flash-preview"
 
 # =============================================================================
 # Honcho Integration (Cross-Session User Modeling)
