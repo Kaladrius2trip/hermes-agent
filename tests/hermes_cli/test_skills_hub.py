@@ -30,6 +30,7 @@ def hub_env(monkeypatch, tmp_path):
     monkeypatch.setattr(hub, "AUDIT_LOG", hub_dir / "audit.log")
     monkeypatch.setattr(hub, "TAPS_FILE", hub_dir / "taps.json")
     monkeypatch.setattr(hub, "INDEX_CACHE_DIR", hub_dir / "index-cache")
+    monkeypatch.setattr(hub, "BACKUP_DIR", hub_dir / "backups")
 
     return hub_dir
 
@@ -120,6 +121,7 @@ def test_do_list_initializes_hub_dir(monkeypatch, hub_env):
     assert (hub_dir / "lock.json").exists()
     assert (hub_dir / "quarantine").is_dir()
     assert (hub_dir / "index-cache").is_dir()
+    assert (hub_dir / "backups").is_dir()
 
 
 def test_do_list_distinguishes_hub_builtin_and_local(three_source_env):
