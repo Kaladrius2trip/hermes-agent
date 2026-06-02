@@ -7,8 +7,8 @@ license: MIT
 platforms: [linux, macos, windows]
 metadata:
   hermes:
-    tags: [Coding-Agent, Claude, Anthropic, Code-Review, Refactoring, PTY, Automation]
-    related_skills: [codex, hermes-agent, opencode]
+    tags: [Coding-Agent, Claude, Anthropic, Code-Review, Refactoring, PTY, Automation, Security, Plugins]
+    related_skills: [codex, hermes-agent, opencode, claude-code-security-guidance]
 ---
 
 # Claude Code — Hermes Orchestration Guide
@@ -351,6 +351,17 @@ mcp__<server>__<tool>   # Specific MCP tool
   }
 }
 ```
+
+### Official Security Guidance Plugin
+
+Use `references/security-guidance-plugin.md` when installing, enabling, configuring, or relying on Claude Code's official `security-guidance@claude-plugins-official` plugin.
+
+Hermes policy:
+- Treat plugin enablement as a plugin execution event: load/use `oss-update-security-review` first.
+- Good fit for Claude Code edits touching auth/authz, secrets, gateway privacy, Hermes tools/toolsets, MCP/plugins, memory/session_search, cron, CI/CD, Docker, dependencies, or PII/logging.
+- It adds three early layers: deterministic per-edit pattern checks, background end-of-turn diff review, and deeper commit/push review when Claude runs `git commit`/`git push` through Bash.
+- It does not block edits/commits and can miss issues. Keep Zhora verification, independent review, `/security-review`, CI/static analysis, and release gates.
+- Do not project-enable it in shared/private/client repos unless the user/team accepts the code-diff data flow and teammate impact.
 
 ### Memory Files (CLAUDE.md) Hierarchy
 1. **Global:** `~/.claude/CLAUDE.md` — applies to all projects
