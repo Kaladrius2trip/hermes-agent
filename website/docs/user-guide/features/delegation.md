@@ -364,6 +364,21 @@ Override precedence: an explicit `category=` argument wins over
 the top-level `delegation.*` defaults; caller-passed `toolsets` further narrow
 the category scope.
 
+### Future direction: capability profiles
+
+Categories are the first piece of a larger, **forward-looking** abstraction
+called **capability profiles** — a single named record that bundles a category's
+provider/model/budget/toolset scope *together with* a responsibility statement,
+workspace and verification policy, a structured handoff schema, and explicit
+approval gates. The intent is to retire borrowed "named-agent" personas in favor
+of operator-owned profiles whose every capability is explicit and fail-closed.
+
+This is an **RFC only — no behavior changes ship yet**. Today's categories,
+recipes, and team metadata each map one-to-one onto a profile field, so adoption
+will be additive and reversible: existing `delegation:` config keeps working
+unchanged. See [`docs/architecture/capability-profiles.md`](https://github.com/NousResearch/hermes-agent/blob/main/docs/architecture/capability-profiles.md)
+for the proposed schema, the migration crosswalk, and the rollout/rollback plan.
+
 ### Troubleshooting category routing
 
 | Symptom | Cause | Fix |

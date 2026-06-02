@@ -29,6 +29,13 @@
 #   2. `default_category: quick` opts in globally for fast, narrow delegation.
 #      Set it to "" if you prefer per-call category selection only.
 #   3. Delete `default_category` and `categories` to revert to legacy behavior.
+#
+# Future direction (RFC, no behavior change):
+#   Each category below maps one-to-one onto a future *capability profile* — a
+#   single named record that also carries responsibility, workspace/verification
+#   policy, handoff schema, and approval gates. The mapping is additive and
+#   backward-compatible; this file keeps working unchanged. See
+#   docs/architecture/capability-profiles.md for the schema and crosswalk.
 # =============================================================================
 
 delegation:
