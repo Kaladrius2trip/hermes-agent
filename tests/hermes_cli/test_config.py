@@ -74,6 +74,8 @@ class TestLoadConfigDefaults:
             assert config["display"]["interim_assistant_messages"] is True
             assert config["delegation"]["default_category"] == ""
             assert config["delegation"]["categories"] == {}
+            assert config["capabilities"]["default_profile"] == ""
+            assert config["capabilities"]["profiles"] == {}
 
     def test_legacy_delegation_config_gets_category_defaults(self, tmp_path):
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
