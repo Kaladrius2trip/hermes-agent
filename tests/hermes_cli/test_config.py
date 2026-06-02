@@ -71,6 +71,18 @@ class TestLoadConfigDefaults:
             assert "terminal" in config
             assert config["terminal"]["backend"] == "local"
             assert config["display"]["interim_assistant_messages"] is True
+            assert config["delegation"]["default_category"] == ""
+            assert config["delegation"]["categories"] == {}
+
+    def test_legacy_delegation_config_gets_category_defaults(self, tmp_path):
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            config_path = tmp_path / "config.yaml"
+            config_path.write_text("delegation:\n  max_concurrent_children: 7\n")
+
+            config = load_config()
+            assert config["delegation"]["max_concurrent_children"] == 7
+            assert config["delegation"]["default_category"] == ""
+            assert config["delegation"]["categories"] == {}
 
     def test_legacy_root_level_max_turns_migrates_to_agent_config(self, tmp_path):
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):

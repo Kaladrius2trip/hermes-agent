@@ -926,15 +926,47 @@ def do_check(name: Optional[str] = None, console: Optional[Console] = None) -> N
     c.print(f"[dim]{update_count} update(s) available across {len(results)} checked skill(s)[/]\n")
 
 
-def do_update(name: Optional[str] = None, console: Optional[Console] = None) -> None:
-    """Update hub-installed skills with upstream changes."""
+def do_update(name: Optional[str] = None, console: Optional[Console] = None,
+              to_ref: str = "", dry_run: bool = False) -> None:
+    """Update hub-installed skills with upstream changes.
+
+    ``dry_run`` reports what would happen without fetching/installing. ``to_ref``
+    records an explicit target SHA/version for operator review; non-dry-run
+    pinned updates are intentionally refused until source adapters can fetch by
+    immutable ref.
+    """
     from tools.skills_hub import HubLockFile, check_for_skill_updates
 
     c = console or _console
     lock = HubLockFile()
+
+    if to_ref:
+        if not name:
+            c.print("[bold red]Error:[/] --to requires a specific skill name.\n")
+            return
+        installed = lock.get_installed(name)
+        if not installed:
+            c.print(f"[bold red]Error:[/] '{name}' is not a hub-installed skill.\n")
+            return
+        if dry_run:
+            c.print(f"Would update {name} ({installed.get('identifier', '')}) to {to_ref}", soft_wrap=True)
+            return
+        c.print("[bold red]Error:[/] pinned --to updates currently require --dry-run.\n")
+        return
+
     updates = [entry for entry in check_for_skill_updates(name=name) if entry.get("status") == "update_available"]
     if not updates:
         c.print("[dim]No updates available.[/]\n")
+        return
+
+    if dry_run:
+        for entry in updates:
+            c.print(
+                f"Would update {entry['name']} from {entry.get('current_hash', '')} "
+                f"to {entry.get('latest_hash', '')}",
+                soft_wrap=True,
+            )
+        c.print(f"[dim]{len(updates)} update(s) would be applied.[/]\n")
         return
 
     for entry in updates:
@@ -992,16 +1024,94 @@ def do_audit(name: Optional[str] = None, console: Optional[Console] = None,
         c.print()
 
 
+def do_doctor(path: str, console: Optional[Console] = None) -> None:
+    """Inspect a skill pack path and report lifecycle readiness."""
+    from tools.skills_hub import doctor_skill_path
+
+    c = console or _console
+    report = doctor_skill_path(path)
+    c.print(f"Kind: {report['kind']}")
+    c.print(f"Valid: {report['valid']}")
+    metadata = report.get("metadata") or {}
+    if metadata.get("name"):
+        c.print(f"Name: {metadata['name']}")
+    for issue in report.get("issues", []):
+        c.print(f"Issue: {issue['code']} — {issue['message']}")
+    for warning in report.get("warnings", []):
+        c.print(f"Warning: {warning['code']} — {warning['message']}")
+    c.print(f"Suggested action: {report['suggested_action']}")
+
+
+def do_convert(path: str, output_dir: str = "", dry_run: bool = False,
+               force: bool = False, console: Optional[Console] = None) -> None:
+    """Convert a flat markdown skill into a skill directory."""
+    from tools.skills_hub import SKILLS_DIR, convert_flat_skill
+
+    c = console or _console
+    target_root = Path(output_dir).expanduser() if output_dir else SKILLS_DIR
+    try:
+        result = convert_flat_skill(path, output_dir=target_root, dry_run=dry_run, force=force)
+    except ValueError as exc:
+        c.print(str(exc))
+        return
+    if result["status"] == "would_convert":
+        c.print(f"Would convert {result['source_path']} -> {result['target_path']}", soft_wrap=True)
+    elif result["status"] == "already_converted":
+        c.print(f"Already converted: {result['target_path']}", soft_wrap=True)
+    else:
+        c.print(f"Converted {result['source_path']} -> {result['target_path']}", soft_wrap=True)
+
+
+def do_import(path: str, dry_run: bool = False, convert_flat: bool = False,
+              output_dir: str = "", force: bool = False,
+              console: Optional[Console] = None) -> None:
+    """Import a local skill pack into the skill directory."""
+    from tools.skills_hub import SKILLS_DIR, import_skill_path
+
+    c = console or _console
+    target_root = Path(output_dir).expanduser() if output_dir else SKILLS_DIR
+    try:
+        result = import_skill_path(
+            path,
+            output_dir=target_root,
+            dry_run=dry_run,
+            convert_flat=convert_flat,
+            force=force,
+        )
+    except ValueError as exc:
+        c.print(str(exc))
+        return
+
+    if result["status"] == "would_import":
+        c.print(f"Would import: {result['target_path']}", soft_wrap=True)
+    else:
+        c.print(f"Imported: {result['target_path']}", soft_wrap=True)
+
+
+def do_rollback(name: str, console: Optional[Console] = None) -> None:
+    """Restore latest lifecycle backup for a hub-installed skill."""
+    from tools.skills_hub import rollback_skill
+
+    c = console or _console
+    try:
+        result = rollback_skill(name)
+    except (FileNotFoundError, ValueError) as exc:
+        c.print(f"[bold red]Error:[/] {exc}\n")
+        return
+    c.print(f"[bold green]Restored {result['skill_name']} from {result['backup_path']}[/]\n", soft_wrap=True)
+
+
 def do_uninstall(name: str, console: Optional[Console] = None,
                  skip_confirm: bool = False,
-                 invalidate_cache: bool = True) -> None:
+                 invalidate_cache: bool = True,
+                 dry_run: bool = False) -> None:
     """Remove a hub-installed skill with confirmation."""
     from tools.skills_hub import uninstall_skill
 
     c = console or _console
 
     # skip_confirm bypasses the prompt (needed in TUI mode where input() hangs)
-    if not skip_confirm:
+    if not skip_confirm and not dry_run:
         c.print(f"\n[bold]Uninstall '{name}'?[/]")
         try:
             answer = input("Confirm [y/N]: ").strip().lower()
@@ -1011,7 +1121,10 @@ def do_uninstall(name: str, console: Optional[Console] = None,
             c.print("[dim]Cancelled.[/]\n")
             return
 
-    success, msg = uninstall_skill(name)
+    if dry_run:
+        success, msg = uninstall_skill(name, dry_run=True)
+    else:
+        success, msg = uninstall_skill(name)
     if success:
         c.print(f"[bold green]{msg}[/]\n")
         if invalidate_cache:
@@ -1538,12 +1651,35 @@ def skills_command(args) -> None:
     elif action == "check":
         do_check(name=getattr(args, "name", None))
     elif action == "update":
-        do_update(name=getattr(args, "name", None))
+        do_update(
+            name=getattr(args, "name", None),
+            to_ref=getattr(args, "to", "") or "",
+            dry_run=getattr(args, "dry_run", False),
+        )
     elif action == "audit":
         do_audit(name=getattr(args, "name", None),
                  deep=getattr(args, "deep", False))
+    elif action == "doctor":
+        do_doctor(getattr(args, "path", "."))
+    elif action == "convert":
+        do_convert(
+            getattr(args, "path"),
+            output_dir=getattr(args, "output", "") or "",
+            dry_run=getattr(args, "dry_run", False),
+            force=getattr(args, "force", False),
+        )
+    elif action == "import":
+        do_import(
+            getattr(args, "path"),
+            dry_run=getattr(args, "dry_run", False),
+            convert_flat=getattr(args, "convert_flat", False),
+            output_dir=getattr(args, "output", "") or "",
+            force=getattr(args, "force", False),
+        )
+    elif action == "rollback":
+        do_rollback(args.name)
     elif action == "uninstall":
-        do_uninstall(args.name)
+        do_uninstall(args.name, dry_run=getattr(args, "dry_run", False))
     elif action == "reset":
         do_reset(args.name, restore=getattr(args, "restore", False),
                  skip_confirm=getattr(args, "yes", False))
@@ -1718,8 +1854,59 @@ def handle_skills_slash(cmd: str, console: Optional[Console] = None) -> None:
         do_check(name=name, console=c)
 
     elif action == "update":
-        name = args[0] if args else None
-        do_update(name=name, console=c)
+        name = None
+        to_ref = ""
+        dry_run = "--dry-run" in args
+        i = 0
+        while i < len(args):
+            if args[i] == "--to" and i + 1 < len(args):
+                to_ref = args[i + 1]
+                i += 2
+            elif args[i].startswith("--"):
+                i += 1
+            elif name is None:
+                name = args[i]
+                i += 1
+            else:
+                i += 1
+        do_update(name=name, console=c, to_ref=to_ref, dry_run=dry_run)
+
+    elif action == "doctor":
+        path = args[0] if args else "."
+        do_doctor(path, console=c)
+
+    elif action == "convert":
+        if not args:
+            c.print("[bold red]Usage:[/] /skills convert <flat-skill.md> [--output <dir>] [--dry-run] [--force]\n")
+            return
+        path = args[0]
+        output_dir = ""
+        dry_run = "--dry-run" in args
+        force = "--force" in args
+        for i, a in enumerate(args):
+            if a == "--output" and i + 1 < len(args):
+                output_dir = args[i + 1]
+        do_convert(path, output_dir=output_dir, dry_run=dry_run, force=force, console=c)
+
+    elif action == "import":
+        if not args:
+            c.print("[bold red]Usage:[/] /skills import <path> [--dry-run] [--convert-flat] [--output <dir>] [--force]\n")
+            return
+        path = args[0]
+        output_dir = ""
+        dry_run = "--dry-run" in args
+        convert_flat = "--convert-flat" in args
+        force = "--force" in args
+        for i, a in enumerate(args):
+            if a == "--output" and i + 1 < len(args):
+                output_dir = args[i + 1]
+        do_import(path, dry_run=dry_run, convert_flat=convert_flat, output_dir=output_dir, force=force, console=c)
+
+    elif action == "rollback":
+        if not args:
+            c.print("[bold red]Usage:[/] /skills rollback <name>\n")
+            return
+        do_rollback(args[0], console=c)
 
     elif action == "audit":
         name = args[0] if args and not args[0].startswith("--") else None
@@ -1728,13 +1915,14 @@ def handle_skills_slash(cmd: str, console: Optional[Console] = None) -> None:
 
     elif action == "uninstall":
         if not args:
-            c.print("[bold red]Usage:[/] /skills uninstall <name> [--now]\n")
+            c.print("[bold red]Usage:[/] /skills uninstall <name> [--dry-run] [--now]\n")
             return
         # Slash commands run inside prompt_toolkit where input() hangs.
         skip_confirm = True
         invalidate_cache = "--now" in args
+        dry_run = "--dry-run" in args
         do_uninstall(args[0], console=c, skip_confirm=skip_confirm,
-                     invalidate_cache=invalidate_cache)
+                     invalidate_cache=invalidate_cache, dry_run=dry_run)
 
     elif action == "reset":
         if not args:
@@ -1803,9 +1991,13 @@ def _print_skills_help(console: Console) -> None:
         "  [cyan]list[/] [--source hub|builtin|local] [--enabled-only]\n"
         "       List installed skills; --enabled-only filters to the active profile's live set\n"
         "  [cyan]check[/] [name]                Check hub skills for upstream updates\n"
-        "  [cyan]update[/] [name]               Update hub skills with upstream changes\n"
+        "  [cyan]update[/] [name] [--dry-run]   Update hub skills with upstream changes\n"
+        "  [cyan]doctor[/] [path]               Inspect a local skill pack before import\n"
+        "  [cyan]import[/] <path> [--dry-run]   Import a local skill pack; flat markdown needs --convert-flat\n"
+        "  [cyan]convert[/] <file.md>           Convert flat markdown to <name>/SKILL.md\n"
         "  [cyan]audit[/] [name]                Re-scan hub skills for security\n"
-        "  [cyan]uninstall[/] <name>            Remove a hub-installed skill\n"
+        "  [cyan]rollback[/] <name>             Restore latest lifecycle backup for a skill\n"
+        "  [cyan]uninstall[/] <name> [--dry-run] Remove a hub-installed skill\n"
         "  [cyan]reset[/] <name> [--restore]    Reset bundled-skill tracking (fix 'user-modified' flag)\n"
         "  [cyan]publish[/] <path> --repo <r>   Publish a skill to GitHub via PR\n"
         "  [cyan]snapshot[/] export|import      Export/import skill configurations\n"

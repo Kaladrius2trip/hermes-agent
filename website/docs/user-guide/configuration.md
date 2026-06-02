@@ -1669,11 +1669,24 @@ delegation:
   # model: "google/gemini-3-flash-preview"  # Override model (empty = inherit parent)
   # provider: "openrouter"                  # Override provider (empty = inherit parent)
   # base_url: "http://localhost:1234/v1"    # Direct OpenAI-compatible endpoint (takes precedence over provider)
-  # api_key: "local-key"                    # API key for base_url (falls back to OPENAI_API_KEY)
+  # api_key: "[REDACTED]"                   # Endpoint credential placeholder; prefer .env/credential pools
   # api_mode: ""                            # Wire protocol for base_url: "chat_completions", "codex_responses", or "anthropic_messages". Empty = auto-detect from URL (e.g. /anthropic suffix → anthropic_messages). Set explicitly for non-standard endpoints the heuristic can't detect.
   max_concurrent_children: 3                # Parallel children per batch (floor 1, no ceiling). Also via DELEGATION_MAX_CONCURRENT_CHILDREN env var.
   max_spawn_depth: 1                        # Delegation tree depth cap (1-3, clamped). 1 = flat (default): parent spawns leaves that cannot delegate. 2 = orchestrator children can spawn leaf grandchildren. 3 = three levels.
   orchestrator_enabled: true                # Global kill switch. When false, role="orchestrator" is ignored and every child is forced to leaf regardless of max_spawn_depth.
+  recipe: ""                               # Optional built-in prompt recipe; empty preserves legacy child prompts.
+  default_category: ""                     # Optional category name; empty keeps the category layer inactive unless category= is passed.
+  categories:                              # Optional capability categories; copy presets from docs/config/delegation-category-presets.yaml.
+    quick:
+      recipe: focused-executor
+      reasoning_effort: low
+      max_iterations: 20
+      child_timeout_seconds: 300
+      toolsets_mode: intersect             # Categories may only narrow tool scope, never escalate.
+      toolsets: [file, search]
+      fallback_chain:                      # Optional provider/model identifiers only; no credentials.
+        - provider: openrouter
+          model: "google/gemini-3-flash-preview"
 ```
 
 **Subagent provider:model override:** By default, subagents inherit the parent agent's provider and model. Set `delegation.provider` and `delegation.model` to route subagents to a different provider:model pair — e.g., use a cheap/fast model for narrowly-scoped subtasks while your primary agent runs an expensive reasoning model.

@@ -6303,6 +6303,13 @@ def cmd_kanban(args):
     return kanban_command(args)
 
 
+def cmd_team(args):
+    """Deterministic team-mode planner over Kanban."""
+    from hermes_cli.team import team_command
+
+    return team_command(args)
+
+
 def cmd_hooks(args):
     """Shell-hook inspection and management."""
     from hermes_cli.hooks import hooks_command
@@ -11465,7 +11472,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "model", "pairing", "plugins", "portal", "postinstall", "profile", "proxy",
         "prompt-size",
         "send", "sessions", "setup",
-        "skills", "slack", "status", "tools", "uninstall", "update",
+        "skills", "slack", "status", "team", "tools", "uninstall", "update",
         "version", "webhook", "whatsapp", "chat", "secrets", "security",
         # Help-ish invocations — plugin commands not being listed in
         # top-level --help is an acceptable trade-off for skipping an
@@ -12762,6 +12769,14 @@ def main():
     kanban_parser.set_defaults(func=cmd_kanban)
 
     # =========================================================================
+    # team command — deterministic team-mode planner over Kanban
+    # =========================================================================
+    from hermes_cli.team import build_parser as _build_team_parser
+
+    team_parser = _build_team_parser(subparsers)
+    team_parser.set_defaults(func=cmd_team)
+
+    # =========================================================================
     # hooks command — shell-hook inspection and management
     # =========================================================================
     hooks_parser = subparsers.add_parser(
@@ -13226,6 +13241,54 @@ Examples:
         nargs="?",
         help="Specific skill to update (default: all outdated skills)",
     )
+    skills_update.add_argument(
+        "--to",
+        default="",
+        help="Target SHA/version for a pinned update preview (requires --dry-run)",
+    )
+    skills_update.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show the update plan without installing anything",
+    )
+
+    skills_doctor = skills_subparsers.add_parser(
+        "doctor", help="Inspect a local skill pack before import"
+    )
+    skills_doctor.add_argument(
+        "path", nargs="?", default=".", help="Skill directory or flat markdown skill file"
+    )
+
+    skills_import = skills_subparsers.add_parser(
+        "import", help="Import a local skill pack"
+    )
+    skills_import.add_argument("path", help="Skill directory or flat markdown skill file")
+    skills_import.add_argument(
+        "--dry-run", action="store_true", help="Validate and show target paths without writing"
+    )
+    skills_import.add_argument(
+        "--convert-flat", action="store_true", help="Allow converting a legacy flat markdown skill"
+    )
+    skills_import.add_argument(
+        "--output", default="", help="Skills directory to write converted/imported files into"
+    )
+    skills_import.add_argument(
+        "--force", action="store_true", help="Overwrite an existing converted skill"
+    )
+
+    skills_convert = skills_subparsers.add_parser(
+        "convert", help="Convert a flat markdown skill to <name>/SKILL.md"
+    )
+    skills_convert.add_argument("path", help="Flat markdown skill file")
+    skills_convert.add_argument(
+        "--output", default="", help="Skills directory to write the converted skill into"
+    )
+    skills_convert.add_argument(
+        "--dry-run", action="store_true", help="Show target path without writing"
+    )
+    skills_convert.add_argument(
+        "--force", action="store_true", help="Overwrite an existing converted skill"
+    )
 
     skills_audit = skills_subparsers.add_parser(
         "audit", help="Re-scan installed hub skills"
@@ -13239,10 +13302,18 @@ Examples:
         help="Run AST-level analysis on Python files (opt-in diagnostic)",
     )
 
+    skills_rollback = skills_subparsers.add_parser(
+        "rollback", help="Restore latest lifecycle backup for a hub-installed skill"
+    )
+    skills_rollback.add_argument("name", help="Skill name to restore from latest backup")
+
     skills_uninstall = skills_subparsers.add_parser(
         "uninstall", help="Remove a hub-installed skill"
     )
     skills_uninstall.add_argument("name", help="Skill name to remove")
+    skills_uninstall.add_argument(
+        "--dry-run", action="store_true", help="Show what would be removed without deleting files"
+    )
 
     skills_reset = skills_subparsers.add_parser(
         "reset",

@@ -31,6 +31,12 @@ from concurrent.futures import (
 from typing import Any, Dict, List, Optional
 
 from toolsets import TOOLSETS
+from tools.delegation_categories import (
+    DelegationCategoryConfigError,
+    resolve_delegation_category,
+)
+from tools.agent_recipes import get_builtin_recipe, render_agent_recipe
+from tools.delegation_audit import build_delegation_run_event, record_audit_event
 
 # Sentinel value used by the runtime provider system for providers that are
 # not natively known (named custom providers, third-party aggregators, etc.).
@@ -509,6 +515,39 @@ def _preserve_parent_mcp_toolsets(
     return preserved
 
 
+def _parent_toolsets_for_delegation(parent_agent) -> List[str]:
+    """Return the parent's effective toolsets as a category upper bound."""
+    parent_enabled = getattr(parent_agent, "enabled_toolsets", None)
+    if parent_enabled is not None:
+        return list(parent_enabled)
+    if parent_agent and hasattr(parent_agent, "valid_tool_names"):
+        try:
+            import model_tools
+
+            return sorted(
+                {
+                    ts
+                    for name in parent_agent.valid_tool_names
+                    if (ts := model_tools.get_toolset_for_tool(name)) is not None
+                }
+            )
+        except Exception:
+            logger.debug("Could not derive parent toolsets from valid_tool_names", exc_info=True)
+    return list(DEFAULT_TOOLSETS)
+
+
+def _config_for_resolved_category(cfg: dict, resolved_category: Dict[str, Any]) -> dict:
+    """Overlay category provider/model settings onto legacy delegation config."""
+    if not resolved_category.get("category"):
+        return dict(cfg)
+    merged = dict(cfg)
+    for key in ("provider", "model", "reasoning_effort"):
+        value = resolved_category.get(key)
+        if value not in (None, ""):
+            merged[key] = value
+    return merged
+
+
 DEFAULT_MAX_ITERATIONS = 50
 DEFAULT_CHILD_TIMEOUT = 600  # seconds before a child agent is considered stuck
 _HEARTBEAT_INTERVAL = 30  # seconds between parent activity heartbeats during delegation
@@ -574,6 +613,8 @@ def _build_child_system_prompt(
     role: str = "leaf",
     max_spawn_depth: int = 2,
     child_depth: int = 1,
+    agent_recipe: Optional[str] = None,
+    recipe_values: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Build a focused system prompt for a child agent.
 
@@ -639,6 +680,18 @@ def _build_child_system_prompt(
             f"NOTE: You are at depth {child_depth}. The delegation tree "
             f"is capped at max_spawn_depth={max_spawn_depth}. {child_note}"
         )
+    if agent_recipe and str(agent_recipe).strip():
+        values = dict(recipe_values or {})
+        values.setdefault("goal", goal)
+        values.setdefault("context", context or "")
+        values.setdefault("role", role)
+        values.setdefault("workspace_path", workspace_path or "")
+        values.setdefault("child_depth", child_depth)
+        values.setdefault("max_spawn_depth", max_spawn_depth)
+        values.setdefault("category", "")
+        values.setdefault("toolsets", "")
+        recipe = get_builtin_recipe(str(agent_recipe).strip())
+        parts.append("\n" + render_agent_recipe(recipe, **values))
     return "\n".join(parts)
 
 
@@ -881,6 +934,9 @@ def _build_child_agent(
     override_base_url: Optional[str] = None,
     override_api_key: Optional[str] = None,
     override_api_mode: Optional[str] = None,
+    override_reasoning_effort: Optional[str] = None,
+    override_child_timeout_seconds: Optional[float] = None,
+    delegation_category: Optional[Dict[str, Any]] = None,
     # ACP transport overrides — lets a non-ACP parent spawn ACP child agents
     override_acp_command: Optional[str] = None,
     override_acp_args: Optional[List[str]] = None,
@@ -888,6 +944,7 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    agent_recipe: Optional[str] = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -923,40 +980,22 @@ def _build_child_agent(
 
     delegation_cfg = _load_config()
 
-    # When no explicit toolsets given, inherit from parent's enabled toolsets
-    # so disabled tools (e.g. web) don't leak to subagents.
-    # Note: enabled_toolsets=None means "all tools enabled" (the default),
-    # so we must derive effective toolsets from the parent's loaded tools.
-    parent_enabled = getattr(parent_agent, "enabled_toolsets", None)
-    if parent_enabled is not None:
-        parent_toolsets = set(parent_enabled)
-    elif parent_agent and hasattr(parent_agent, "valid_tool_names"):
-        # enabled_toolsets is None (all tools) — derive from loaded tool names
-        import model_tools
+    parent_toolset_list = _parent_toolsets_for_delegation(parent_agent)
+    parent_toolsets = set(parent_toolset_list)
 
-        parent_toolsets = {
-            ts
-            for name in parent_agent.valid_tool_names
-            if (ts := model_tools.get_toolset_for_tool(name)) is not None
-        }
-    else:
-        parent_toolsets = set(DEFAULT_TOOLSETS)
-
-    if toolsets:
+    if toolsets is not None:
         # Intersect with parent — subagent must not gain tools the parent lacks.
         # Expand composite toolsets (e.g. hermes-cli) so that individual
         # toolset names (e.g. web, terminal) are recognised during intersection.
         expanded_parent = _expand_parent_toolsets(parent_toolsets)
         child_toolsets = [t for t in toolsets if t in expanded_parent]
-        if _get_inherit_mcp_toolsets():
+        if child_toolsets and _get_inherit_mcp_toolsets():
             child_toolsets = _preserve_parent_mcp_toolsets(
                 child_toolsets, parent_toolsets
             )
         child_toolsets = _strip_blocked_tools(child_toolsets)
-    elif parent_agent and parent_enabled is not None:
-        child_toolsets = _strip_blocked_tools(parent_enabled)
-    elif parent_toolsets:
-        child_toolsets = _strip_blocked_tools(sorted(parent_toolsets))
+    elif parent_agent and parent_toolsets:
+        child_toolsets = _strip_blocked_tools(parent_toolset_list)
     else:
         child_toolsets = _strip_blocked_tools(DEFAULT_TOOLSETS)
 
@@ -975,6 +1014,13 @@ def _build_child_agent(
         role=effective_role,
         max_spawn_depth=max_spawn,
         child_depth=child_depth,
+        agent_recipe=agent_recipe,
+        recipe_values={
+            "category": (delegation_category or {}).get("category", ""),
+            "toolsets": child_toolsets,
+            "model": model or getattr(parent_agent, "model", ""),
+            "provider": override_provider or getattr(parent_agent, "provider", ""),
+        },
     )
     # Extract parent's API key so subagents inherit auth (e.g. Nous Portal).
     parent_api_key = getattr(parent_agent, "api_key", None)
@@ -1061,7 +1107,9 @@ def _build_child_agent(
     parent_reasoning = getattr(parent_agent, "reasoning_config", None)
     child_reasoning = parent_reasoning
     try:
-        delegation_effort = str(delegation_cfg.get("reasoning_effort") or "").strip()
+        delegation_effort = str(
+            override_reasoning_effort or delegation_cfg.get("reasoning_effort") or ""
+        ).strip()
         if delegation_effort:
             from hermes_constants import parse_reasoning_effort
 
@@ -1146,6 +1194,31 @@ def _build_child_agent(
     child._subagent_id = subagent_id
     child._parent_subagent_id = parent_subagent_id
     child._subagent_goal = goal
+    if override_child_timeout_seconds is not None:
+        try:
+            setattr(
+                child,
+                "_delegate_child_timeout_seconds",
+                max(30.0, float(override_child_timeout_seconds)),
+            )
+        except (TypeError, ValueError):
+            logger.warning(
+                "delegation category child_timeout_seconds=%r is not valid; using default",
+                override_child_timeout_seconds,
+            )
+    if delegation_category and delegation_category.get("category"):
+        category_metadata = {
+            "category": delegation_category.get("category"),
+            "fallback_metadata": delegation_category.get("fallback_metadata", {}),
+        }
+        recipe_name = str(delegation_category.get("recipe") or agent_recipe or "").strip()
+        if recipe_name:
+            category_metadata["recipe"] = recipe_name
+        setattr(
+            child,
+            "_delegation_category",
+            category_metadata,
+        )
 
     # Share a credential pool with the child when possible so subagents can
     # rotate credentials on rate limits instead of getting pinned to one key.
@@ -1488,7 +1561,9 @@ def _run_single_child(
 
         # Run child with a hard timeout to prevent indefinite blocking
         # when the child's API call or tool-level HTTP request hangs.
-        child_timeout = _get_child_timeout()
+        child_timeout = getattr(child, "_delegate_child_timeout_seconds", None)
+        if not isinstance(child_timeout, (int, float)) or isinstance(child_timeout, bool):
+            child_timeout = _get_child_timeout()
         _timeout_executor = ThreadPoolExecutor(
             max_workers=1,
             # Install a non-interactive approval callback in the worker thread
@@ -1718,6 +1793,9 @@ def _run_single_child(
         }
         if status == "failed":
             entry["error"] = result.get("error", "Subagent did not produce a response.")
+        delegation_category = getattr(child, "_delegation_category", None)
+        if isinstance(delegation_category, dict) and delegation_category.get("category"):
+            entry["delegation"] = delegation_category
 
         # Cross-agent file-state reminder.  If this subagent wrote any
         # files the parent had already read, surface it so the parent
@@ -1919,6 +1997,7 @@ def delegate_task(
     goal: Optional[str] = None,
     context: Optional[str] = None,
     toolsets: Optional[List[str]] = None,
+    category: Optional[str] = None,
     tasks: Optional[List[Dict[str, Any]]] = None,
     max_iterations: Optional[int] = None,
     acp_command: Optional[str] = None,
@@ -1985,17 +2064,6 @@ def delegate_task(
             "using delegation.max_iterations=%s from config",
             max_iterations, default_max_iter,
         )
-    effective_max_iter = default_max_iter
-
-    # Resolve delegation credentials (provider:model pair).
-    # When delegation.provider is configured, this resolves the full credential
-    # bundle (base_url, api_key, api_mode) via the same runtime provider system
-    # used by CLI/gateway startup.  When unconfigured, returns None values so
-    # children inherit from the parent.
-    try:
-        creds = _resolve_delegation_credentials(cfg, parent_agent)
-    except ValueError as exc:
-        return tool_error(str(exc))
 
     # Normalize to task list
     max_children = _get_max_concurrent_children()
@@ -2017,7 +2085,13 @@ def delegate_task(
         task_list = tasks
     elif goal and isinstance(goal, str) and goal.strip():
         task_list = [
-            {"goal": goal, "context": context, "toolsets": toolsets, "role": top_role}
+            {
+                "goal": goal,
+                "context": context,
+                "toolsets": toolsets,
+                "category": category,
+                "role": top_role,
+            }
         ]
     else:
         return tool_error("Provide either 'goal' (single task) or 'tasks' (batch).")
@@ -2033,6 +2107,49 @@ def delegate_task(
             )
         if not task.get("goal", "").strip():
             return tool_error(f"Task {i} is missing a 'goal'.")
+
+    # Resolve categories and credentials before spawning any child.  This keeps
+    # unknown/disabled categories and provider misconfiguration from partially
+    # launching a batch.
+    parent_toolsets_for_categories = _parent_toolsets_for_delegation(parent_agent)
+    task_runtimes: List[Dict[str, Any]] = []
+    for i, task in enumerate(task_list):
+        task_toolsets = task.get("toolsets") if "toolsets" in task else toolsets
+        task_category = task.get("category") if "category" in task else category
+        try:
+            resolved_category = resolve_delegation_category(
+                cfg,
+                category=task_category,
+                parent_toolsets=parent_toolsets_for_categories,
+                requested_toolsets=task_toolsets,
+            )
+        except DelegationCategoryConfigError as exc:
+            return tool_error(str(exc))
+
+        runtime_cfg = _config_for_resolved_category(cfg, resolved_category)
+        try:
+            creds = _resolve_delegation_credentials(runtime_cfg, parent_agent)
+        except ValueError as exc:
+            return tool_error(str(exc))
+
+        runtime_max_iter = resolved_category.get("max_iterations") or default_max_iter
+        runtime_recipe = str(resolved_category.get("recipe") or cfg.get("recipe") or "").strip()
+        if runtime_recipe:
+            try:
+                get_builtin_recipe(runtime_recipe)
+            except KeyError as exc:
+                return tool_error(str(exc))
+        task_runtimes.append(
+            {
+                "toolsets": resolved_category.get("toolsets"),
+                "category": resolved_category,
+                "creds": creds,
+                "max_iterations": runtime_max_iter,
+                "reasoning_effort": resolved_category.get("reasoning_effort") or None,
+                "child_timeout_seconds": resolved_category.get("child_timeout_seconds"),
+                "recipe": runtime_recipe or None,
+            }
+        )
 
     overall_start = time.monotonic()
     results = []
@@ -2054,7 +2171,10 @@ def delegate_task(
     children = []
     try:
         for i, t in enumerate(task_list):
+            runtime = task_runtimes[i]
+            creds = runtime["creds"]
             task_acp_args = t.get("acp_args") if "acp_args" in t else None
+            task_toolsets = runtime["toolsets"]
             # Per-task role beats top-level; normalise again so unknown
             # per-task values warn and degrade to leaf uniformly.
             effective_role = _normalize_role(t.get("role") or top_role)
@@ -2062,15 +2182,18 @@ def delegate_task(
                 task_index=i,
                 goal=t["goal"],
                 context=t.get("context"),
-                toolsets=t.get("toolsets") or toolsets,
+                toolsets=task_toolsets,
                 model=creds["model"],
-                max_iterations=effective_max_iter,
+                max_iterations=runtime["max_iterations"],
                 task_count=n_tasks,
                 parent_agent=parent_agent,
                 override_provider=creds["provider"],
                 override_base_url=creds["base_url"],
                 override_api_key=creds["api_key"],
                 override_api_mode=creds["api_mode"],
+                override_reasoning_effort=runtime["reasoning_effort"],
+                override_child_timeout_seconds=runtime["child_timeout_seconds"],
+                delegation_category=runtime["category"],
                 override_acp_command=t.get("acp_command")
                 or acp_command
                 or creds.get("command"),
@@ -2080,6 +2203,7 @@ def delegate_task(
                     else (acp_args if acp_args is not None else creds.get("args"))
                 ),
                 role=effective_role,
+                agent_recipe=runtime["recipe"],
             )
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names
@@ -2299,6 +2423,39 @@ def delegate_task(
             logger.debug("Subagent cost rollup failed", exc_info=True)
 
     total_duration = round(time.monotonic() - overall_start, 2)
+
+    # Local-only, opt-in audit bundle. Record safe run metadata after children
+    # finish; never include goal/context prompts or credential values.
+    for entry in results:
+        try:
+            idx = int(entry.get("task_index", 0) or 0)
+            runtime = task_runtimes[idx] if idx < len(task_runtimes) else {}
+            creds = runtime.get("creds") or {}
+            child = children[idx][2] if idx < len(children) else None
+            task = task_list[idx] if idx < len(task_list) else {}
+            record_audit_event(
+                cfg,
+                build_delegation_run_event(
+                    session_id=getattr(child, "session_id", None),
+                    parent_session_id=getattr(parent_agent, "session_id", None),
+                    category_requested=task.get("category"),
+                    resolved_category=runtime.get("category"),
+                    recipe=runtime.get("recipe"),
+                    provider=creds.get("provider"),
+                    model=creds.get("model") or getattr(child, "model", None),
+                    base_url=creds.get("base_url"),
+                    toolsets=runtime.get("toolsets"),
+                    child_timeout_seconds=runtime.get("child_timeout_seconds"),
+                    max_iterations=runtime.get("max_iterations"),
+                    status=entry.get("status"),
+                    result_summary=entry.get("summary"),
+                    error=entry.get("error"),
+                    task_index=idx,
+                    task_count=n_tasks,
+                ),
+            )
+        except Exception:
+            logger.debug("delegation audit event build failed", exc_info=True)
 
     return json.dumps(
         {
@@ -2703,6 +2860,15 @@ DELEGATE_TASK_SCHEMA = {
                     "['terminal', 'file', 'web'] for full-stack tasks."
                 ),
             },
+            "category": {
+                "type": "string",
+                "description": (
+                    "Optional delegation category configured under "
+                    "delegation.categories. Categories resolve provider/model, "
+                    "runtime budget, and toolset scope before spawning; scope "
+                    "can only narrow parent/requested toolsets."
+                ),
+            },
             "tasks": {
                 "type": "array",
                 "items": {
@@ -2717,6 +2883,10 @@ DELEGATE_TASK_SCHEMA = {
                             "type": "array",
                             "items": {"type": "string"},
                             "description": f"Toolsets for this specific task. Available: {_TOOLSET_LIST_STR}. Use 'web' for network access, 'terminal' for shell, 'browser' for web interaction.",
+                        },
+                        "category": {
+                            "type": "string",
+                            "description": "Per-task delegation category override.",
                         },
                         "acp_command": {
                             "type": "string",
@@ -2788,6 +2958,7 @@ registry.register(
         goal=args.get("goal"),
         context=args.get("context"),
         toolsets=args.get("toolsets"),
+        category=args.get("category"),
         tasks=args.get("tasks"),
         max_iterations=args.get("max_iterations"),
         acp_command=args.get("acp_command"),

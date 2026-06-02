@@ -1562,6 +1562,12 @@ DEFAULT_CONFIG = {
                                        # raise if children time out before producing output.
         "reasoning_effort": "",  # reasoning effort for subagents: "xhigh", "high", "medium",
                                  # "low", "minimal", "none" (empty = inherit parent's level)
+        # Optional clean-room prompt recipe attached to delegated child prompts.
+        # Empty = no attachment (legacy prompt behavior). Named categories can
+        # override with their own `recipe` value.
+        # Valid built-ins live in tools/agent_recipes.py (e.g. focused-executor,
+        # readonly-advisor, researcher, critic-reviewer, orchestrator).
+        "recipe": "",
         "max_concurrent_children": 3,  # max parallel children per batch; floor of 1 enforced, no ceiling
         # Orchestrator role controls (see tools/delegate_tool.py:_get_max_spawn_depth
         # and _get_orchestrator_enabled).  Values are clamped to [1, 3] with a
@@ -1577,6 +1583,24 @@ DEFAULT_CONFIG = {
         # Flip to true only if you trust delegated work to run dangerous cmds
         # without human review (cron pipelines, batch automation, etc.).
         "subagent_auto_approve": False,
+        # Named delegation categories (capability layer). Each category bundles a
+        # provider/model + runtime budget + toolset scope so callers delegate by
+        # intent ("quick", "deep", …) instead of wiring providers ad hoc. Empty by
+        # default — legacy single-provider delegation keeps working untouched.
+        # Resolved by tools/delegation_categories.resolve_delegation_category.
+        "default_category": "",
+        "categories": {},
+        # Local-only, privacy-safe delegation/observability audit bundle
+        # (P10 Phase 7). Disabled by default — when enabled, safe redacted
+        # event dicts (category routing, recipe, fallback, provider/model,
+        # toolsets, timeouts, result, team handoffs, MCP env decisions) are
+        # appended as JSONL. Never persists prompts/goals or credentials.
+        # Remote telemetry stays opt-in through the plugin system only.
+        # Resolved by tools/delegation_audit. Empty ``dir`` => Hermes logs dir.
+        "audit": {
+            "enabled": False,
+            "dir": "",
+        },
     },
 
     # Ephemeral prefill messages file — JSON list of {role, content} dicts
@@ -1630,6 +1654,14 @@ DEFAULT_CONFIG = {
         # External hub installs (trusted/community sources) are always
         # scanned regardless of this setting.
         "guard_agent_created": False,
+        # Skill-scoped MCP servers (Phase 4 MVP). When a skill declares an
+        # `mcp:` manifest in its frontmatter, skill_view surfaces it for
+        # inspection, but servers are only built/registered when this is on.
+        # Off by default: starting MCP servers on skill load runs skill-author
+        # commands with skill-author-chosen env, so it stays opt-in.
+        "mcp": {
+            "enabled": False,
+        },
     },
 
     # Curator — background skill maintenance.

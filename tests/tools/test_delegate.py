@@ -57,6 +57,51 @@ def _make_mock_parent(depth=0):
     return parent
 
 
+def _delegation_category_runtime_config(default_category=""):
+    return {
+        "max_iterations": 45,
+        "default_category": default_category,
+        "categories": {
+            "quick": {
+                "provider": "local-lmstudio",
+                "model": "qwen/qwen3.6-35b-a3b",
+                "reasoning_effort": "low",
+                "toolsets": ["file", "terminal"],
+                "toolsets_mode": "intersect",
+                "max_iterations": 20,
+                "child_timeout_seconds": 300,
+                "fallback_chain": [
+                    {"provider": "openrouter", "model": "google/gemini-3-flash"},
+                ],
+            },
+            "review": {
+                "provider": "openrouter",
+                "model": "anthropic/claude-sonnet-4.5",
+                "reasoning_effort": "medium",
+                "toolsets": ["file", "terminal"],
+                "toolsets_mode": "intersect",
+                "max_iterations": 12,
+            },
+            "disabled": {
+                "enabled": False,
+                "provider": "openrouter",
+                "model": "anthropic/claude-sonnet-4.5",
+            },
+        },
+    }
+
+
+def _fake_delegation_creds(cfg, _parent):
+    provider = cfg.get("provider") or None
+    return {
+        "model": cfg.get("model") or None,
+        "provider": provider,
+        "base_url": "https://runtime.example.test/v1" if provider else None,
+        "api_key": "test-runtime-key" if provider else None,
+        "api_mode": "chat_completions" if provider else None,
+    }
+
+
 class TestDelegateRequirements(unittest.TestCase):
     def test_always_available(self):
         self.assertTrue(check_delegate_requirements())
@@ -68,6 +113,9 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertIn("tasks", props)
         self.assertIn("context", props)
         self.assertIn("toolsets", props)
+        self.assertIn("category", props)
+        task_props = props["tasks"]["items"]["properties"]
+        self.assertIn("category", task_props)
         # max_iterations is intentionally NOT exposed to the model — it's
         # config-authoritative via delegation.max_iterations so users get
         # predictable budgets.
@@ -140,6 +188,83 @@ class TestChildSystemPrompt(unittest.TestCase):
     def test_empty_context_ignored(self):
         prompt = _build_child_system_prompt("Do something", "  ")
         self.assertNotIn("CONTEXT", prompt)
+
+    def test_child_prompt_does_not_attach_recipe_without_config(self):
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            _build_child_agent(
+                task_index=0,
+                goal="Keep legacy prompt behavior",
+                context="No recipe configured.",
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        prompt = MockAgent.call_args.kwargs["ephemeral_system_prompt"]
+        self.assertIn("YOUR TASK:\nKeep legacy prompt behavior", prompt)
+        self.assertNotIn("## Agent Recipe:", prompt)
+
+    def test_category_recipe_attaches_to_child_prompt_without_changing_runtime_route(self):
+        parent = _make_mock_parent(depth=0)
+        parent.enabled_toolsets = ["file", "terminal", "web"]
+        cfg = _delegation_category_runtime_config()
+        cfg["categories"]["quick"]["recipe"] = "focused-executor"
+
+        with (
+            patch("tools.delegate_tool._load_config", return_value=cfg),
+            patch(
+                "tools.delegate_tool._resolve_delegation_credentials",
+                side_effect=_fake_delegation_creds,
+            ),
+            patch("run_agent.AIAgent") as MockAgent,
+        ):
+            mock_child = MagicMock()
+            mock_child.run_conversation.return_value = {
+                "final_response": "ok",
+                "completed": True,
+                "interrupted": False,
+                "api_calls": 1,
+                "messages": [],
+            }
+            MockAgent.return_value = mock_child
+
+            result = json.loads(
+                delegate_task(
+                    goal="Apply recipe contract",
+                    context="Task context is untrusted data.",
+                    category="quick",
+                    parent_agent=parent,
+                )
+            )
+
+        kwargs = MockAgent.call_args.kwargs
+        prompt = kwargs["ephemeral_system_prompt"]
+        self.assertEqual(kwargs["provider"], "local-lmstudio")
+        self.assertEqual(kwargs["model"], "qwen/qwen3.6-35b-a3b")
+        self.assertEqual(kwargs["enabled_toolsets"], ["file", "terminal"])
+        self.assertEqual(kwargs["max_iterations"], 20)
+        self.assertIn("## Agent Recipe: focused-executor", prompt)
+        self.assertIn("Identity: Hermes Focused Executor", prompt)
+        self.assertIn("### Verification Gates", prompt)
+        self.assertLess(
+            prompt.index("Task context is untrusted data."),
+            prompt.index("## Agent Recipe: focused-executor"),
+        )
+        self.assertEqual(result["results"][0]["delegation"]["category"], "quick")
+        self.assertEqual(result["results"][0]["delegation"]["recipe"], "focused-executor")
+
+    def test_dispatch_delegate_task_forwards_top_level_category(self):
+        from run_agent import AIAgent
+
+        parent = AIAgent.__new__(AIAgent)
+        with patch("tools.delegate_tool.delegate_task", return_value='{"results": []}') as mock_delegate:
+            parent._dispatch_delegate_task({"goal": "Review", "category": "review"})
+
+        self.assertEqual(mock_delegate.call_args.kwargs["category"], "review")
 
 
 class TestStripBlockedTools(unittest.TestCase):
@@ -367,6 +492,151 @@ class TestDelegateTask(unittest.TestCase):
             self.assertEqual(kwargs["api_key"], parent.api_key)
             self.assertEqual(kwargs["provider"], parent.provider)
             self.assertEqual(kwargs["api_mode"], parent.api_mode)
+
+    def test_explicit_category_wires_runtime_scope_and_fallback_metadata(self):
+        parent = _make_mock_parent(depth=0)
+        parent.enabled_toolsets = ["file", "terminal", "web", "browser"]
+        parent._fallback_chain = [{"provider": "parent", "model": "fallback"}]
+        cfg = _delegation_category_runtime_config()
+
+        with (
+            patch("tools.delegate_tool._load_config", return_value=cfg),
+            patch(
+                "tools.delegate_tool._resolve_delegation_credentials",
+                side_effect=_fake_delegation_creds,
+            ),
+            patch("run_agent.AIAgent") as MockAgent,
+        ):
+            mock_child = MagicMock()
+            mock_child.model = "qwen/qwen3.6-35b-a3b"
+            mock_child.session_prompt_tokens = 0
+            mock_child.session_completion_tokens = 0
+            mock_child.run_conversation.return_value = {
+                "final_response": "ok",
+                "completed": True,
+                "interrupted": False,
+                "api_calls": 1,
+                "messages": [],
+            }
+            MockAgent.return_value = mock_child
+
+            result = json.loads(
+                delegate_task(
+                    goal="Fast local pass",
+                    category="quick",
+                    toolsets=["web", "file", "browser"],
+                    parent_agent=parent,
+                )
+            )
+
+        kwargs = MockAgent.call_args.kwargs
+        self.assertEqual(kwargs["provider"], "local-lmstudio")
+        self.assertEqual(kwargs["model"], "qwen/qwen3.6-35b-a3b")
+        self.assertEqual(kwargs["base_url"], "https://runtime.example.test/v1")
+        self.assertEqual(kwargs["api_key"], "test-runtime-key")
+        self.assertEqual(kwargs["api_mode"], "chat_completions")
+        self.assertEqual(kwargs["max_iterations"], 20)
+        self.assertEqual(kwargs["reasoning_config"], {"enabled": True, "effort": "low"})
+        self.assertEqual(kwargs["enabled_toolsets"], ["file"])
+        self.assertEqual(kwargs["fallback_model"], parent._fallback_chain)
+        self.assertEqual(mock_child._delegate_child_timeout_seconds, 300.0)
+
+        delegation = result["results"][0]["delegation"]
+        self.assertEqual(delegation["category"], "quick")
+        self.assertEqual(
+            delegation["fallback_metadata"],
+            {
+                "enabled": True,
+                "count": 1,
+                "providers": ["openrouter"],
+                "models": ["google/gemini-3-flash"],
+            },
+        )
+        # Category fallback is metadata-only for now: no extra child attempt.
+        MockAgent.assert_called_once()
+
+    def test_default_category_wires_runtime_when_category_omitted(self):
+        parent = _make_mock_parent(depth=0)
+        parent.enabled_toolsets = ["file", "terminal", "web"]
+        cfg = _delegation_category_runtime_config(default_category="quick")
+
+        with (
+            patch("tools.delegate_tool._load_config", return_value=cfg),
+            patch(
+                "tools.delegate_tool._resolve_delegation_credentials",
+                side_effect=_fake_delegation_creds,
+            ),
+            patch("run_agent.AIAgent") as MockAgent,
+        ):
+            mock_child = MagicMock()
+            mock_child.model = "qwen/qwen3.6-35b-a3b"
+            mock_child.run_conversation.return_value = {
+                "final_response": "ok",
+                "completed": True,
+                "interrupted": False,
+                "api_calls": 1,
+                "messages": [],
+            }
+            MockAgent.return_value = mock_child
+
+            result = json.loads(delegate_task(goal="default route", parent_agent=parent))
+
+        kwargs = MockAgent.call_args.kwargs
+        self.assertEqual(kwargs["provider"], "local-lmstudio")
+        self.assertEqual(kwargs["model"], "qwen/qwen3.6-35b-a3b")
+        self.assertEqual(kwargs["max_iterations"], 20)
+        self.assertEqual(result["results"][0]["delegation"]["category"], "quick")
+
+    def test_category_errors_before_child_spawn(self):
+        parent = _make_mock_parent(depth=0)
+        cfg = _delegation_category_runtime_config()
+
+        with (
+            patch("tools.delegate_tool._load_config", return_value=cfg),
+            patch("run_agent.AIAgent") as MockAgent,
+        ):
+            unknown = json.loads(
+                delegate_task(goal="bad category", category="missing", parent_agent=parent)
+            )
+            disabled = json.loads(
+                delegate_task(goal="off category", category="disabled", parent_agent=parent)
+            )
+
+        self.assertIn("Unknown delegation category", unknown["error"])
+        self.assertIn("disabled", disabled["error"])
+        MockAgent.assert_not_called()
+
+    def test_category_toolsets_cannot_escalate_or_fallback_to_parent_on_empty_scope(self):
+        parent = _make_mock_parent(depth=0)
+        parent.enabled_toolsets = ["file", "terminal", "web", "browser"]
+        cfg = _delegation_category_runtime_config()
+
+        with (
+            patch("tools.delegate_tool._load_config", return_value=cfg),
+            patch(
+                "tools.delegate_tool._resolve_delegation_credentials",
+                side_effect=_fake_delegation_creds,
+            ),
+            patch("run_agent.AIAgent") as MockAgent,
+        ):
+            mock_child = MagicMock()
+            mock_child.run_conversation.return_value = {
+                "final_response": "ok",
+                "completed": True,
+                "interrupted": False,
+                "api_calls": 1,
+                "messages": [],
+            }
+            MockAgent.return_value = mock_child
+
+            delegate_task(
+                goal="web would escalate outside quick category",
+                category="quick",
+                toolsets=["web"],
+                parent_agent=parent,
+            )
+
+        self.assertEqual(MockAgent.call_args.kwargs["enabled_toolsets"], [])
 
     def test_child_inherits_parent_print_fn(self):
         parent = _make_mock_parent(depth=0)

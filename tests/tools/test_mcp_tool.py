@@ -948,6 +948,50 @@ class TestMCPServerTask:
 
         asyncio.run(_test())
 
+    def test_stdio_launch_env_excludes_unconfigured_parent_secrets(self):
+        """Integrated stdio launch uses safe env plus explicit config env only."""
+        from tools.mcp_tool import MCPServerTask
+
+        mock_session = MagicMock()
+        mock_session.initialize = AsyncMock()
+        mock_session.list_tools = AsyncMock(
+            return_value=SimpleNamespace(tools=[])
+        )
+
+        p_stdio, p_cs, _, _ = self._mock_stdio_and_session(mock_session)
+
+        async def _test():
+            with patch("tools.mcp_tool.StdioServerParameters") as mock_params, \
+                 p_stdio, p_cs, \
+                 patch.dict(
+                     "os.environ",
+                     {
+                         "PATH": "/usr/bin",
+                         "HOME": "/home/test",
+                         "AWS_SECRET_ACCESS_KEY": "unrelated-parent-secret",
+                     },
+                     clear=True,
+                 ):
+                server = MCPServerTask("skill:github_triage:github_readonly")
+                await server.start(
+                    {
+                        "command": "node",
+                        "env": {"SKILL_MCP_TOKEN": "secret-token-value"},
+                    }
+                )
+
+                env_arg = mock_params.call_args.kwargs.get("env")
+                assert isinstance(env_arg, dict)
+                assert env_arg["PATH"] == "/usr/bin"
+                assert env_arg["HOME"] == "/home/test"
+                assert env_arg["SKILL_MCP_TOKEN"] == "secret-token-value"
+                assert "AWS_SECRET_ACCESS_KEY" not in env_arg
+                assert "unrelated-parent-secret" not in json.dumps(env_arg, ensure_ascii=False)
+
+                await server.shutdown()
+
+        asyncio.run(_test())
+
     def test_shutdown_signals_task_exit(self):
         """shutdown() signals the event and waits for task completion."""
         from tools.mcp_tool import MCPServerTask

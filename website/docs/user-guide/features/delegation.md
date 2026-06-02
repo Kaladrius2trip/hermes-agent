@@ -257,6 +257,125 @@ For **durable long-running work** that must survive interrupts or outlive the cu
 
 **Rule of thumb:** Use `delegate_task` when the subtask requires reasoning, judgment, or multi-step problem solving. Use `execute_code` when you need mechanical data processing or scripted workflows.
 
+## Delegation Capability Categories
+
+Capability categories are the optional **capability layer** on top of legacy delegation. A
+*category* bundles a provider/model, a runtime budget, a prompt recipe, and a
+toolset scope under a short intent name, so the agent delegates by intent
+("quick", "deep", "review", "visual", "writing") instead of wiring providers ad
+hoc on every call. The layer is resolved by
+`tools/delegation_categories.resolve_delegation_category` **before** any child is
+spawned, so configuration mistakes fail fast with a precise error.
+
+:::info Clean-room notice
+Categories and recipe names are Hermes-native concepts. They map only to the
+built-in recipes in `tools/agent_recipes.py` and the resolver in
+`tools/delegation_categories.py` — no code or prompts are copied from any
+external project.
+:::
+
+### Safe category presets
+
+A ready-to-merge `delegation:` block lives at repository path
+`docs/config/delegation-category-presets.yaml`. It defines five categories you can copy straight into
+`~/.hermes/config.yaml`:
+
+| Category | Recipe | Toolsets | Posture |
+|----------|--------|----------|---------|
+| `quick` | `focused-executor` | `[file, search]` | Cheap/fast leaf edits and lookups |
+| `deep` | `deep-worker` | `[file, search, terminal, web]` | Long, high-effort multi-file work |
+| `review` | `critic-reviewer` | `[file, search]` | Read-only critique — **no `terminal`** |
+| `visual` | `explorer` | `[vision, browser, file]` | Screenshots, diagrams, UI inspection |
+| `writing` | `researcher` | `[file, search, web]` | Drafting prose/docs from sources |
+
+Every category sets `toolsets_mode: intersect`. This is the core safety
+guarantee: a category can only ever **narrow** toolset scope, never escalate it.
+The child's effective toolsets are `category ∩ parent ∩ caller-requested`, with
+category order preserved. `review` deliberately omits `terminal` so a reviewer
+cannot execute or mutate anything.
+
+Valid recipe names come from `tools/agent_recipes.py`: `focused-executor`,
+`deep-worker`, `critic-reviewer`, `explorer`, `researcher`, `readonly-advisor`,
+`orchestrator`, `team-orchestrator`.
+
+### Enabling categories
+
+```yaml
+# In ~/.hermes/config.yaml — merged with any existing delegation: settings
+delegation:
+  default_category: ""        # "" = opt-in per call; set a name to apply globally
+  categories:
+    quick:
+      recipe: focused-executor
+      reasoning_effort: low
+      max_iterations: 20
+      child_timeout_seconds: 300
+      toolsets_mode: intersect
+      toolsets: [file, search]
+      fallback_chain:                  # optional; provider/model identifiers only
+        - provider: openrouter
+          model: "google/gemini-3-flash-preview"
+    review:
+      recipe: critic-reviewer
+      reasoning_effort: high
+      toolsets_mode: intersect
+      toolsets: [file, search]   # no terminal — read-only review
+```
+
+Set `default_category` to apply one intent to every `delegate_task`, or leave it
+empty and let the agent pass a category per call.
+
+`fallback_chain` is optional per category. Keep it to provider/model identifiers
+only; credential material stays in environment or credential-pool config and is
+never needed in the category preset.
+
+:::warning No credentials in presets
+Category blocks never carry `api_key`, `password`, or `base_url`. Provider/model
+values are plain identifiers; real secrets stay in `~/.hermes/.env` (shown as
+`[REDACTED]` in docs, never inlined). Subagents inherit the parent's resolved
+credentials, so you almost never need to set credentials per category.
+:::
+
+### Migration from ad-hoc delegation prompts
+
+Categories replace hand-written "act as a careful reviewer, don't run anything,
+only look at these files…" preambles with a named, enforced posture:
+
+| Before (ad-hoc prompt) | After (category) |
+|------------------------|------------------|
+| `delegate_task(goal="Review auth for bugs but DON'T run anything", toolsets=["file"])` | `delegate_task(goal="Review auth for bugs", category="review")` |
+| `delegate_task(goal="Quick: just check this one file", toolsets=["file"], max_iterations=10)` | `delegate_task(goal="Check this file", category="quick")` |
+| `delegate_task(goal="Deep refactor across src/", toolsets=["terminal","file","web"])` | `delegate_task(goal="Deep refactor across src/", category="deep")` |
+
+Migration is **incremental and reversible**:
+
+1. **Nothing changes by default.** `delegation.model` / `delegation.provider`
+   still work exactly as before; the category layer stays inactive until you add
+   `categories`.
+2. **Add categories alongside** your existing `delegation:` settings. A category
+   with no `provider`/`model` inherits the legacy values.
+3. **Opt in gradually** — pass `category=` on the calls you want, or set
+   `default_category` once you trust it.
+4. **Revert any time** by deleting `default_category` and `categories`; behavior
+   falls straight back to legacy single-provider delegation.
+
+Override precedence: an explicit `category=` argument wins over
+`default_category`; a category's `provider`/`model`/`reasoning_effort` override
+the top-level `delegation.*` defaults; caller-passed `toolsets` further narrow
+the category scope.
+
+### Troubleshooting category routing
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| `unknown_category` error listing valid names | Typo or category not defined | Use one of the listed categories, or add it under `categories:` |
+| `disabled_category` error | Category has `enabled: false` | Remove the flag or set `enabled: true` |
+| `invalid_toolsets_mode` error | A category set `toolsets_mode` to something other than `intersect` | Categories may only narrow scope — set it back to `intersect` |
+| Child has **fewer** tools than its category lists | Intersection with parent/requested toolsets — this is by design | Widen the parent's toolsets, or pass matching `toolsets=` on the call |
+| `reasoning_effort` ignored, "inheriting parent level" in logs | Value isn't one of `xhigh/high/medium/low/minimal/none` | Use a supported level (see [`hermes_constants.parse_reasoning_effort`]) |
+| Subagent times out with zero API calls | Missing/unreachable provider for the category's `provider`/`model` | Check the diagnostic dump in `~/.hermes/logs/`; verify the provider is configured |
+| Unknown recipe error before spawn | `recipe:` not in `tools/agent_recipes.py` | Use a valid built-in recipe name |
+
 ## Configuration
 
 ```yaml
@@ -274,7 +393,7 @@ delegation:
 delegation:
   model: "qwen2.5-coder"
   base_url: "http://localhost:1234/v1"
-  api_key: "local-key"
+  api_key: "[REDACTED]"
   # api_mode: "anthropic_messages"  # Optional. Wire protocol override for base_url ("chat_completions", "codex_responses", or "anthropic_messages"). Empty = auto-detect from URL (e.g. /anthropic suffix). Set explicitly for endpoints the heuristic can't classify (Azure AI Foundry, MiniMax, Zhipu GLM, LiteLLM proxies, …).
 ```
 
