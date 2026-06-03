@@ -6,6 +6,7 @@ import pytest
 
 from tools.capability_profiles import (
     CapabilityProfileConfigError,
+    list_builtin_capability_profiles,
     render_capability_profile_prompt,
     resolve_capability_profile,
 )
@@ -14,6 +15,16 @@ from tools.capability_profiles import (
 def _delegation_config():
     return {
         "categories": {
+            "deep": {
+                "recipe": "deep-worker",
+                "provider": "openrouter",
+                "model": "anthropic/claude-sonnet-4.5",
+                "reasoning_effort": "high",
+                "max_iterations": 80,
+                "child_timeout_seconds": 1200,
+                "toolsets_mode": "intersect",
+                "toolsets": ["terminal", "file", "search", "web", "delegation"],
+            },
             "review": {
                 "recipe": "critic-reviewer",
                 "provider": "openrouter",
@@ -27,8 +38,161 @@ def _delegation_config():
                     {"provider": "openrouter", "model": "google/gemini-3-flash"},
                 ],
             },
+            "visual": {
+                "recipe": "explorer",
+                "provider": "openrouter",
+                "model": "anthropic/claude-sonnet-4.5",
+                "reasoning_effort": "medium",
+                "max_iterations": 50,
+                "child_timeout_seconds": 900,
+                "toolsets_mode": "intersect",
+                "toolsets": ["browser", "vision", "file", "search", "terminal"],
+            },
+            "writing": {
+                "recipe": "researcher",
+                "provider": "openrouter",
+                "model": "anthropic/claude-sonnet-4.5",
+                "reasoning_effort": "medium",
+                "max_iterations": 50,
+                "child_timeout_seconds": 900,
+                "toolsets_mode": "intersect",
+                "toolsets": ["file", "search", "web"],
+            },
+            # Same-name categories for profile labels must not be picked by
+            # accident; built-in profile -> category mapping is explicit.
+            "implementation": {
+                "recipe": "readonly-advisor",
+                "provider": "bad-provider",
+                "model": "bad-model",
+                "reasoning_effort": "low",
+                "max_iterations": 5,
+                "child_timeout_seconds": 30,
+                "toolsets_mode": "intersect",
+                "toolsets": ["file"],
+            },
+            "documentation": {
+                "recipe": "readonly-advisor",
+                "provider": "bad-provider",
+                "model": "bad-model",
+                "reasoning_effort": "low",
+                "max_iterations": 5,
+                "child_timeout_seconds": 30,
+                "toolsets_mode": "intersect",
+                "toolsets": ["file"],
+            },
         },
     }
+
+
+LEGACY_BUILTIN_COMPAT_PROFILES = {"quick", "deep", "review", "visual", "writing"}
+
+BUILTIN_CAPABILITY_PROFILE_PACK = {
+    "implementation": {
+        "category": "deep",
+        "recipe": "deep-worker",
+        "mutate": True,
+        "toolsets": ["terminal", "file", "search"],
+        "handoff_keys": {"changed_files", "commands_run", "tests", "risks", "blockers"},
+    },
+    "review": {
+        "category": "review",
+        "recipe": "critic-reviewer",
+        "mutate": False,
+        "toolsets": ["file", "search"],
+        "handoff_keys": {"findings", "evidence", "commands_run", "blockers"},
+    },
+    "testing": {
+        "category": "deep",
+        "recipe": "focused-executor",
+        "mutate": True,
+        "toolsets": ["terminal", "file", "search"],
+        "handoff_keys": {"tests_added", "commands_run", "failures", "coverage_gaps", "blockers"},
+    },
+    "research": {
+        "category": "writing",
+        "recipe": "researcher",
+        "mutate": False,
+        "toolsets": ["file", "search", "web"],
+        "handoff_keys": {"sources", "findings", "recommendation", "confidence", "blockers"},
+    },
+    "orchestration": {
+        "category": "deep",
+        "recipe": "team-orchestrator",
+        "mutate": False,
+        "toolsets": ["delegation", "file", "search"],
+        "handoff_keys": {"plan", "created_tasks", "dependencies", "handoffs", "blockers"},
+    },
+    "documentation": {
+        "category": "writing",
+        "recipe": "focused-executor",
+        "mutate": True,
+        "toolsets": ["file", "search", "web"],
+        "handoff_keys": {"docs_changed", "source_material", "commands_run", "gaps", "blockers"},
+    },
+    "webui-ux": {
+        "category": "visual",
+        "recipe": "deep-worker",
+        "mutate": True,
+        "toolsets": ["browser", "vision", "file", "search", "terminal"],
+        "handoff_keys": {"user_flows", "screenshots", "changed_files", "commands_run", "findings", "blockers"},
+    },
+}
+
+
+def test_builtin_capability_profile_pack_names_are_stable_and_required():
+    names = set(list_builtin_capability_profiles())
+
+    assert set(BUILTIN_CAPABILITY_PROFILE_PACK) <= names
+    assert LEGACY_BUILTIN_COMPAT_PROFILES <= names
+
+
+def test_builtin_capability_profile_pack_snapshots_required_fields_and_mappings():
+    parent_toolsets = ["terminal", "file", "search", "web", "browser", "vision", "delegation"]
+    responsibilities = []
+    for profile, expected in BUILTIN_CAPABILITY_PROFILE_PACK.items():
+        resolved = resolve_capability_profile(
+            {"profiles": {}},
+            profile=profile,
+            delegation_config=_delegation_config(),
+            parent_toolsets=parent_toolsets,
+            requested_toolsets=None,
+        )
+
+        assert resolved["active"] is True
+        assert resolved["profile"] == profile
+        assert resolved["category"] == expected["category"]
+        assert resolved["prompt_sections"] == {"recipe": expected["recipe"]}
+        assert resolved["toolsets"] == expected["toolsets"]
+        assert resolved["workspace_policy"]["mutate"] is expected["mutate"]
+        assert resolved["responsibility"]
+        responsibilities.append(resolved["responsibility"])
+        assert resolved["verification_policy"]["require_evidence"] is True
+        assert resolved["verification_policy"]["on_unverifiable"] in {"report", "fail"}
+        assert resolved["approval_gates"] == ["push", "merge", "publish", "send_message"]
+        assert set(resolved["handoff_schema"]) >= expected["handoff_keys"]
+        prompt = render_capability_profile_prompt(resolved, goal="Exercise built-in pack")
+        assert f"## Capability Profile: {profile}" in prompt
+        assert f"Local recipe: {expected['recipe']}" in prompt
+
+    assert len(set(responsibilities)) == len(BUILTIN_CAPABILITY_PROFILE_PACK)
+
+    implementation = resolve_capability_profile(
+        {"profiles": {}},
+        profile="implementation",
+        delegation_config=_delegation_config(),
+        parent_toolsets=parent_toolsets,
+    )
+    documentation = resolve_capability_profile(
+        {"profiles": {}},
+        profile="documentation",
+        delegation_config=_delegation_config(),
+        parent_toolsets=parent_toolsets,
+    )
+
+    assert implementation["provider"] == "openrouter"
+    assert implementation["model"] == "anthropic/claude-sonnet-4.5"
+    assert documentation["provider"] == "openrouter"
+    assert documentation["model"] == "anthropic/claude-sonnet-4.5"
 
 
 def test_builtin_review_profile_resolves_safe_readonly_defaults_and_strict_toolset_intersection():

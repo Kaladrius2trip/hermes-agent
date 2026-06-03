@@ -364,20 +364,73 @@ Override precedence: an explicit `category=` argument wins over
 the top-level `delegation.*` defaults; caller-passed `toolsets` further narrow
 the category scope.
 
-### Future direction: capability profiles
+### Capability profiles
 
-Categories are the first piece of a larger, **forward-looking** abstraction
-called **capability profiles** — a single named record that bundles a category's
-provider/model/budget/toolset scope *together with* a responsibility statement,
-workspace and verification policy, a structured handoff schema, and explicit
-approval gates. The intent is to retire borrowed "named-agent" personas in favor
-of operator-owned profiles whose every capability is explicit and fail-closed.
+Capability profiles are the higher-level delegation contract on top of categories
+and recipes. A profile bundles responsibility, category/model/budget/tool scope,
+workspace mutation policy, verification requirements, approval gates, and a
+handoff schema. Profiles are opt-in: pass `profile=` on a `delegate_task` call or
+set `capabilities.default_profile`; otherwise legacy delegation is unchanged.
 
-This is an **RFC only — no behavior changes ship yet**. Today's categories,
-recipes, and team metadata each map one-to-one onto a profile field, so adoption
-will be additive and reversible: existing `delegation:` config keeps working
-unchanged. See [`docs/architecture/capability-profiles.md`](https://github.com/NousResearch/hermes-agent/blob/main/docs/architecture/capability-profiles.md)
-for the proposed schema, the migration crosswalk, and the rollout/rollback plan.
+Built-in profiles:
+
+| Profile | Use | Mutates | Default toolsets |
+|---------|-----|---------|------------------|
+| `implementation` | scoped code changes with tests | yes | `[terminal, file, search]` |
+| `review` | read-only correctness/security review | no | `[file, search]` |
+| `testing` | add/run focused tests and isolate failures | yes | `[terminal, file, search]` |
+| `research` | evidence-backed synthesis from files/web | no | `[file, search, web]` |
+| `orchestration` | decompose and route child work | no | `[delegation, file, search]` |
+| `documentation` | update docs from verified project facts | yes | `[file, search, web]` |
+| `webui-ux` | inspect/fix WebUI UX with visual evidence | yes | `[browser, vision, file, search, terminal]` |
+
+Example call:
+
+```python
+delegate_task(
+    goal="Implement retry handling in src/client.py and verify focused tests",
+    profile="implementation"
+)
+```
+
+Custom profile YAML:
+
+```yaml
+capabilities:
+  default_profile: ""  # keep empty for opt-in per call
+  profiles:
+    security-review:
+      responsibility: >
+        Review changed files for security regressions and return findings only.
+      category: review
+      prompt_sections:
+        recipe: critic-reviewer
+      allowed_toolsets: [file, search]
+      workspace_policy:
+        kind: scratch
+        mutate: false
+      verification_policy:
+        require_evidence: true
+        on_unverifiable: report
+      handoff_schema:
+        findings: list
+        evidence: list
+        blockers: list
+      approval_gates: [push, merge, publish, send_message]
+```
+
+Rules:
+
+- Profiles can only narrow tool scope: `profile ∩ category ∩ parent ∩ caller-requested`.
+- `provider`/`model` are identifiers only; never put `api_key`, `password`,
+  `base_url`, or auth headers in a profile.
+- `capability_profiles:` is accepted as a legacy shorthand for
+  `capabilities.profiles`, but new configs should use `capabilities.profiles`.
+- Unknown, disabled, unsafe, secret-like, or external-prompt-import profile
+  config fails before a child spawns.
+
+See [`docs/architecture/capability-profiles.md`](https://github.com/NousResearch/hermes-agent/blob/main/docs/architecture/capability-profiles.md)
+for the full schema, clean-room policy, and rollback plan.
 
 ### Troubleshooting category routing
 

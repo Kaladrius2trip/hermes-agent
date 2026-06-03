@@ -130,6 +130,170 @@ _EXTERNAL_PROMPT_TEXT = re.compile(
 
 def _builtins() -> Dict[str, Dict[str, Any]]:
     return {
+        "implementation": {
+            "responsibility": (
+                "Implement scoped code changes for the delegated goal; preserve "
+                "unrelated behavior and verify the changed path."
+            ),
+            "category": "deep",
+            "prompt_sections": {"recipe": "deep-worker"},
+            "allowed_toolsets": ["terminal", "file", "search"],
+            "budget": {
+                "reasoning_effort": "high",
+                "max_iterations": 70,
+                "child_timeout_seconds": 1200,
+            },
+            "workspace_policy": {"kind": "worktree", "mutate": True},
+            "verification_policy": {
+                "require_evidence": True,
+                "on_unverifiable": "fail",
+                "commands": ["targeted tests for touched code"],
+            },
+            "handoff_schema": {
+                "changed_files": "list",
+                "commands_run": "list",
+                "tests": "list",
+                "risks": "list",
+                "blockers": "list",
+            },
+        },
+        "review": {
+            "responsibility": "Review changed files for correctness, security, regressions, and missing tests; report findings only.",
+            "category": "review",
+            "prompt_sections": {"recipe": "critic-reviewer"},
+            "allowed_toolsets": ["file", "search"],
+            "budget": {
+                "reasoning_effort": "high",
+                "max_iterations": 40,
+                "child_timeout_seconds": 600,
+            },
+            "workspace_policy": {"kind": "scratch", "mutate": False},
+            "handoff_schema": {
+                "findings": "list",
+                "evidence": "list",
+                "commands_run": "list",
+                "blockers": "list",
+            },
+        },
+        "testing": {
+            "responsibility": (
+                "Create or run focused tests for the delegated behavior; isolate "
+                "failures from unrelated suite noise."
+            ),
+            "category": "deep",
+            "prompt_sections": {"recipe": "focused-executor"},
+            "allowed_toolsets": ["terminal", "file", "search"],
+            "budget": {
+                "reasoning_effort": "medium",
+                "max_iterations": 50,
+                "child_timeout_seconds": 900,
+            },
+            "workspace_policy": {"kind": "worktree", "mutate": True},
+            "verification_policy": {
+                "require_evidence": True,
+                "on_unverifiable": "fail",
+                "commands": ["focused test command", "regression check when available"],
+            },
+            "handoff_schema": {
+                "tests_added": "list",
+                "commands_run": "list",
+                "failures": "list",
+                "coverage_gaps": "list",
+                "blockers": "list",
+            },
+        },
+        "research": {
+            "responsibility": "Gather evidence from supplied context and allowed sources, then synthesize cited findings without mutating project files.",
+            "category": "writing",
+            "prompt_sections": {"recipe": "researcher"},
+            "allowed_toolsets": ["file", "search", "web"],
+            "budget": {
+                "reasoning_effort": "medium",
+                "max_iterations": 50,
+                "child_timeout_seconds": 900,
+            },
+            "workspace_policy": {"kind": "scratch", "mutate": False},
+            "verification_policy": {"require_evidence": True, "on_unverifiable": "report"},
+            "handoff_schema": {
+                "sources": "list",
+                "findings": "list",
+                "recommendation": "string",
+                "confidence": "string",
+                "blockers": "list",
+            },
+        },
+        "orchestration": {
+            "responsibility": "Decompose the delegated goal, route leaf work, track dependencies, and synthesize handoffs without doing leaf implementation.",
+            "category": "deep",
+            "prompt_sections": {"recipe": "team-orchestrator"},
+            "allowed_toolsets": ["delegation", "file", "search"],
+            "budget": {
+                "reasoning_effort": "high",
+                "max_iterations": 80,
+                "child_timeout_seconds": 1200,
+            },
+            "workspace_policy": {"kind": "scratch", "mutate": False},
+            "verification_policy": {"require_evidence": True, "on_unverifiable": "report"},
+            "handoff_schema": {
+                "plan": "list",
+                "created_tasks": "list",
+                "dependencies": "list",
+                "handoffs": "list",
+                "blockers": "list",
+            },
+        },
+        "documentation": {
+            "responsibility": "Write or update documentation from verified project facts; avoid runtime code changes unless explicitly requested.",
+            "category": "writing",
+            "prompt_sections": {"recipe": "focused-executor"},
+            "allowed_toolsets": ["file", "search", "web"],
+            "budget": {
+                "reasoning_effort": "medium",
+                "max_iterations": 45,
+                "child_timeout_seconds": 900,
+            },
+            "workspace_policy": {"kind": "worktree", "mutate": True},
+            "verification_policy": {
+                "require_evidence": True,
+                "on_unverifiable": "report",
+                "commands": ["docs lint or targeted docs test when available"],
+            },
+            "handoff_schema": {
+                "docs_changed": "list",
+                "source_material": "list",
+                "commands_run": "list",
+                "gaps": "list",
+                "blockers": "list",
+            },
+        },
+        "webui-ux": {
+            "responsibility": "Inspect WebUI behavior and UX evidence, then propose or make scoped UI fixes with screenshots or test output.",
+            "category": "visual",
+            "prompt_sections": {"recipe": "deep-worker"},
+            "allowed_toolsets": ["browser", "vision", "file", "search", "terminal"],
+            "budget": {
+                "reasoning_effort": "high",
+                "max_iterations": 70,
+                "child_timeout_seconds": 1200,
+            },
+            "workspace_policy": {"kind": "worktree", "mutate": True},
+            "verification_policy": {
+                "require_evidence": True,
+                "on_unverifiable": "report",
+                "commands": ["targeted UI/unit test", "browser smoke when available"],
+            },
+            "handoff_schema": {
+                "user_flows": "list",
+                "screenshots": "list",
+                "changed_files": "list",
+                "commands_run": "list",
+                "findings": "list",
+                "blockers": "list",
+            },
+        },
+        # Legacy category-mirror profiles kept for compatibility with earlier
+        # Phase 13 canaries.  The named profile pack above is preferred because
+        # its labels describe responsibilities instead of routing categories.
         "quick": {
             "responsibility": "Complete small scoped implementation, lookup, or mechanical fix tasks.",
             "category": "quick",
@@ -153,18 +317,6 @@ def _builtins() -> Dict[str, Dict[str, Any]]:
                 "child_timeout_seconds": 1200,
             },
             "workspace_policy": {"kind": "worktree", "mutate": True},
-        },
-        "review": {
-            "responsibility": "Read changed files and report correctness, security, and style defects without mutation.",
-            "category": "review",
-            "prompt_sections": {"recipe": "critic-reviewer"},
-            "allowed_toolsets": ["file", "search"],
-            "budget": {
-                "reasoning_effort": "high",
-                "max_iterations": 40,
-                "child_timeout_seconds": 600,
-            },
-            "workspace_policy": {"kind": "scratch", "mutate": False},
         },
         "visual": {
             "responsibility": "Inspect screenshots, browser state, diagrams, or images and return evidence-backed findings.",

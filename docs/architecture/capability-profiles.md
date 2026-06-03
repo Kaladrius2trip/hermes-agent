@@ -1,14 +1,16 @@
-# Capability Profiles (RFC, Phase 13)
+# Capability Profiles (Phase 13)
 
-> Status: **Phase 13.1 resolver MVP implemented**. Runtime child-spawn wiring remains
-> additive and opt-in. With none of the new keys present, the agent preserves
-> current delegation behavior.
+> Status: **Implemented incrementally**. The pure resolver, resolver hardening,
+> prompt renderer, `delegate_task` profile routing, Team/Kanban bridge, and
+> built-in profile pack are additive and opt-in. With no profile requested and no
+> profile config present, delegation keeps the legacy category/global/provider
+> behavior.
 
-This RFC proposes **capability profiles**: a single, declarative description of
-*what a delegated agent is allowed to be* — its responsibility, prompt shape,
-tool scope, model/budget, workspace and verification policy, handoff contract,
-approval gates, and fallbacks. A profile is the future abstraction that unifies
-three things Hermes already ships as separate, partially-overlapping concepts:
+**Capability profiles** are a single, declarative description of *what a
+delegated agent is allowed to be* — its responsibility, prompt shape, tool
+scope, model/budget, workspace and verification policy, handoff contract,
+approval gates, and fallbacks. A profile unifies three Hermes surfaces that used
+to be separate, partially-overlapping concepts:
 
 - **agent recipes** (`tools/agent_recipes.py`) — prompt posture + readonly flag,
 - **delegation categories** (`tools/delegation_categories.py`) — provider/model/
@@ -63,27 +65,31 @@ unchanged.
 
 ## Profile schema
 
-A profile is a named mapping. Phase 13.1 rejects unsupported top-level profile
-fields (fail-closed for typos and future pass-through risk). Every supported
-field is optional and has a fail-closed default (narrowest scope, read-only
-posture, no side effects). The top-level shape (Phase 13.1 implements pure
-config resolution; child-spawn enforcement lands in later phases):
+A profile is a named mapping. Unsupported top-level profile fields are rejected
+fail-closed for typos and pass-through risk. Every supported field is optional
+and has a fail-closed default (narrowest scope, read-only posture, no side
+effects). The implemented runtime shape is:
 
 ```yaml
-capability_profiles:
-  <profile-name>:
-    responsibility:        # WHAT this profile is for — one binding sentence
-    prompt_sections:       # ordered prompt shape (recipe ref or inline sections)
-    allowed_toolsets:      # tool scope; narrow-only, intersect semantics
-    model:                 # model/provider/budget block
-    provider:
-    budget:
-    workspace_policy:      # where it may run + whether it may mutate
-    verification_policy:   # what counts as "done"
-    handoff_schema:        # structured result it must return
-    approval_gates:        # actions requiring explicit human approval
-    fallbacks:             # ordered provider/model candidates on transport error
+capabilities:
+  default_profile: ""        # optional; empty keeps legacy delegation default
+  profiles:
+    <profile-name>:
+      responsibility:        # WHAT this profile is for — one binding sentence
+      prompt_sections:       # ordered prompt shape (recipe ref or inline sections)
+      allowed_toolsets:      # tool scope; narrow-only, intersect semantics
+      model:                 # model/provider/budget block
+      provider:
+      budget:
+      workspace_policy:      # where it may run + whether it may mutate
+      verification_policy:   # what counts as "done"
+      handoff_schema:        # structured result it must return
+      approval_gates:        # actions requiring explicit human approval
+      fallbacks:             # ordered provider/model candidates on transport error
 ```
+
+`capability_profiles:` is still accepted as a legacy shorthand for
+`capabilities.profiles`, but new config should use `capabilities.profiles`.
 
 ### Field reference
 
@@ -100,6 +106,26 @@ capability_profiles:
 | `handoff_schema` | mapping | minimal summary | Structured fields the child must return: `changed_files`, `commands_run`, `findings`, `blockers`, plus any profile-specific keys. Drives the parent-visible summary; nothing else enters the parent context. |
 | `approval_gates` | list[str] | `[push, merge, publish, send_message]` | Actions that require explicit human approval before the child may perform them. Fail-closed: an action on this list is denied unless an operator approves. |
 | `fallbacks` | list | `[]` | Ordered `{provider, model}` candidates tried on a *retryable transport/availability* error only (auth, model-not-found, timeout, rate limit) — never on a model-produced task failure. An entry may include `profile` or a narrowed `allowed_toolsets` list, but no other keys. Provider/model/profile values must be plain identifiers: no env interpolation, URLs/schemes, headers, API keys, tokens, or secret-like fields. String values anywhere in a profile are rejected if they contain shell-style env/command interpolation (`${VAR}`, `${VAR:-default}`, `$VAR`, `%VAR%`, `$(...)`, backticks; Unicode-normalized before scan). An entry may narrow but never widen the final effective toolset scope. |
+
+### Built-in profile pack
+
+Hermes ships a clean-room built-in pack for common delegation modes. These names
+are capability labels, not personas; each maps explicitly to a category/recipe
+pair and a distinct policy surface.
+
+| Profile | Category | Recipe | Mutates | Default toolsets | Handoff focus |
+|---------|----------|--------|---------|------------------|---------------|
+| `implementation` | `deep` | `deep-worker` | yes | `terminal`, `file`, `search` | changed files, commands, tests, risks, blockers |
+| `review` | `review` | `critic-reviewer` | no | `file`, `search` | findings, evidence, commands, blockers |
+| `testing` | `deep` | `focused-executor` | yes | `terminal`, `file`, `search` | tests added, commands, failures, coverage gaps |
+| `research` | `writing` | `researcher` | no | `file`, `search`, `web` | sources, findings, recommendation, confidence |
+| `orchestration` | `deep` | `team-orchestrator` | no | `delegation`, `file`, `search` | plan, created tasks, dependencies, handoffs |
+| `documentation` | `writing` | `focused-executor` | yes | `file`, `search`, `web` | docs changed, source material, commands, gaps |
+| `webui-ux` | `visual` | `deep-worker` | yes | `browser`, `vision`, `file`, `search`, `terminal` | user flows, screenshots, changed files, findings |
+
+Legacy category-mirror built-ins (`quick`, `deep`, `visual`, `writing`) remain
+available for compatibility. `review` keeps the old name but now uses the stricter
+read-only profile contract above.
 
 ### Worked example
 
@@ -188,10 +214,13 @@ a direct profile home:
 | `fallback_chain` (provider/model only) | `fallbacks` |
 | `enabled: false` | profile-level `enabled: false` → `disabled_profile` error |
 
-The five shipped categories (`quick`, `deep`, `review`, `visual`, `writing`) map
-one-to-one onto five starter profiles. The intersect-only safety property and
-the "no credentials in config" rule carry over unchanged — `fallbacks` continue
-to hold provider/model identifiers only.
+The shipped categories (`quick`, `deep`, `review`, `visual`, `writing`) map to
+legacy category-mirror profiles and to the named built-in pack above. Mapping is
+explicit: `implementation` and `testing` use `deep`, `research` and
+`documentation` use `writing`, `orchestration` uses `deep`, and `webui-ux` uses
+`visual`. The intersect-only safety property and the "no credentials in config"
+rule carry over unchanged — `fallbacks` continue to hold provider/model
+identifiers only.
 
 ### Team metadata → `responsibility`, `workspace_policy`, `approval_gates`, `handoff_schema`
 
@@ -216,7 +245,7 @@ no-inbound-control properties of team mode are preserved verbatim.
 
 ## Non-goals
 
-This RFC explicitly **does not** propose:
+The implemented layer still **does not** add:
 
 1. **No copied `oh-my-*` prompts, schemas, or persona text.** Profiles are
    clean-room Hermes data. Built-in `prompt_sections` come only from
@@ -256,41 +285,42 @@ If none of the new keys are present, the agent behaves byte-for-byte as before.
 
 ## Rollout plan
 
-Profiles ship as a sequence of additive, individually-revertible steps. Each
-step is gated and inert until an operator opts in.
+Profiles shipped as additive, individually-revertible steps. Current backend
+state:
 
 | Step | Scope | Gate | Verification |
 |------|-------|------|--------------|
-| 13.0 | This RFC (docs only) | none | Docs lint: files exist, headings present, no tabs/trailing whitespace, no secret-like strings, `git diff --check`. |
-| 13.1 | Profile resolver (pure, no I/O) reading `capability_profiles`, returning a spec; references recipes/categories | absent key ⇒ inactive | `pytest -k "profile or recipe or categor"` |
-| 13.2 | `delegate_task` accepts `profile=`; resolves via 13.1; fail-closed defaults | per-call opt-in | targeted delegate tests |
-| 13.3 | Starter profile presets shipped as docs/config YAML (the five category mappings) | copy-in only | preset lint |
-| 13.4 | Team templates may reference a profile per node | template opt-in | `pytest -k "team or kanban"` |
-| 13.5 | WebUI read-only profile inspector (see UX contract) | feature flag | UI smoke test |
-| Pre-merge (every step) | Full `pytest` suite green | — | full suite |
+| 13.0 | Architecture RFC and threat model | docs only | docs checks |
+| 13.1 | Pure resolver for `capabilities.profiles` / legacy `capability_profiles` | absent key ⇒ inactive | resolver tests |
+| 13.2 | `delegate_task(profile=...)` routing + capability prompt rendering | per-call opt-in | delegate/profile tests |
+| 13.3 | Legacy category-mirror built-ins (`quick`, `deep`, `review`, `visual`, `writing`) | built-in only, no default flip | profile snapshot tests |
+| 13.5 | Named built-in profile pack (`implementation`, `review`, `testing`, `research`, `orchestration`, `documentation`, `webui-ux`) | explicit `profile=` or `default_profile` | `tests/tools/test_capability_profiles.py` + `tests/tools/test_agent_recipes.py` |
+| Pre-merge | Full integration confidence | no push/restart without approval | targeted then full pytest where practical |
 
-Steps 13.1–13.4 are backend-only and headless-safe. Step 13.5 is the only
-UI-touching step and is independently flag-gated.
+The runtime remains opt-in. With no `profile=` and no `capabilities.default_profile`,
+`delegate_task` still uses the legacy category/global/provider path.
 
 ## Canary plan
 
 Profiles are validated on a narrow, low-blast-radius path before any default
 flips:
 
-1. **Resolver-only canary.** Enable 13.1/13.2 for a single operator on a single
-   board. Exercise the five starter profiles against real delegations; compare
-   the resolved spec to the equivalent legacy category resolution and assert
-   they are identical (a profile that references a category must produce the
-   same effective `toolsets`, model, and budget).
-2. **Read-only profiles first.** Canary `review`, `explore`, and `advise`-shaped
-   profiles (no terminal, `mutate: false`) before any write-capable profile, so
-   the worst-case canary failure is a no-op read.
-3. **Approval-gate assertion.** With a write-capable profile in canary, confirm
+1. **Resolver-only canary.** Enable profile calls for a single operator on a
+   single board. Exercise the named built-in pack plus legacy mirror profiles
+   against real delegations; compare resolved category-derived fields to the
+   equivalent legacy category resolution where a profile references a category.
+2. **Read-only profiles first.** Canary `review` and `research` before
+   write-capable or child-spawning profiles, so the worst-case canary failure is
+   a no-op read/synthesis run.
+3. **Orchestration with child-spawn gates.** Canary `orchestration` only after
+   read-only profiles pass, and constrain spawned children to read-only profiles
+   until delegation routing/audit behavior is verified.
+4. **Approval-gate assertion.** With a write-capable profile in canary, confirm
    every `approval_gates` action is denied without explicit approval — a single
    un-gated push during canary is a hard stop.
-4. **Local audit diff.** Confirm each resolution and each fallback advance emits
+5. **Local audit diff.** Confirm each resolution and each fallback advance emits
    exactly one local audit line and zero network calls.
-5. **Promotion criteria.** Promote past canary only when: resolved specs match
+6. **Promotion criteria.** Promote past canary only when: resolved specs match
    legacy for all reference profiles, no approval gate was bypassed, no remote
    call was observed, and the full `pytest` suite is green.
 
@@ -303,19 +333,20 @@ Every step is removable by deleting keys — no migration, no data rewrite.
 
 | Step | Rollback action | Result |
 |------|-----------------|--------|
-| 13.1 / 13.2 | Delete `capability_profiles`; stop passing `profile=` | Resolver inactive; delegation falls back to categories/global/inherit |
-| 13.3 | Delete the starter preset block | Hand-write profiles or use categories |
-| 13.4 | Remove `profile:` from team nodes | Team nodes use inline toolsets/approval as today |
-| 13.5 | Disable the WebUI flag | Inspector hidden; backend unaffected |
+| 13.1 / 13.2 | Delete `capabilities.profiles` / legacy `capability_profiles`; stop passing `profile=` | Resolver inactive; delegation falls back to categories/global/inherit |
+| 13.3 / 13.5 | Stop using built-in `profile=` names or clear `default_profile` | Calls use legacy categories or caller toolsets |
+| Team references | Remove `profile:` from team nodes | Team nodes use inline toolsets/approval as today |
+| WebUI inspector | Disable the WebUI flag | Inspector hidden; backend unaffected |
 
-Emergency rollback is a single config delete: removing `capability_profiles`
-(and any `default_profile`) reverts the engine to legacy delegation with no
-restart of any resolver state required, because resolution is pure and per-call.
-Because profiles never mutate existing config, there is nothing to un-migrate.
+Emergency rollback is a single config delete: removing `capabilities.profiles`
+(or legacy `capability_profiles`) and any `default_profile` reverts the engine to
+legacy delegation with no restart of any resolver state required, because
+resolution is pure and per-call. Because profiles never mutate existing config,
+there is nothing to un-migrate.
 
 ## WebUI UX contract
 
-The WebUI surface for profiles is **read-only and inspectional** in this RFC.
+The WebUI surface for profiles remains **read-only and inspectional**.
 Editing profiles is out of scope (operators edit YAML); the UI explains and
 audits, it does not grant.
 
