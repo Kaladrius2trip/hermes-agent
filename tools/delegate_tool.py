@@ -1169,11 +1169,15 @@ def _build_child_agent(
     except Exception as exc:
         logger.debug("Could not load delegation reasoning_effort: %s", exc)
 
-    # Inherit the parent's fallback provider chain so subagents can recover
-    # from rate-limits and credential exhaustion exactly like the top-level
-    # agent does.  _fallback_chain is a list accepted by AIAgent's
-    # fallback_model parameter (which handles both list and dict forms).
-    parent_fallback = getattr(parent_agent, "_fallback_chain", None) or None
+    # Delegate runtime specs may carry their own provider fallback chain.  Use
+    # the scoped category/profile chain first; otherwise inherit the parent's
+    # chain so legacy subagents still recover like the top-level agent.
+    runtime_fallback = None
+    if capability_profile and capability_profile.get("fallbacks"):
+        runtime_fallback = capability_profile.get("fallbacks")
+    elif delegation_category and delegation_category.get("fallback_chain"):
+        runtime_fallback = delegation_category.get("fallback_chain")
+    parent_fallback = runtime_fallback or getattr(parent_agent, "_fallback_chain", None) or None
 
     # Inherit the parent's OpenRouter provider-preference filters by default
     # (so subagents routed to the same provider honour the same routing
@@ -1261,6 +1265,8 @@ def _build_child_agent(
             category_metadata["recipe"] = recipe_name
         if capability_profile and capability_profile.get("profile"):
             category_metadata["profile"] = capability_profile.get("profile")
+        elif delegation_category.get("profile"):
+            category_metadata["profile"] = delegation_category.get("profile")
         setattr(
             child,
             "_delegation_category",
@@ -2184,6 +2190,16 @@ def delegate_task(
         task_toolsets = task.get("toolsets") if "toolsets" in task else toolsets
         task_category = task.get("category") if "category" in task else category
         task_profile = task.get("profile") if "profile" in task else profile
+        if not task_profile:
+            category_for_profile = task_category or cfg.get("default_category") or ""
+            category_specs = cfg.get("categories") or {}
+            category_spec = (
+                category_specs.get(category_for_profile)
+                if isinstance(category_specs, dict) and category_for_profile
+                else None
+            )
+            if isinstance(category_spec, dict):
+                task_profile = category_spec.get("default_profile") or category_spec.get("profile")
 
         try:
             resolved_profile = resolve_capability_profile(
@@ -2230,6 +2246,13 @@ def delegate_task(
                     return tool_error(str(exc))
             resolved_category = {
                 "category": resolved_profile.get("category") or "",
+                "profile": resolved_profile.get("profile") or "",
+                "provider": resolved_profile.get("provider") or "",
+                "model": resolved_profile.get("model") or "",
+                "toolsets": resolved_profile.get("toolsets"),
+                "max_iterations": runtime_max_iter,
+                "child_timeout_seconds": budget.get("child_timeout_seconds"),
+                "fallback_chain": resolved_profile.get("fallbacks") or [],
                 "fallback_metadata": resolved_profile.get("fallback_metadata", {}),
             }
             if runtime_recipe:
@@ -2585,6 +2608,7 @@ def delegate_task(
                     session_id=getattr(child, "session_id", None),
                     parent_session_id=getattr(parent_agent, "session_id", None),
                     category_requested=task.get("category"),
+                    profile_requested=task.get("profile"),
                     resolved_category=runtime.get("category"),
                     recipe=runtime.get("recipe"),
                     provider=creds.get("provider"),

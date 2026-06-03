@@ -583,7 +583,7 @@ class TestDelegateTask(unittest.TestCase):
             self.assertEqual(kwargs["provider"], parent.provider)
             self.assertEqual(kwargs["api_mode"], parent.api_mode)
 
-    def test_explicit_category_wires_runtime_scope_and_fallback_metadata(self):
+    def test_explicit_category_wires_runtime_scope_and_fallback_chain(self):
         parent = _make_mock_parent(depth=0)
         parent.enabled_toolsets = ["file", "terminal", "web", "browser"]
         parent._fallback_chain = [{"provider": "parent", "model": "fallback"}]
@@ -628,7 +628,10 @@ class TestDelegateTask(unittest.TestCase):
         self.assertEqual(kwargs["max_iterations"], 20)
         self.assertEqual(kwargs["reasoning_config"], {"enabled": True, "effort": "low"})
         self.assertEqual(kwargs["enabled_toolsets"], ["file"])
-        self.assertEqual(kwargs["fallback_model"], parent._fallback_chain)
+        self.assertEqual(
+            kwargs["fallback_model"],
+            [{"provider": "openrouter", "model": "google/gemini-3-flash"}],
+        )
         self.assertEqual(mock_child._delegate_child_timeout_seconds, 300.0)
 
         delegation = result["results"][0]["delegation"]
@@ -642,8 +645,95 @@ class TestDelegateTask(unittest.TestCase):
                 "models": ["google/gemini-3-flash"],
             },
         )
-        # Category fallback is metadata-only for now: no extra child attempt.
+        # Category fallback chain is enforced inside the child runtime, not by
+        # spawning extra delegated children from the parent.
         MockAgent.assert_called_once()
+
+    def test_category_default_profile_wires_profile_runtime_and_fallback_chain(self):
+        parent = _make_mock_parent(depth=0)
+        parent.enabled_toolsets = ["file", "terminal", "web", "browser"]
+        parent._fallback_chain = [{"provider": "parent", "model": "fallback"}]
+        cfg = _delegation_category_runtime_config()
+        cfg["categories"]["quick"]["default_profile"] = "safe-review"
+        full_cfg = {
+            "delegation": cfg,
+            "capabilities": {
+                "profiles": {
+                    "safe-review": {
+                        "responsibility": "Review scoped implementation changes only.",
+                        "category": "quick",
+                        "prompt_sections": {"recipe": "critic-reviewer"},
+                        "allowed_toolsets": ["file", "terminal", "web"],
+                        "budget": {"max_iterations": 9},
+                        "fallbacks": [
+                            {
+                                "provider": "openrouter",
+                                "model": "anthropic/claude-haiku",
+                            }
+                        ],
+                    }
+                }
+            },
+        }
+
+        with (
+            patch("tools.delegate_tool._load_config", return_value=cfg),
+            patch("tools.delegate_tool._load_full_config", return_value=full_cfg),
+            patch(
+                "tools.delegate_tool._resolve_delegation_credentials",
+                side_effect=_fake_delegation_creds,
+            ),
+            patch("run_agent.AIAgent") as MockAgent,
+        ):
+            mock_child = MagicMock()
+            mock_child.model = "qwen/qwen3.6-35b-a3b"
+            mock_child.session_prompt_tokens = 0
+            mock_child.session_completion_tokens = 0
+            mock_child.run_conversation.return_value = {
+                "final_response": "profile ok",
+                "completed": True,
+                "interrupted": False,
+                "api_calls": 1,
+                "messages": [],
+            }
+            MockAgent.return_value = mock_child
+
+            result = json.loads(
+                delegate_task(
+                    goal="Review quick implementation",
+                    category="quick",
+                    toolsets=["web", "file", "terminal"],
+                    parent_agent=parent,
+                )
+            )
+
+        kwargs = MockAgent.call_args.kwargs
+        prompt = kwargs["ephemeral_system_prompt"]
+        self.assertEqual(kwargs["provider"], "local-lmstudio")
+        self.assertEqual(kwargs["model"], "qwen/qwen3.6-35b-a3b")
+        self.assertEqual(kwargs["max_iterations"], 9)
+        self.assertEqual(kwargs["enabled_toolsets"], ["file", "terminal"])
+        self.assertEqual(
+            kwargs["fallback_model"],
+            [{"provider": "openrouter", "model": "anthropic/claude-haiku"}],
+        )
+        self.assertIn("## Capability Profile: safe-review", prompt)
+        self.assertIn("## Agent Recipe: critic-reviewer", prompt)
+
+        delegation = result["results"][0]["delegation"]
+        self.assertEqual(delegation["category"], "quick")
+        self.assertEqual(delegation["profile"], "safe-review")
+        self.assertEqual(delegation["recipe"], "critic-reviewer")
+        self.assertEqual(
+            delegation["fallback_metadata"],
+            {
+                "enabled": True,
+                "count": 1,
+                "providers": ["openrouter"],
+                "models": ["anthropic/claude-haiku"],
+                "profiles": [],
+            },
+        )
 
     def test_default_category_wires_runtime_when_category_omitted(self):
         parent = _make_mock_parent(depth=0)
