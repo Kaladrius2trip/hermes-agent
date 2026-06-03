@@ -78,6 +78,30 @@ _SECRET_FIELD_PARTS = {
 _CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
 _WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 _VERIFICATION_ON_UNVERIFIABLE = {"report", "fail"}
+_SECRET_VALUE_PATTERNS = (
+    re.compile(r"\bsk-[A-Za-z0-9._-]{4,}"),
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{4,}"),
+    re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{6,}"),
+    re.compile(
+        r"(?i)\b(api[_-]?key|token|password|secret)\b\s*[:=]\s*[^\s,;]+"
+    ),
+)
+_EXTERNAL_PROMPT_FIELD_KEYS = {
+    "copy_from",
+    "external_prompt",
+    "external_prompt_url",
+    "import_from",
+    "prompt_copy",
+    "prompt_import",
+    "prompt_source",
+    "prompt_url",
+    "source_prompt",
+    "source_prompt_url",
+}
+_EXTERNAL_PROMPT_TEXT = re.compile(
+    r"(?i)(copy|fetch|import|load)\s+(?:an?\s+)?(?:external\s+)?prompt\s+"
+    r"(?:from|via)|prompt\s+(?:copy|import)|oh-my-(?:openagent|opencode|hermes)"
+)
 
 
 def _builtins() -> Dict[str, Dict[str, Any]]:
@@ -720,6 +744,182 @@ def resolve_capability_profile(
     }
 
 
+def _redact_prompt_text(value: Any) -> str:
+    text = str(value)
+    for pattern in _SECRET_VALUE_PATTERNS:
+        text = pattern.sub("[REDACTED]", text)
+    return text
+
+
+def _format_bool(value: Any) -> str:
+    return "true" if bool(value) else "false"
+
+
+def _format_sequence(values: Any) -> str:
+    if values is None:
+        return ""
+    if isinstance(values, (list, tuple)):
+        return ", ".join(_redact_prompt_text(item) for item in values)
+    return _redact_prompt_text(values)
+
+
+def _assert_no_external_prompt_imports(
+    obj: Any,
+    *,
+    profile: str,
+    path: str = "prompt_sections",
+) -> None:
+    if isinstance(obj, Mapping):
+        for key, value in obj.items():
+            key_text = str(key)
+            canonical = _canonical_field_key(key_text)
+            if (
+                canonical in _EXTERNAL_PROMPT_FIELD_KEYS
+                or canonical.endswith("_prompt_url")
+                or canonical.endswith("_prompt_path")
+            ):
+                raise CapabilityProfileConfigError(
+                    f"Capability profile {profile!r} tries to import or copy an external prompt via {path}.{key_text}",
+                    code="external_prompt_import",
+                    profile=profile,
+                    field=f"{path}.{key_text}",
+                )
+            _assert_no_external_prompt_imports(
+                value,
+                profile=profile,
+                path=f"{path}.{key_text}",
+            )
+    elif isinstance(obj, list):
+        for index, item in enumerate(obj):
+            _assert_no_external_prompt_imports(
+                item,
+                profile=profile,
+                path=f"{path}[{index}]",
+            )
+    elif isinstance(obj, str) and _EXTERNAL_PROMPT_TEXT.search(obj):
+        raise CapabilityProfileConfigError(
+            f"Capability profile {profile!r} tries to import or copy an external prompt via {path}",
+            code="external_prompt_import",
+            profile=profile,
+            field=path,
+        )
+
+
+def _render_budget_line(budget: Mapping[str, Any]) -> str:
+    parts = []
+    for key in sorted(budget):
+        value = budget.get(key)
+        if value not in (None, "", [], {}):
+            parts.append(f"{key}={_redact_prompt_text(value)}")
+    return "; ".join(parts)
+
+
+def _render_handoff_schema_lines(schema: Mapping[str, Any]) -> List[str]:
+    lines: List[str] = []
+    evidence_blocks = schema.get("evidence_blocks")
+    for key in sorted(str(k) for k in schema.keys() if str(k) != "evidence_blocks"):
+        lines.append(f"- `{key}`: {_redact_prompt_text(schema.get(key))}")
+
+    if isinstance(evidence_blocks, Mapping):
+        for block_name in sorted(str(k) for k in evidence_blocks.keys()):
+            raw = evidence_blocks.get(block_name)
+            if isinstance(raw, Mapping):
+                fields = raw.get("required") or raw.get("fields") or raw.get("sections") or []
+            elif isinstance(raw, (list, tuple)):
+                fields = raw
+            elif raw:
+                fields = [raw]
+            else:
+                fields = []
+            rendered = _format_sequence(fields) or "not specified"
+            lines.append(f"- Evidence block `{block_name}` requires: {rendered}")
+    return lines
+
+
+def render_capability_profile_prompt(
+    resolved_profile: Mapping[str, Any],
+    *,
+    goal: Optional[str] = None,
+    context: Optional[str] = None,
+) -> str:
+    """Render a resolved capability profile into a child-agent prompt fragment.
+
+    The renderer is deterministic and local-only: it never fetches or imports
+    prompt text, redacts secret-shaped values, and emits a capability contract
+    rather than a persona/identity instruction so it composes with agent recipes.
+    """
+    if not resolved_profile or resolved_profile.get("active") is False:
+        return ""
+
+    profile = str(resolved_profile.get("profile") or "unnamed")
+    prompt_sections = resolved_profile.get("prompt_sections") or {}
+    _assert_no_external_prompt_imports(prompt_sections, profile=profile)
+
+    lines: List[str] = [
+        f"## Capability Profile: {_redact_prompt_text(profile)}",
+        "This is a local capability contract, not a persona or identity.",
+    ]
+
+    responsibility = _redact_prompt_text(
+        resolved_profile.get("responsibility") or "Use the delegated task goal as the responsibility."
+    )
+    lines.extend(["", "### Responsibility", responsibility])
+
+    workspace = resolved_profile.get("workspace_policy") or {}
+    toolsets_text = _format_sequence(resolved_profile.get("toolsets")) or "inherit parent scope"
+    gates_text = _format_sequence(resolved_profile.get("approval_gates")) or "none"
+    lines.extend(
+        [
+            "",
+            "### Runtime Boundaries",
+            f"- Effective toolsets: {toolsets_text}",
+            f"- Workspace: {_redact_prompt_text(workspace.get('kind', 'scratch'))}; mutate: {_format_bool(workspace.get('mutate', False))}",
+            f"- Approval gates: {gates_text}",
+        ]
+    )
+    if resolved_profile.get("category"):
+        lines.append(f"- Delegation category: {_redact_prompt_text(resolved_profile.get('category'))}")
+    budget_text = _render_budget_line(resolved_profile.get("budget") or {})
+    if budget_text:
+        lines.append(f"- Budget: {budget_text}")
+
+    verification = resolved_profile.get("verification_policy") or {}
+    lines.extend(
+        [
+            "",
+            "### Verification",
+            f"- Require evidence: {_format_bool(verification.get('require_evidence', True))}",
+            f"- On unverifiable result: {_redact_prompt_text(verification.get('on_unverifiable', 'report'))}",
+        ]
+    )
+    commands = verification.get("commands")
+    if commands:
+        lines.append(f"- Suggested verification commands: {_format_sequence(commands)}")
+
+    handoff = resolved_profile.get("handoff_schema") or {}
+    lines.extend(
+        [
+            "",
+            "### Handoff Output",
+            "Return a concise final answer that satisfies this schema; if impossible, report blockers.",
+        ]
+    )
+    lines.extend(_render_handoff_schema_lines(handoff))
+
+    recipe = ""
+    if isinstance(prompt_sections, Mapping):
+        recipe = str(prompt_sections.get("recipe") or "").strip()
+    if recipe:
+        lines.extend(["", "### Prompt Composition", f"- Local recipe: {_redact_prompt_text(recipe)}"])
+
+    # `goal` / `context` are accepted for future renderers but intentionally not
+    # interpolated: the base child prompt already carries them, and duplicating
+    # task text is cache-hostile and increases prompt-injection surface.
+    _ = goal, context
+    return "\n".join(lines).rstrip()
+
+
+
 def list_builtin_capability_profiles() -> List[str]:
     """Return built-in capability profile names."""
     return sorted(_builtins())
@@ -730,5 +930,6 @@ __all__ = [
     "DEFAULT_APPROVAL_GATES",
     "SAFE_APPROVAL_GATES",
     "list_builtin_capability_profiles",
+    "render_capability_profile_prompt",
     "resolve_capability_profile",
 ]

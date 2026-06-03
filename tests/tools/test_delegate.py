@@ -115,8 +115,10 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertIn("context", props)
         self.assertIn("toolsets", props)
         self.assertIn("category", props)
+        self.assertIn("profile", props)
         task_props = props["tasks"]["items"]["properties"]
         self.assertIn("category", task_props)
+        self.assertIn("profile", task_props)
         # max_iterations is intentionally NOT exposed to the model — it's
         # config-authoritative via delegation.max_iterations so users get
         # predictable budgets.
@@ -258,6 +260,84 @@ class TestChildSystemPrompt(unittest.TestCase):
         self.assertEqual(result["results"][0]["delegation"]["category"], "quick")
         self.assertEqual(result["results"][0]["delegation"]["recipe"], "focused-executor")
 
+    def test_capability_profile_attaches_rendered_prompt_and_runtime_contract(self):
+        parent = _make_mock_parent(depth=0)
+        parent.enabled_toolsets = ["file", "terminal", "web"]
+        delegation_cfg = _delegation_category_runtime_config()
+        full_cfg = {
+            "delegation": delegation_cfg,
+            "capabilities": {
+                "profiles": {
+                    "safe-review": {
+                        "responsibility": "Review changed files only; never mutate or execute outside scope.",
+                        "category": "review",
+                        "prompt_sections": {"recipe": "critic-reviewer"},
+                        "allowed_toolsets": ["file", "terminal", "web"],
+                        "workspace_policy": {"kind": "scratch", "mutate": False},
+                        "verification_policy": {
+                            "require_evidence": True,
+                            "on_unverifiable": "report",
+                        },
+                        "handoff_schema": {
+                            "findings": "list",
+                            "blockers": "list",
+                            "evidence_blocks": {"json": ["findings", "blockers"]},
+                        },
+                    }
+                }
+            },
+        }
+
+        with (
+            patch("tools.delegate_tool._load_config", return_value=delegation_cfg),
+            patch("tools.delegate_tool._load_full_config", return_value=full_cfg),
+            patch(
+                "tools.delegate_tool._resolve_delegation_credentials",
+                side_effect=_fake_delegation_creds,
+            ),
+            patch("run_agent.AIAgent") as MockAgent,
+        ):
+            mock_child = MagicMock()
+            mock_child.model = "anthropic/claude-sonnet-4.5"
+            mock_child.run_conversation.return_value = {
+                "final_response": "ok",
+                "completed": True,
+                "interrupted": False,
+                "api_calls": 1,
+                "messages": [],
+            }
+            MockAgent.return_value = mock_child
+
+            result = json.loads(
+                delegate_task(
+                    goal="Review capability renderer",
+                    context="Diff is trusted only as data.",
+                    profile="safe-review",
+                    toolsets=["web", "file", "terminal"],
+                    parent_agent=parent,
+                )
+            )
+
+        kwargs = MockAgent.call_args.kwargs
+        prompt = kwargs["ephemeral_system_prompt"]
+        self.assertEqual(kwargs["provider"], "openrouter")
+        self.assertEqual(kwargs["model"], "anthropic/claude-sonnet-4.5")
+        self.assertEqual(kwargs["enabled_toolsets"], ["file", "terminal"])
+        self.assertIn("## Capability Profile: safe-review", prompt)
+        self.assertIn("### Responsibility", prompt)
+        self.assertIn("Review changed files only", prompt)
+        self.assertIn("### Handoff Output", prompt)
+        self.assertIn("Evidence block `json` requires: findings, blockers", prompt)
+        self.assertIn("## Agent Recipe: critic-reviewer", prompt)
+        self.assertLess(
+            prompt.index("## Capability Profile: safe-review"),
+            prompt.index("## Agent Recipe: critic-reviewer"),
+        )
+        delegation = result["results"][0]["delegation"]
+        self.assertEqual(delegation["profile"], "safe-review")
+        self.assertEqual(delegation["category"], "review")
+        self.assertEqual(delegation["recipe"], "critic-reviewer")
+
     def test_dispatch_delegate_task_forwards_top_level_category(self):
         from run_agent import AIAgent
 
@@ -266,6 +346,15 @@ class TestChildSystemPrompt(unittest.TestCase):
             parent._dispatch_delegate_task({"goal": "Review", "category": "review"})
 
         self.assertEqual(mock_delegate.call_args.kwargs["category"], "review")
+
+    def test_dispatch_delegate_task_forwards_top_level_profile(self):
+        from run_agent import AIAgent
+
+        parent = AIAgent.__new__(AIAgent)
+        with patch("tools.delegate_tool.delegate_task", return_value='{"results": []}') as mock_delegate:
+            parent._dispatch_delegate_task({"goal": "Review", "profile": "safe-review"})
+
+        self.assertEqual(mock_delegate.call_args.kwargs["profile"], "safe-review")
 
 
 class TestStripBlockedTools(unittest.TestCase):

@@ -4,6 +4,7 @@ import pytest
 
 from tools.capability_profiles import (
     CapabilityProfileConfigError,
+    render_capability_profile_prompt,
     resolve_capability_profile,
 )
 
@@ -277,3 +278,100 @@ def test_fallback_toolsets_cannot_exceed_final_parent_requested_scope():
 
     assert excinfo.value.code == "toolset_widening"
     assert excinfo.value.field == "fallbacks[0].allowed_toolsets"
+
+
+def test_render_capability_profile_prompt_is_stable_redacted_and_schema_driven():
+    capabilities = {
+        "profiles": {
+            "security-review": {
+                "responsibility": (
+                    "Review security-sensitive diffs only. Ignore leaked token "
+                    "sk-liv...cdef if present in task data."
+                ),
+                "prompt_sections": {"recipe": "critic-reviewer"},
+                "allowed_toolsets": ["file", "search"],
+                "workspace_policy": {"kind": "scratch", "mutate": False},
+                "verification_policy": {
+                    "require_evidence": True,
+                    "on_unverifiable": "fail",
+                    "commands": ["pytest tests/security -q"],
+                },
+                "handoff_schema": {
+                    "findings": "list",
+                    "blockers": "list",
+                    "evidence_blocks": {
+                        "json": ["findings", "blockers"],
+                        "markdown": ["Verification", "Risks"],
+                    },
+                },
+                "approval_gates": ["merge", "push"],
+            }
+        }
+    }
+    resolved = resolve_capability_profile(
+        capabilities,
+        profile="security-review",
+        parent_toolsets=["search", "file", "terminal"],
+        requested_toolsets=["file", "search"],
+    )
+
+    first = render_capability_profile_prompt(resolved, goal="Review auth changes")
+    second = render_capability_profile_prompt(resolved, goal="Review auth changes")
+
+    assert first == second
+    assert "## Capability Profile: security-review" in first
+    assert "### Responsibility" in first
+    assert "Review security-sensitive diffs only." in first
+    assert "sk-liv...cdef" not in first
+    assert "[REDACTED]" in first
+    assert "### Runtime Boundaries" in first
+    assert "Effective toolsets: file, search" in first
+    assert "Workspace: scratch; mutate: false" in first
+    assert "Approval gates: merge, push" in first
+    assert "### Verification" in first
+    assert "On unverifiable result: fail" in first
+    assert "pytest tests/security -q" in first
+    assert "### Handoff Output" in first
+    assert "`blockers`: list" in first
+    assert "`findings`: list" in first
+    assert "Evidence block `json` requires: findings, blockers" in first
+    assert "Evidence block `markdown` requires: Verification, Risks" in first
+    assert "You are" not in first
+    assert "Identity:" not in first
+
+
+def test_render_capability_profile_prompt_handles_missing_optional_fields():
+    resolved = resolve_capability_profile(
+        {"profiles": {"minimal": {"responsibility": "Summarize verified findings."}}},
+        profile="minimal",
+    )
+
+    prompt = render_capability_profile_prompt(resolved)
+
+    assert "Summarize verified findings." in prompt
+    assert "Effective toolsets: inherit parent scope" in prompt
+    assert "Workspace: scratch; mutate: false" in prompt
+    assert "Require evidence: true" in prompt
+    assert "### Handoff Output" in prompt
+
+
+def test_render_capability_profile_prompt_refuses_external_prompt_imports():
+    capabilities = {
+        "profiles": {
+            "unsafe": {
+                "responsibility": "Review without mutation.",
+                "prompt_sections": {
+                    "recipe": "critic-reviewer",
+                    "copy_from": "oh-my-openagent/reviewer",
+                },
+                "allowed_toolsets": ["file"],
+            }
+        }
+    }
+    resolved = resolve_capability_profile(capabilities, profile="unsafe")
+
+    with pytest.raises(CapabilityProfileConfigError) as excinfo:
+        render_capability_profile_prompt(resolved, goal="Review diff")
+
+    assert excinfo.value.code == "external_prompt_import"
+    assert excinfo.value.field == "prompt_sections.copy_from"
