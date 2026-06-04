@@ -1,9 +1,8 @@
 # Capability Profiles (RFC, Phase 13)
 
-> Status: **Design / RFC**. This is a docs-only artifact. No runtime behavior
-> changes ship with this document. Every field and mechanism described here is
-> additive and gated behind new, opt-in configuration. With none of the new
-> keys present, the agent behaves byte-for-byte as it does today.
+> Status: **Phase 13.1 resolver MVP implemented**. Runtime child-spawn wiring remains
+> additive and opt-in. With none of the new keys present, the agent preserves
+> current delegation behavior.
 
 This RFC proposes **capability profiles**: a single, declarative description of
 *what a delegated agent is allowed to be* — its responsibility, prompt shape,
@@ -64,9 +63,11 @@ unchanged.
 
 ## Profile schema
 
-A profile is a named mapping. Every field is optional and has a fail-closed
-default (narrowest scope, read-only posture, no side effects). The proposed
-top-level shape (Phase 13+; **not yet implemented**):
+A profile is a named mapping. Phase 13.1 rejects unsupported top-level profile
+fields (fail-closed for typos and future pass-through risk). Every supported
+field is optional and has a fail-closed default (narrowest scope, read-only
+posture, no side effects). The top-level shape (Phase 13.1 implements pure
+config resolution; child-spawn enforcement lands in later phases):
 
 ```yaml
 capability_profiles:
@@ -89,15 +90,16 @@ capability_profiles:
 | Field | Type | Default | Meaning |
 |-------|------|---------|---------|
 | `responsibility` | string | *required* | One binding sentence describing the slice of work this profile owns. Rendered into the child prompt as the scope contract; it is the *only* identity the child gets. No persona name. |
+| `extends` | string | none | Optional parent profile. Parent fields merge first, child overrides. Loops, unknown parents, and chains deeper than 32 profiles fail closed before any child spawn. |
 | `prompt_sections` | recipe-ref \| list | `readonly-advisor` | Either `recipe: <name>` (a built-in from `agent_recipes.py`) or an inline ordered list of `{id, title, body, required}` sections rendered by `render_agent_recipe`. Inline sections may only *add* boundaries, never remove the base scope/role/verification sections. |
 | `allowed_toolsets` | list[str] | `[]` (no tools) | Upper bound on tool scope. Resolved with `toolsets_mode: intersect` only — effective scope is `profile ∩ parent ∩ caller-requested`, order preserved. A profile can only ever **narrow**. |
-| `model` / `provider` | string | inherit parent | Plain identifiers only — never credentials. Empty inherits the parent's resolved model/provider/credential pool. |
-| `budget` | mapping | conservative caps | `{reasoning_effort, max_iterations, child_timeout_seconds}`. Bounds runtime cost. Defaults to the tightest sensible caps so an unset profile cannot run unbounded. |
+| `model` / `provider` | string | inherit parent | Plain identifiers only — never credentials, URLs/schemes, schemeless authorities, whitespace/control chars, or shell interpolation. Empty inherits the parent's resolved model/provider/credential pool. |
+| `budget` | mapping | inherits legacy caps until enforcement | `{reasoning_effort, max_iterations, child_timeout_seconds}`. Bounds runtime cost once child-spawn enforcement lands. Phase 13.1 resolver preserves existing unset-category behavior (`None`/inherit) for backward compatibility; enforcement phases must set concrete caps before using a profile for spawning. |
 | `workspace_policy` | mapping | `{kind: scratch, mutate: false}` | `kind` ∈ `scratch \| worktree \| dir`; `mutate` gates whether the child may write. Read-only profiles set `mutate: false`; runtime dispatch denies mutation tools (`write_file`, `patch`, destructive terminal commands) even if a broad read surface such as `file` is present. |
 | `verification_policy` | mapping | `{require_evidence: true}` | What the child must do before claiming success: `require_evidence`, optional `commands` (named, advisory), and `on_unverifiable` ∈ `report \| fail`. Mirrors the recipe's *Verification Gates* section, made declarative. |
 | `handoff_schema` | mapping | minimal summary | Structured fields the child must return: `changed_files`, `commands_run`, `findings`, `blockers`, plus any profile-specific keys. Drives the parent-visible summary; nothing else enters the parent context. |
 | `approval_gates` | list[str] | `[push, merge, publish, send_message]` | Actions that require explicit human approval before the child may perform them. Fail-closed: an action on this list is denied unless an operator approves. |
-| `fallbacks` | list | `[]` | Ordered `{provider, model}` candidates tried on a *retryable transport/availability* error only (auth, model-not-found, timeout, rate limit) — never on a model-produced task failure. An entry may narrow but never widen `allowed_toolsets`. |
+| `fallbacks` | list | `[]` | Ordered `{provider, model}` candidates tried on a *retryable transport/availability* error only (auth, model-not-found, timeout, rate limit) — never on a model-produced task failure. An entry may include `profile` or a narrowed `allowed_toolsets` list, but no other keys. Provider/model/profile values must be plain identifiers: no env interpolation, URLs/schemes, headers, API keys, tokens, or secret-like fields. String values anywhere in a profile are rejected if they contain shell-style env/command interpolation (`${VAR}`, `${VAR:-default}`, `$VAR`, `%VAR%`, `$(...)`, backticks; Unicode-normalized before scan). An entry may narrow but never widen the final effective toolset scope. |
 
 ### Worked example
 

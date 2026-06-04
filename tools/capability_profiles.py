@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import copy
 import re
+import unicodedata
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from toolsets import TOOLSETS
@@ -76,6 +77,29 @@ _SECRET_FIELD_PARTS = {
     "credentials",
 }
 _CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+_ENV_INTERPOLATION = re.compile(
+    r"(\$\{[A-Za-z_][A-Za-z0-9_]*[^}]*\}|\$[A-Za-z_][A-Za-z0-9_]*|%[A-Za-z_][A-Za-z0-9_]*%|\$\([^)]*\)|`[^`]*`)"
+)
+_URL_SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
+_INVALID_IDENTIFIER_CHARS = re.compile(r"(^//|\s|[\x00-\x1f\x7f])")
+_FALLBACK_ALLOWED_KEYS = {"provider", "model", "profile", "allowed_toolsets"}
+_PROFILE_ALLOWED_KEYS = {
+    "extends",
+    "enabled",
+    "responsibility",
+    "category",
+    "prompt_sections",
+    "allowed_toolsets",
+    "provider",
+    "model",
+    "budget",
+    "workspace_policy",
+    "verification_policy",
+    "handoff_schema",
+    "approval_gates",
+    "fallbacks",
+}
+_MAX_PROFILE_CHAIN_DEPTH = 32
 _WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 _VERIFICATION_ON_UNVERIFIABLE = {"report", "fail"}
 _SECRET_VALUE_PATTERNS = (
@@ -226,9 +250,14 @@ def _valid_profile_names(config_profiles: Mapping[str, Any]) -> List[str]:
 
 
 def _canonical_field_key(key: str) -> str:
+    key = unicodedata.normalize("NFKC", key)
     split_camel = _CAMEL_BOUNDARY.sub("_", key)
-    normalized = split_camel.lower().replace("-", "_")
+    normalized = split_camel.casefold().replace("-", "_")
     return re.sub(r"[^a-z0-9_]+", "_", normalized).strip("_")
+
+
+def _contains_env_interpolation(value: str) -> bool:
+    return bool(_ENV_INTERPOLATION.search(unicodedata.normalize("NFKC", value)))
 
 
 def _is_forbidden_field_key(key: str) -> bool:
@@ -253,6 +282,15 @@ def _profile_spec(
 ) -> Dict[str, Any]:
     path = list(stack or [])
     profile_names = list(valid_profiles or _valid_profile_names(config_profiles))
+    if len(path) >= _MAX_PROFILE_CHAIN_DEPTH:
+        origin = path[0] if path else name
+        raise CapabilityProfileConfigError(
+            f"Capability profile extends chain exceeds {_MAX_PROFILE_CHAIN_DEPTH} profiles",
+            code="extends_depth",
+            profile=origin,
+            valid_profiles=profile_names,
+            field="extends",
+        )
     if name in path:
         origin = path[0] if path else name
         raise CapabilityProfileConfigError(
@@ -290,10 +328,34 @@ def _profile_spec(
     return spec
 
 
+def _validate_profile_allowed_keys(spec: Mapping[str, Any], *, profile: str) -> None:
+    for key in spec:
+        key_text = str(key)
+        if key_text not in _PROFILE_ALLOWED_KEYS:
+            raise CapabilityProfileConfigError(
+                f"Capability profile {profile!r} has unsupported field {key_text!r}",
+                code="unknown_profile_field",
+                profile=profile,
+                field=f"profile.{key_text}",
+            )
+
+
 def _validate_no_secret_fields(obj: Any, *, profile: str, path: str = "profile") -> None:
     if isinstance(obj, Mapping):
+        seen: Dict[str, str] = {}
         for key, value in obj.items():
             key_text = str(key)
+            canonical = _canonical_field_key(key_text)
+            if canonical:
+                previous = seen.get(canonical)
+                if previous is not None and previous != key_text:
+                    raise CapabilityProfileConfigError(
+                        f"Capability profile {profile!r} has colliding field names at {path}.{key_text}",
+                        code="field_collision",
+                        profile=profile,
+                        field=f"{path}.{key_text}",
+                    )
+                seen[canonical] = key_text
             if _is_forbidden_field_key(key_text):
                 raise CapabilityProfileConfigError(
                     f"Capability profile {profile!r} contains forbidden secret/env field {path}.{key_text}",
@@ -305,6 +367,13 @@ def _validate_no_secret_fields(obj: Any, *, profile: str, path: str = "profile")
     elif isinstance(obj, list):
         for index, item in enumerate(obj):
             _validate_no_secret_fields(item, profile=profile, path=f"{path}[{index}]")
+    elif isinstance(obj, str) and _contains_env_interpolation(obj):
+        raise CapabilityProfileConfigError(
+            f"Capability profile {profile!r} field {path} must not contain environment interpolation",
+            code="env_interpolation",
+            profile=profile,
+            field=path,
+        )
 
 
 def _validate_toolsets(toolsets: Optional[Sequence[Any]], *, profile: str, field: str) -> List[str]:
@@ -400,6 +469,22 @@ def _validate_fallbacks(
             )
         entry = copy.deepcopy(dict(raw))
         _validate_no_secret_fields(entry, profile=profile, path=f"fallbacks[{index}]")
+        for key in list(entry):
+            key_text = str(key)
+            if key_text not in _FALLBACK_ALLOWED_KEYS:
+                raise CapabilityProfileConfigError(
+                    f"Capability profile {profile!r} fallback #{index} has unsupported field {key_text!r}",
+                    code="unknown_fallback_field",
+                    profile=profile,
+                    field=f"fallbacks[{index}].{key_text}",
+                )
+        for key in ("provider", "model", "profile"):
+            if key in entry:
+                entry[key] = _plain_identifier(
+                    entry.get(key),
+                    profile=profile,
+                    field=f"fallbacks[{index}].{key}",
+                )
         if "allowed_toolsets" in entry:
             entry["allowed_toolsets"] = _validate_toolsets(
                 entry.get("allowed_toolsets"),
@@ -445,6 +530,14 @@ def _detect_fallback_loop(
     valid_profiles: Sequence[str],
     stack: List[str],
 ) -> None:
+    if len(stack) >= _MAX_PROFILE_CHAIN_DEPTH:
+        raise CapabilityProfileConfigError(
+            f"Capability profile fallback chain exceeds {_MAX_PROFILE_CHAIN_DEPTH} profiles",
+            code="fallback_depth",
+            profile=origin,
+            valid_profiles=valid_profiles,
+            field="fallbacks",
+        )
     if name in stack:
         raise CapabilityProfileConfigError(
             f"Capability profile fallback loop detected: {' -> '.join(stack + [name])}",
@@ -512,6 +605,27 @@ def _plain_identifier(value: Any, *, profile: str, field: str) -> str:
     if not isinstance(value, str):
         raise CapabilityProfileConfigError(
             f"Capability profile {profile!r} field {field} must be a plain identifier string",
+            code="invalid_identifier",
+            profile=profile,
+            field=field,
+        )
+    if _contains_env_interpolation(value):
+        raise CapabilityProfileConfigError(
+            f"Capability profile {profile!r} field {field} must not contain environment interpolation",
+            code="env_interpolation",
+            profile=profile,
+            field=field,
+        )
+    if _URL_SCHEME.match(value):
+        raise CapabilityProfileConfigError(
+            f"Capability profile {profile!r} field {field} must be a provider/model identifier, not a URL",
+            code="invalid_identifier",
+            profile=profile,
+            field=field,
+        )
+    if _INVALID_IDENTIFIER_CHARS.search(value):
+        raise CapabilityProfileConfigError(
+            f"Capability profile {profile!r} field {field} must be a plain identifier",
             code="invalid_identifier",
             profile=profile,
             field=field,
@@ -613,6 +727,7 @@ def resolve_capability_profile(
 
     spec = _profile_spec(name, config_profiles, valid_profiles=valid_profiles)
     _validate_no_secret_fields(spec, profile=name)
+    _validate_profile_allowed_keys(spec, profile=name)
 
     if spec.get("enabled", True) is False:
         raise CapabilityProfileConfigError(

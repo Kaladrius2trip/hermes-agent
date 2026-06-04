@@ -1,5 +1,7 @@
 """Tests for capability profile config resolution."""
 
+from typing import Any
+
 import pytest
 
 from tools.capability_profiles import (
@@ -225,6 +227,7 @@ def test_validation_rejects_unknown_extends_profile():
         "extraEnv",
         "envVars",
         "credentialFile",
+        "ａｐｉ＿ｋｅｙ",
     ],
 )
 def test_validation_rejects_secret_like_field_variants_in_fallbacks(field_name):
@@ -250,6 +253,157 @@ def test_validation_rejects_secret_like_field_variants_in_fallbacks(field_name):
     assert excinfo.value.code == "secret_field"
     assert excinfo.value.field is not None
     assert excinfo.value.field.endswith(f"fallbacks[0].{field_name}")
+
+
+@pytest.mark.parametrize(
+    "fallback",
+    [
+        {"provider": "openrouter", "model": "${OPENAI_API_KEY}"},
+        {"provider": "$PROVIDER", "model": "google/gemini-3-flash"},
+        {"provider": "openrouter", "model": "google/gemini-3-flash", "metadata": {"owner": "${SECRET_TOKEN}"}},
+        {"provider": "openrouter", "model": "google/gemini-3-flash", "random_setting": "value"},
+    ],
+)
+def test_validation_rejects_env_interpolation_and_unknown_fallback_fields(fallback):
+    with pytest.raises(CapabilityProfileConfigError) as excinfo:
+        resolve_capability_profile(
+            {
+                "profiles": {
+                    "bad": {
+                        "allowed_toolsets": ["file"],
+                        "fallbacks": [fallback],
+                    },
+                },
+            },
+            profile="bad",
+        )
+
+    assert excinfo.value.code in {"env_interpolation", "unknown_fallback_field"}
+    assert excinfo.value.field is not None
+
+
+def test_validation_rejects_canonical_field_collisions():
+    with pytest.raises(CapabilityProfileConfigError) as excinfo:
+        resolve_capability_profile(
+            {
+                "profiles": {
+                    "bad": {
+                        "allowed_toolsets": ["file"],
+                        "workspace_policy": {"kind": "scratch", "Kind": "worktree"},
+                    },
+                },
+            },
+            profile="bad",
+        )
+
+    assert excinfo.value.code == "field_collision"
+    assert excinfo.value.field == "profile.workspace_policy.Kind"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("responsibility", "Use ${SECRET_TOKEN} for auth"),
+        ("responsibility", "Use ${SECRET_TOKEN:-fallback} for auth"),
+        ("responsibility", "Use ${SECRET_TOKEN/foo/bar} for auth"),
+        ("responsibility", "Use ＄｛SECRET_TOKEN｝ for auth"),
+        ("responsibility", "Use $(printenv SECRET_TOKEN) for auth"),
+        ("responsibility", "Use `printenv SECRET_TOKEN` for auth"),
+        ("handoff_schema", {"summary": "$PRIVATE_CONTEXT"}),
+        ("verification_policy", {"commands": ["echo %USERPROFILE%"]}),
+    ],
+)
+def test_validation_rejects_env_interpolation_in_string_leaves(field, value):
+    with pytest.raises(CapabilityProfileConfigError) as excinfo:
+        resolve_capability_profile(
+            {
+                "profiles": {
+                    "bad": {
+                        "allowed_toolsets": ["file"],
+                        field: value,
+                    },
+                },
+            },
+            profile="bad",
+        )
+
+    assert excinfo.value.code == "env_interpolation"
+    assert excinfo.value.field is not None
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "https://api.example.invalid/v1",
+        "//api.example.invalid/v1",
+        "bad model",
+        "bad\nmodel",
+    ],
+)
+@pytest.mark.parametrize("field", ["provider", "model"])
+def test_validation_rejects_non_plain_provider_and_model_identifiers(field, value):
+    with pytest.raises(CapabilityProfileConfigError) as excinfo:
+        resolve_capability_profile(
+            {
+                "profiles": {
+                    "bad": {
+                        "allowed_toolsets": ["file"],
+                        field: value,
+                    },
+                },
+            },
+            profile="bad",
+        )
+
+    assert excinfo.value.code == "invalid_identifier"
+    assert excinfo.value.field == field
+
+
+@pytest.mark.parametrize("field", ["endpoint", "Provider"])
+def test_validation_rejects_unknown_top_level_profile_fields(field):
+    with pytest.raises(CapabilityProfileConfigError) as excinfo:
+        resolve_capability_profile(
+            {
+                "profiles": {
+                    "bad": {
+                        "allowed_toolsets": ["file"],
+                        field: "operator typo",
+                    },
+                },
+            },
+            profile="bad",
+        )
+
+    assert excinfo.value.code == "unknown_profile_field"
+    assert excinfo.value.field == f"profile.{field}"
+
+
+def test_validation_allows_profile_specific_handoff_schema_keys():
+    resolved = resolve_capability_profile(
+        {
+            "profiles": {
+                "custom": {
+                    "allowed_toolsets": ["file"],
+                    "handoff_schema": {"custom_summary": "string"},
+                },
+            },
+        },
+        profile="custom",
+    )
+
+    assert resolved["handoff_schema"]["custom_summary"] == "string"
+
+
+def test_validation_rejects_overly_deep_extends_chains_before_recursion_error():
+    profiles: dict[str, dict[str, Any]] = {"p0": {"allowed_toolsets": ["file"]}}
+    for index in range(1, 35):
+        profiles[f"p{index}"] = {"extends": f"p{index - 1}"}
+
+    with pytest.raises(CapabilityProfileConfigError) as excinfo:
+        resolve_capability_profile({"profiles": profiles}, profile="p34")
+
+    assert excinfo.value.code == "extends_depth"
+    assert excinfo.value.field == "extends"
 
 
 def test_fallback_toolsets_cannot_exceed_final_parent_requested_scope():
