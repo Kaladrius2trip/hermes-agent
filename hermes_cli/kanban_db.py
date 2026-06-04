@@ -6610,6 +6610,82 @@ def _worker_terminal_timeout_env(
     return str(desired)
 
 
+def _task_team_meta(task: Task) -> dict[str, Any]:
+    """Extract embedded team metadata from a task body, fail-closed to empty."""
+    try:
+        from hermes_cli.team import TEAM_META_MARKER, parse_team_meta
+        meta = parse_team_meta(task.body)
+    except Exception as exc:
+        raise RuntimeError(f"invalid team metadata for task {task.id}: {exc}") from exc
+    if isinstance(meta, dict):
+        return dict(meta)
+    if task.body and f"<!-- {TEAM_META_MARKER}" in task.body:
+        raise RuntimeError(f"invalid team metadata for task {task.id}")
+    return {}
+
+
+def _resolve_task_capability_profile(task: Task) -> Optional[dict[str, Any]]:
+    """Resolve a Team/Kanban task's capability_profile for worker spawning.
+
+    The profile name is carried only in embedded team metadata. The resolver
+    returns a sanitized local contract; the dispatcher must not copy arbitrary
+    profile config into env/argv or widen toolsets beyond the task metadata.
+    """
+    meta = _task_team_meta(task)
+    raw_name = meta.get("capability_profile")
+    name = str(raw_name).strip() if raw_name is not None else ""
+    if not name:
+        return None
+
+    raw_toolsets = meta.get("toolsets")
+    if not isinstance(raw_toolsets, list):
+        raise RuntimeError(
+            f"capability_profile {name!r} on task {task.id} requires explicit non-empty team toolsets"
+        )
+    requested_toolsets = [
+        str(value).strip()
+        for value in raw_toolsets
+        if str(value).strip()
+    ]
+    if not requested_toolsets:
+        raise RuntimeError(
+            f"capability_profile {name!r} on task {task.id} requires explicit non-empty team toolsets"
+        )
+
+    try:
+        from hermes_cli import config as hermes_config
+        from tools.capability_profiles import (
+            render_capability_profile_prompt,
+            resolve_capability_profile,
+        )
+        full_config = hermes_config.load_config() or {}
+        resolved = resolve_capability_profile(
+            full_config,
+            name,
+            delegation_config=full_config.get("delegation") or {},
+            requested_toolsets=requested_toolsets,
+        )
+        prompt = render_capability_profile_prompt(resolved)
+    except Exception as exc:
+        raise RuntimeError(
+            f"capability_profile {name!r} rejected for task {task.id}: {exc}"
+        ) from exc
+
+    effective_toolsets = resolved.get("toolsets")
+    if not isinstance(effective_toolsets, list) or not effective_toolsets:
+        raise RuntimeError(
+            f"capability_profile {name!r} resolved no effective toolsets for task {task.id}"
+        )
+    requested_set = set(requested_toolsets)
+    widened = [str(value) for value in effective_toolsets if str(value) not in requested_set]
+    if widened:
+        raise RuntimeError(
+            f"capability_profile {name!r} widened toolsets for task {task.id}: {widened}"
+        )
+
+    return {"name": name, "resolved": resolved, "prompt": prompt}
+
+
 def _default_spawn(
     task: Task,
     workspace: str,
@@ -6637,6 +6713,9 @@ def _default_spawn(
     profile_arg = normalize_profile_name(task.assignee)
 
     prompt = f"work kanban task {task.id}"
+    capability = _resolve_task_capability_profile(task)
+    if capability and capability.get("prompt"):
+        prompt = f"{prompt}\n\n{capability['prompt']}"
     env = dict(os.environ)
 
     # Inject HERMES_HOME so the worker reads the profile-scoped config.yaml
@@ -6659,6 +6738,8 @@ def _default_spawn(
         pass
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
+    if capability:
+        env["HERMES_CAPABILITY_PROFILE"] = capability["name"]
     env["HERMES_KANBAN_TASK"] = task.id
     env["HERMES_KANBAN_WORKSPACE"] = workspace
     if task.branch_name:
@@ -6741,6 +6822,35 @@ def _default_spawn(
         for sk in task.skills:
             if sk and sk != "kanban-worker":
                 cmd.extend(["--skills", sk])
+    if capability:
+        resolved = capability["resolved"]
+        provider = str(resolved.get("provider") or "").strip()
+        model = str(resolved.get("model") or "").strip()
+        toolsets = resolved.get("toolsets")
+        budget = resolved.get("budget") or {}
+        if not isinstance(budget, dict):
+            raise RuntimeError(
+                f"capability_profile {capability['name']!r} has invalid budget"
+            )
+        max_iterations = budget.get("max_iterations")
+        if provider and not task.model_override:
+            cmd.extend(["--provider", provider])
+        if model and not task.model_override:
+            cmd.extend(["-m", model])
+        if isinstance(toolsets, list) and toolsets:
+            cmd.extend(["--toolsets", ",".join(str(t) for t in toolsets)])
+        if max_iterations not in (None, ""):
+            try:
+                turns = int(max_iterations)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"capability_profile {capability['name']!r} has invalid max_iterations"
+                ) from exc
+            if turns <= 0:
+                raise RuntimeError(
+                    f"capability_profile {capability['name']!r} has invalid max_iterations"
+                )
+            cmd.extend(["--max-turns", str(turns)])
     if task.model_override:
         cmd.extend(["-m", task.model_override])
     cmd.extend([

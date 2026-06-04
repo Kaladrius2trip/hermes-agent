@@ -146,6 +146,59 @@ def test_generated_bodies_carry_handoff_contract_and_meta():
     assert meta["team"] == "coding"
 
 
+def test_team_templates_assign_capability_profiles_into_metadata():
+    cfg = team.load_teams_config({
+        "teams": {
+            "templates": {
+                "profiled": {
+                    "description": "profile bridge smoke",
+                    "lead": {
+                        "name": "lead",
+                        "category": "coordination",
+                        "toolsets": ["file"],
+                        "readonly": True,
+                        "workspace": "scratch",
+                        "capability_profile": "quick",
+                    },
+                    "members": [
+                        {
+                            "name": "builder",
+                            "category": "implementation",
+                            "toolsets": ["terminal", "file"],
+                            "readonly": False,
+                            "workspace": "worktree",
+                            "capability_profile": "deep",
+                        },
+                    ],
+                    "review": {
+                        "name": "reviewer",
+                        "category": "review",
+                        "toolsets": ["file"],
+                        "readonly": True,
+                        "workspace": "scratch",
+                        "capability_profile": "review",
+                    },
+                }
+            }
+        }
+    })
+    plan = team.build_team_plan("bridge profiles", "profiled", cfg)
+    builder = next(n for n in plan.nodes if n.name == "builder")
+
+    assert builder.capability_profile == "deep"
+    assert team.plan_to_dict(plan)["nodes"][1]["capability_profile"] == "deep"
+
+    meta = team.parse_team_meta(builder.body)
+    assert meta is not None
+    assert meta["capability_profile"] == "deep"
+    assert meta["category"] == "implementation"
+    assert meta["readonly"] is False
+    assert meta["workspace_policy"] == {
+        "kind": "worktree", "readonly": False, "mutate": True,
+    }
+    assert "**Capability profile:** deep" in builder.body
+
+
 def test_approval_guard_metadata_present_in_every_body():
     cfg = team.load_teams_config({})
     plan = team.build_team_plan("ship feature", "coding", cfg)
@@ -277,6 +330,53 @@ def test_team_status_summarizes_counts_and_gates(kanban_home):
     assert set(t["approval_guards"]) == {
         "push", "merge", "publish", "send_message"
     }
+
+
+def test_team_status_reports_profile_category_and_role(kanban_home):
+    cfg = team.load_teams_config({
+        "teams": {
+            "templates": {
+                "profiled": {
+                    "lead": {
+                        "name": "lead",
+                        "category": "coordination",
+                        "toolsets": ["file"],
+                        "readonly": True,
+                        "workspace": "scratch",
+                        "capability_profile": "quick",
+                    },
+                    "members": [
+                        {
+                            "name": "builder",
+                            "category": "implementation",
+                            "toolsets": ["terminal", "file"],
+                            "readonly": False,
+                            "workspace": "worktree",
+                            "capability_profile": "deep",
+                        },
+                    ],
+                    "review": {
+                        "name": "reviewer",
+                        "category": "review",
+                        "toolsets": ["file"],
+                        "readonly": True,
+                        "workspace": "scratch",
+                        "capability_profile": "review",
+                    },
+                }
+            }
+        }
+    })
+    plan = team.build_team_plan("status bridge", "profiled", cfg)
+    with kb.connect() as conn:
+        team.materialize_plan(conn, plan, created_by="user")
+        summary = team.team_status(conn, team="profiled")
+
+    tasks = summary["teams"]["profiled"]["tasks"]
+    builder = next(t for t in tasks if t["role"] == "member")
+    assert builder["capability_profile"] == "deep"
+    assert builder["category"] == "implementation"
+    assert builder["role"] == "member"
 
 
 def test_effective_max_parallel_takes_tightest_cap():

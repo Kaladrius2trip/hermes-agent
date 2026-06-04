@@ -2473,6 +2473,249 @@ class TestSharedBoardPaths:
         assert env["HERMES_KANBAN_TASK"] == "t_dispatch_env"
         assert env["HERMES_KANBAN_BRANCH"] == "wt/t_dispatch_env"
 
+    def test_dispatcher_spawn_applies_team_capability_profile(
+        self, tmp_path, monkeypatch
+    ):
+        from hermes_cli import config as hermes_config
+        from hermes_cli import team
+
+        default_home = tmp_path / ".hermes"
+        default_home.mkdir()
+        self._set_home(monkeypatch, tmp_path, default_home)
+
+        monkeypatch.setattr(hermes_config, "load_config", lambda: {
+            "capabilities": {
+                "profiles": {
+                    "team-impl": {
+                        "responsibility": "Implement scoped team card with evidence.",
+                        "prompt_sections": {"recipe": "focused-executor"},
+                        "allowed_toolsets": ["terminal", "file"],
+                        "provider": "openrouter",
+                        "model": "anthropic/claude-sonnet-4",
+                        "budget": {"max_iterations": 12},
+                        "approval_gates": ["push", "merge", "publish", "send_message"],
+                    }
+                }
+            },
+            "delegation": {},
+        })
+
+        captured = {}
+
+        class _FakePopen:
+            def __init__(self, cmd, **kwargs):
+                captured["cmd"] = cmd
+                captured["env"] = kwargs.get("env", {})
+                self.pid = 4343
+
+        monkeypatch.setattr("subprocess.Popen", _FakePopen)
+
+        body = team.embed_team_meta("body", {
+            "version": team.TEAM_META_VERSION,
+            "team": "profiled",
+            "role": "member",
+            "category": "implementation",
+            "toolsets": ["terminal", "file"],
+            "capability_profile": "team-impl",
+            "approval_required": ["push", "merge", "publish", "send_message"],
+        })
+        task = kb.Task(
+            id="t_capability_profile",
+            title="x",
+            body=body,
+            assignee="coder",
+            status="ready",
+            priority=0,
+            created_by=None,
+            created_at=0,
+            started_at=None,
+            completed_at=None,
+            workspace_kind="worktree",
+            workspace_path=str(tmp_path / "ws"),
+            claim_lock=None,
+            claim_expires=None,
+            tenant="team:profiled",
+        )
+
+        kb._default_spawn(task, str(tmp_path / "ws"))
+
+        cmd = captured["cmd"]
+        assert captured["env"]["HERMES_CAPABILITY_PROFILE"] == "team-impl"
+        assert cmd[cmd.index("--provider") + 1] == "openrouter"
+        assert cmd[cmd.index("-m") + 1] == "anthropic/claude-sonnet-4"
+        assert cmd[cmd.index("--toolsets") + 1] == "terminal,file"
+        assert cmd[cmd.index("--max-turns") + 1] == "12"
+        prompt = cmd[cmd.index("-q") + 1]
+        assert "Capability Profile: team-impl" in prompt
+        assert "Implement scoped team card with evidence." in prompt
+        assert "push, merge, publish, send_message" in prompt
+
+    def test_dispatcher_rejects_profile_without_explicit_team_toolsets(
+        self, tmp_path, monkeypatch
+    ):
+        from hermes_cli import team
+
+        default_home = tmp_path / ".hermes"
+        default_home.mkdir()
+        self._set_home(monkeypatch, tmp_path, default_home)
+
+        body = team.embed_team_meta("body", {
+            "version": team.TEAM_META_VERSION,
+            "team": "profiled",
+            "role": "member",
+            "category": "implementation",
+            "capability_profile": "team-impl",
+        })
+        task = kb.Task(
+            id="t_profile_missing_toolsets",
+            title="x",
+            body=body,
+            assignee="coder",
+            status="ready",
+            priority=0,
+            created_by=None,
+            created_at=0,
+            started_at=None,
+            completed_at=None,
+            workspace_kind="worktree",
+            workspace_path=str(tmp_path / "ws"),
+            claim_lock=None,
+            claim_expires=None,
+            tenant=None,
+        )
+
+        with pytest.raises(RuntimeError, match="requires explicit non-empty team toolsets"):
+            kb._default_spawn(task, str(tmp_path / "ws"))
+
+    def test_dispatcher_rejects_profile_with_empty_effective_toolsets(
+        self, tmp_path, monkeypatch
+    ):
+        from hermes_cli import config as hermes_config
+        from hermes_cli import team
+
+        default_home = tmp_path / ".hermes"
+        default_home.mkdir()
+        self._set_home(monkeypatch, tmp_path, default_home)
+        monkeypatch.setattr(hermes_config, "load_config", lambda: {
+            "capabilities": {
+                "profiles": {
+                    "team-impl": {
+                        "allowed_toolsets": ["terminal"],
+                        "responsibility": "narrow only",
+                    }
+                }
+            },
+            "delegation": {},
+        })
+
+        body = team.embed_team_meta("body", {
+            "version": team.TEAM_META_VERSION,
+            "team": "profiled",
+            "role": "member",
+            "category": "implementation",
+            "toolsets": ["file"],
+            "capability_profile": "team-impl",
+        })
+        task = kb.Task(
+            id="t_profile_no_tools",
+            title="x",
+            body=body,
+            assignee="coder",
+            status="ready",
+            priority=0,
+            created_by=None,
+            created_at=0,
+            started_at=None,
+            completed_at=None,
+            workspace_kind="worktree",
+            workspace_path=str(tmp_path / "ws"),
+            claim_lock=None,
+            claim_expires=None,
+            tenant=None,
+        )
+
+        with pytest.raises(RuntimeError, match="resolved no effective toolsets"):
+            kb._default_spawn(task, str(tmp_path / "ws"))
+
+    def test_dispatcher_rejects_profile_resolver_toolset_widening(
+        self, tmp_path, monkeypatch
+    ):
+        from hermes_cli import config as hermes_config
+        from hermes_cli import team
+        from tools import capability_profiles as cp
+
+        default_home = tmp_path / ".hermes"
+        default_home.mkdir()
+        self._set_home(monkeypatch, tmp_path, default_home)
+        monkeypatch.setattr(hermes_config, "load_config", lambda: {"capabilities": {}})
+        monkeypatch.setattr(cp, "resolve_capability_profile", lambda *a, **k: {
+            "active": True,
+            "profile": "team-impl",
+            "toolsets": ["terminal", "browser"],
+            "budget": {},
+            "prompt_sections": {},
+            "responsibility": "",
+        })
+        monkeypatch.setattr(cp, "render_capability_profile_prompt", lambda _resolved: "")
+
+        body = team.embed_team_meta("body", {
+            "version": team.TEAM_META_VERSION,
+            "team": "profiled",
+            "role": "member",
+            "category": "implementation",
+            "toolsets": ["terminal"],
+            "capability_profile": "team-impl",
+        })
+        task = kb.Task(
+            id="t_profile_widened_tools",
+            title="x",
+            body=body,
+            assignee="coder",
+            status="ready",
+            priority=0,
+            created_by=None,
+            created_at=0,
+            started_at=None,
+            completed_at=None,
+            workspace_kind="worktree",
+            workspace_path=str(tmp_path / "ws"),
+            claim_lock=None,
+            claim_expires=None,
+            tenant=None,
+        )
+
+        with pytest.raises(RuntimeError, match="widened toolsets"):
+            kb._default_spawn(task, str(tmp_path / "ws"))
+
+    def test_dispatcher_rejects_corrupt_team_metadata(
+        self, tmp_path, monkeypatch
+    ):
+        from hermes_cli import team
+
+        default_home = tmp_path / ".hermes"
+        default_home.mkdir()
+        self._set_home(monkeypatch, tmp_path, default_home)
+        task = kb.Task(
+            id="t_profile_bad_meta",
+            title="x",
+            body=f"body\n<!-- {team.TEAM_META_MARKER}\nnot-json\n-->",
+            assignee="coder",
+            status="ready",
+            priority=0,
+            created_by=None,
+            created_at=0,
+            started_at=None,
+            completed_at=None,
+            workspace_kind="worktree",
+            workspace_path=str(tmp_path / "ws"),
+            claim_lock=None,
+            claim_expires=None,
+            tenant=None,
+        )
+
+        with pytest.raises(RuntimeError, match="invalid team metadata"):
+            kb._default_spawn(task, str(tmp_path / "ws"))
+
 
 # ---------------------------------------------------------------------------
 # latest_summary / latest_summaries — surface task_runs.summary handoffs
