@@ -38,6 +38,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import re
 import sqlite3
 import time
 from dataclasses import asdict
@@ -45,11 +47,20 @@ from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect, status as http_status
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
+from hermes_cli import config as hermes_config
 from hermes_cli import kanban_db
 from hermes_cli import kanban_diagnostics as kd
+from hermes_cli.team import TEAM_META_VERSION, embed_team_meta
+from tools.capability_profiles import (
+    CapabilityProfileConfigError,
+    SAFE_APPROVAL_GATES,
+    list_builtin_capability_profiles,
+    render_capability_profile_prompt,
+    resolve_capability_profile,
+)
 
 log = logging.getLogger(__name__)
 
@@ -372,6 +383,395 @@ def _links_for(conn: sqlite3.Connection, task_id: str) -> dict[str, list[str]]:
 
 
 # ---------------------------------------------------------------------------
+# Capability Profile inspector bridge (P13.7B)
+# ---------------------------------------------------------------------------
+
+_SECRETISH_RESPONSE_KEYS = {
+    "api_key", "apikey", "api-key", "authorization", "auth", "headers",
+    "password", "passwd", "secret", "secrets", "token", "tokens",
+    "credential", "credentials", "env", "environment", "extra_env",
+    "bearer", "client_secret", "private_key", "refresh_token", "access_token",
+}
+_SECRETISH_VALUE_PATTERNS = (
+    re.compile(r"\bsk-[A-Za-z0-9._-]{4,}"),
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{4,}"),
+    re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{6,}"),
+    re.compile(r"(?i)\b(api[_-]?key|token|password|secret)\b\s*[:=]\s*[^\s,;]+"),
+)
+_CAPABILITY_RESPONSE_KEYS = (
+    "active", "profile", "category", "responsibility", "prompt_sections",
+    "provider", "model", "budget", "allowed_toolsets", "toolsets",
+    "workspace_policy", "verification_policy", "handoff_schema",
+    "approval_gates", "fallback_metadata",
+)
+
+
+class CapabilityPreviewBody(BaseModel):
+    profile: Optional[str] = None
+    category: Optional[str] = None
+    role: str = "leaf"
+    parent_toolsets: Optional[list[str]] = None
+    requested_toolsets: Optional[list[str]] = None
+    goal: Optional[str] = None
+    context: Optional[str] = None
+
+
+class ApprovalDecisionBody(BaseModel):
+    decision: str = "deny"
+    reason: Optional[str] = None
+
+
+class TaskPreviewBody(BaseModel):
+    title: str
+    body: Optional[str] = None
+    assignee: Optional[str] = None
+    tenant: Optional[str] = None
+    priority: int = 0
+    workspace_kind: str = "scratch"
+    workspace_path: Optional[str] = None
+    parents: list[str] = Field(default_factory=list)
+    triage: bool = False
+    max_runtime_seconds: Optional[int] = None
+    skills: Optional[list[str]] = None
+    goal_mode: bool = False
+    goal_max_turns: Optional[int] = None
+    capability_profile: Optional[str] = None
+    toolsets: Optional[list[str]] = None
+    capability_role: Optional[str] = None
+    capability_name: Optional[str] = None
+    capability_category: Optional[str] = None
+    approval_required: Optional[list[str]] = None
+
+
+def _boolish(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _runtime_config() -> dict[str, Any]:
+    loader = getattr(hermes_config, "load_config_readonly", hermes_config.load_config)
+    cfg = loader() or {}
+    return dict(cfg) if isinstance(cfg, dict) else {}
+
+
+def _require_capability_inspector_enabled() -> dict[str, Any]:
+    cfg = _runtime_config()
+    webui = cfg.get("webui") if isinstance(cfg.get("webui"), dict) else {}
+    if not _boolish(webui.get("capability_inspector_enabled", False)):
+        raise HTTPException(status_code=404, detail="Not Found")
+    return cfg
+
+
+def _payload_capability_profile(payload: Any) -> str:
+    return str(getattr(payload, "capability_profile", None) or "").strip()
+
+
+def _runtime_config_for_capability_task(payload: Any) -> dict[str, Any]:
+    if _payload_capability_profile(payload):
+        return _require_capability_inspector_enabled()
+    return _runtime_config()
+
+
+def _capability_config(cfg: dict[str, Any]) -> dict[str, Any]:
+    capabilities = cfg.get("capabilities") if isinstance(cfg.get("capabilities"), dict) else {}
+    out = dict(capabilities)
+    profiles: dict[str, Any] = {}
+    legacy = cfg.get("capability_profiles")
+    if isinstance(legacy, dict):
+        profiles.update(legacy)
+    nested_profiles = capabilities.get("profiles")
+    if isinstance(nested_profiles, dict):
+        profiles.update(nested_profiles)
+    out["profiles"] = profiles
+    return out
+
+
+def _capability_profile_names(cfg: dict[str, Any]) -> list[str]:
+    caps = _capability_config(cfg)
+    profiles = caps.get("profiles") if isinstance(caps.get("profiles"), dict) else {}
+    return sorted(set(list_builtin_capability_profiles()) | set(profiles))
+
+
+def _redact_for_capability_api(value: Any, *, key: str = "") -> Any:
+    norm_key = key.strip().lower().replace("-", "_")
+    if norm_key in _SECRETISH_RESPONSE_KEYS or norm_key.endswith("_env"):
+        return "[REDACTED]"
+    if isinstance(value, dict):
+        return {
+            str(k): _redact_for_capability_api(v, key=str(k))
+            for k, v in value.items()
+            if str(k) != "fallbacks"
+        }
+    if isinstance(value, list):
+        return [_redact_for_capability_api(v, key=key) for v in value]
+    if isinstance(value, str):
+        text = value
+        for pattern in _SECRETISH_VALUE_PATTERNS:
+            text = pattern.sub("[REDACTED]", text)
+        return text
+    return value
+
+
+def _capability_error_payload(
+    exc: CapabilityProfileConfigError,
+    *,
+    cfg: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    valid_profiles = exc.valid_profiles or (_capability_profile_names(cfg or {}) if cfg else [])
+    return {
+        "error": {
+            "code": exc.code,
+            "field": exc.field or "profile",
+            "profile": exc.profile or "",
+            "valid_profiles": list(valid_profiles),
+            "message": _redact_for_capability_api(str(exc)),
+        }
+    }
+
+
+def _capability_error_response(
+    exc: CapabilityProfileConfigError,
+    *,
+    cfg: Optional[dict[str, Any]] = None,
+) -> JSONResponse:
+    status_code = 404 if exc.code in {"unknown_profile", "disabled_profile"} else 422
+    return JSONResponse(status_code=status_code, content=_capability_error_payload(exc, cfg=cfg))
+
+
+def _capability_payload(
+    resolved: dict[str, Any],
+    *,
+    goal: Optional[str] = None,
+    context: Optional[str] = None,
+) -> dict[str, Any]:
+    payload = {
+        key: resolved.get(key)
+        for key in _CAPABILITY_RESPONSE_KEYS
+        if key in resolved
+    }
+    payload["prompt_preview"] = render_capability_profile_prompt(
+        resolved,
+        goal=goal,
+        context=context,
+    )
+    return _redact_for_capability_api(payload)
+
+
+def _resolve_capability_for_api(
+    cfg: dict[str, Any],
+    *,
+    profile: Optional[str],
+    category: Optional[str] = None,
+    parent_toolsets: Optional[list[str]] = None,
+    requested_toolsets: Optional[list[str]] = None,
+    goal: Optional[str] = None,
+    context: Optional[str] = None,
+) -> dict[str, Any]:
+    resolved = resolve_capability_profile(
+        cfg,
+        profile,
+        delegation_config=cfg.get("delegation") or {},
+        parent_toolsets=parent_toolsets,
+        requested_toolsets=requested_toolsets,
+        category_name=category,
+    )
+    return _capability_payload(resolved, goal=goal, context=context)
+
+
+def _capability_profile_summary(
+    cfg: dict[str, Any],
+    name: str,
+) -> dict[str, Any]:
+    caps = _capability_config(cfg)
+    profiles = caps.get("profiles") if isinstance(caps.get("profiles"), dict) else {}
+    raw = profiles.get(name) if isinstance(profiles.get(name), dict) else {}
+    builtin = name in set(list_builtin_capability_profiles())
+    configured = name in profiles
+    enabled = bool(raw.get("enabled", True)) if configured else True
+    entry: dict[str, Any] = {
+        "name": name,
+        "builtin": builtin,
+        "configured": configured,
+        "enabled": enabled,
+    }
+    if not enabled:
+        entry["error"] = {"code": "disabled_profile", "message": "Capability profile is disabled"}
+        return entry
+    try:
+        resolved = resolve_capability_profile(
+            cfg,
+            name,
+            delegation_config=cfg.get("delegation") or {},
+        )
+        payload = _capability_payload(resolved)
+        for key in (
+            "active", "category", "responsibility", "provider", "model",
+            "allowed_toolsets", "toolsets", "workspace_policy",
+            "verification_policy", "approval_gates", "fallback_metadata",
+        ):
+            entry[key] = payload.get(key)
+    except CapabilityProfileConfigError as exc:
+        entry["error"] = _capability_error_payload(exc, cfg=cfg)["error"]
+    return _redact_for_capability_api(entry)
+
+
+def _validate_approval_required(
+    requested: Optional[list[str]],
+    resolved: dict[str, Any],
+    *,
+    profile: str,
+) -> list[str]:
+    profile_gates = [str(g) for g in (resolved.get("approval_gates") or [])]
+    gates = [str(g).strip() for g in (requested if requested is not None else profile_gates)]
+    gates = [g for g in gates if g]
+    allowed = set(SAFE_APPROVAL_GATES)
+    profile_allowed = set(profile_gates)
+    bad = [g for g in gates if g not in allowed or g not in profile_allowed]
+    if bad:
+        raise CapabilityProfileConfigError(
+            f"Capability profile {profile!r} cannot approve unknown or out-of-scope gates: {bad}",
+            code="unknown_approval_gate",
+            profile=profile,
+            field="approval_required",
+        )
+    return gates
+
+
+def _prepare_capability_task_contract(
+    payload: Any,
+    *,
+    cfg: Optional[dict[str, Any]] = None,
+) -> tuple[str | None, dict[str, Any] | None, dict[str, Any] | None]:
+    profile = _payload_capability_profile(payload)
+    if not profile:
+        return getattr(payload, "body", None), None, None
+
+    cfg = cfg or _runtime_config()
+    requested = getattr(payload, "toolsets", None)
+    resolved = resolve_capability_profile(
+        cfg,
+        profile,
+        delegation_config=cfg.get("delegation") or {},
+        requested_toolsets=list(requested) if requested is not None else None,
+        category_name=getattr(payload, "capability_category", None),
+    )
+    effective_toolsets = [str(t) for t in (resolved.get("toolsets") or []) if str(t)]
+    if not effective_toolsets:
+        raise CapabilityProfileConfigError(
+            f"Capability profile {profile!r} resolved no effective toolsets for this task",
+            code="empty_toolsets",
+            profile=profile,
+            valid_profiles=_capability_profile_names(cfg),
+            field="toolsets",
+        )
+    approval_required = _validate_approval_required(
+        getattr(payload, "approval_required", None),
+        resolved,
+        profile=profile,
+    )
+    workspace = resolved.get("workspace_policy") or {}
+    mutate = bool(workspace.get("mutate", False))
+    meta = {
+        "version": TEAM_META_VERSION,
+        "team": "dashboard-capability",
+        "role": getattr(payload, "capability_role", None) or "dashboard",
+        "name": getattr(payload, "capability_name", None) or getattr(payload, "title", "task"),
+        "category": getattr(payload, "capability_category", None) or resolved.get("category") or "",
+        "capability_profile": profile,
+        "toolsets": effective_toolsets,
+        "readonly": not mutate,
+        "workspace": workspace.get("kind", "scratch"),
+        "workspace_policy": {
+            "kind": workspace.get("kind", "scratch"),
+            "readonly": not mutate,
+            "mutate": mutate,
+        },
+        "approval_required": approval_required,
+    }
+    body = embed_team_meta(getattr(payload, "body", None) or "", meta)
+    return body, _capability_payload(resolved), meta
+
+
+@router.get("/capabilities/profiles")
+def list_capability_profiles():
+    cfg = _require_capability_inspector_enabled()
+    return {
+        "enabled": True,
+        "default_profile": (_capability_config(cfg).get("default_profile") or ""),
+        "valid_profiles": _capability_profile_names(cfg),
+        "profiles": [
+            _capability_profile_summary(cfg, name)
+            for name in _capability_profile_names(cfg)
+        ],
+    }
+
+
+@router.get("/capabilities/profiles/{name}")
+def get_capability_profile(name: str):
+    cfg = _require_capability_inspector_enabled()
+    try:
+        return _resolve_capability_for_api(cfg, profile=name)
+    except CapabilityProfileConfigError as exc:
+        return _capability_error_response(exc, cfg=cfg)
+
+
+@router.post("/capabilities/preview")
+def preview_capability_profile(payload: CapabilityPreviewBody):
+    cfg = _require_capability_inspector_enabled()
+    try:
+        return _resolve_capability_for_api(
+            cfg,
+            profile=payload.profile,
+            category=payload.category,
+            parent_toolsets=payload.parent_toolsets,
+            requested_toolsets=payload.requested_toolsets,
+            goal=payload.goal,
+            context=payload.context,
+        )
+    except CapabilityProfileConfigError as exc:
+        return _capability_error_response(exc, cfg=cfg)
+
+
+@router.get("/capabilities/audit")
+def get_capability_audit(session: Optional[str] = Query(None)):
+    _require_capability_inspector_enabled()
+    return {
+        "session": session,
+        "events": [],
+        "safe_gates": list(SAFE_APPROVAL_GATES),
+        "note": "No persisted capability audit events are available in this bridge yet.",
+    }
+
+
+@router.get("/capabilities/approvals")
+def list_capability_approvals():
+    _require_capability_inspector_enabled()
+    return {
+        "approvals": [],
+        "safe_gates": list(SAFE_APPROVAL_GATES),
+        "default_decision": "deny",
+    }
+
+
+@router.post("/capabilities/approvals/{approval_id}")
+def decide_capability_approval(approval_id: str, payload: ApprovalDecisionBody):
+    _require_capability_inspector_enabled()
+    decision = str(payload.decision or "deny").strip().lower()
+    if decision not in {"approve", "deny"}:
+        decision = "deny"
+    return {
+        "approval_id": approval_id,
+        "decision": "deny",
+        "requested_decision": decision,
+        "status": "denied",
+        "reason": "approval_not_found_or_expired",
+    }
+
+
+# ---------------------------------------------------------------------------
 # GET /board
 # ---------------------------------------------------------------------------
 
@@ -592,17 +992,56 @@ class CreateTaskBody(BaseModel):
     skills: Optional[list[str]] = None
     goal_mode: bool = False
     goal_max_turns: Optional[int] = None
+    capability_profile: Optional[str] = None
+    toolsets: Optional[list[str]] = None
+    capability_role: Optional[str] = None
+    capability_name: Optional[str] = None
+    capability_category: Optional[str] = None
+    approval_required: Optional[list[str]] = None
+
+
+@router.post("/tasks/preview")
+def preview_task(payload: TaskPreviewBody):
+    try:
+        cfg = _runtime_config_for_capability_task(payload)
+        task_body, capability, meta = _prepare_capability_task_contract(payload, cfg=cfg)
+    except CapabilityProfileConfigError as exc:
+        return _capability_error_response(exc, cfg=_runtime_config())
+    return {
+        "task": {
+            "will_create": False,
+            "title": payload.title,
+            "body": task_body,
+            "assignee": payload.assignee,
+            "tenant": payload.tenant,
+            "priority": payload.priority,
+            "workspace_kind": payload.workspace_kind,
+            "workspace_path": payload.workspace_path,
+            "parents": payload.parents,
+            "status_preview": "triage" if payload.triage else ("todo" if payload.parents else "ready"),
+            "skills": payload.skills,
+            "goal_mode": payload.goal_mode,
+            "goal_max_turns": payload.goal_max_turns,
+            "capability_meta": meta,
+        },
+        "capability": capability,
+    }
 
 
 @router.post("/tasks")
 def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
+    cfg = _runtime_config_for_capability_task(payload)
+    try:
+        task_body, capability, _meta = _prepare_capability_task_contract(payload, cfg=cfg)
+    except CapabilityProfileConfigError as exc:
+        return _capability_error_response(exc, cfg=cfg)
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
         task_id = kanban_db.create_task(
             conn,
             title=payload.title,
-            body=payload.body,
+            body=task_body,
             assignee=payload.assignee,
             created_by="dashboard",
             workspace_kind=payload.workspace_kind,
@@ -619,6 +1058,8 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
         )
         task = kanban_db.get_task(conn, task_id)
         body: dict[str, Any] = {"task": _task_dict(task) if task else None}
+        if capability is not None:
+            body["capability"] = capability
         # Surface a dispatcher-presence warning so the UI can show a
         # banner when a `ready` task would otherwise sit idle because no
         # gateway is running (or dispatch_in_gateway=false). Only emit

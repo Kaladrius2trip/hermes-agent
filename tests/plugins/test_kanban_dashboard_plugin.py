@@ -18,6 +18,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from hermes_cli import kanban_db as kb
+from hermes_cli.team import parse_team_meta
 
 
 # ---------------------------------------------------------------------------
@@ -59,9 +60,233 @@ def client(kanban_home):
     return TestClient(app)
 
 
+def _write_capability_config(home: Path, *, enabled: bool = True) -> None:
+    """Write a minimal capability-profile config for plugin route tests."""
+    home.joinpath("config.yaml").write_text(
+        f"""
+webui:
+  capability_inspector_enabled: {str(enabled).lower()}
+capabilities:
+  default_profile: review-lite
+  profiles:
+    review-lite:
+      responsibility: Review diffs safely without mutation.
+      allowed_toolsets: [file, search, terminal]
+      workspace_policy:
+        kind: scratch
+        mutate: false
+      verification_policy:
+        require_evidence: true
+        on_unverifiable: report
+      approval_gates: [push, merge]
+      fallbacks:
+        - provider: openrouter
+          model: anthropic/claude-sonnet-4
+    sleepy:
+      enabled: false
+      responsibility: Disabled test profile.
+      allowed_toolsets: [file]
+""".lstrip(),
+        encoding="utf-8",
+    )
+
+
 # ---------------------------------------------------------------------------
-# GET /board on an empty DB
+# Capability Profile bridge (P13.7B)
 # ---------------------------------------------------------------------------
+
+
+def test_capability_routes_are_flag_gated_without_breaking_board(client, kanban_home):
+    r = client.get("/api/plugins/kanban/capabilities/profiles")
+    assert r.status_code == 404
+
+    _write_capability_config(kanban_home, enabled=False)
+
+    preview = client.post(
+        "/api/plugins/kanban/tasks/preview",
+        json={"title": "x", "capability_profile": "review-lite"},
+    )
+    assert preview.status_code == 404
+
+    capability_create = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "x", "capability_profile": "review-lite"},
+    )
+    assert capability_create.status_code == 404
+
+    legacy_create = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "legacy task"},
+    )
+    assert legacy_create.status_code == 200, legacy_create.text
+
+    board = client.get("/api/plugins/kanban/board")
+    assert board.status_code == 200
+    assert "columns" in board.json()
+
+
+def test_capability_profiles_list_is_dynamic_and_redacted(client, kanban_home):
+    _write_capability_config(kanban_home)
+
+    r = client.get("/api/plugins/kanban/capabilities/profiles")
+    assert r.status_code == 200, r.text
+    data = r.json()
+    names = {p["name"] for p in data["profiles"]}
+    assert {"quick", "deep", "review", "visual", "writing", "review-lite", "sleepy"} <= names
+    assert data["default_profile"] == "review-lite"
+
+    review_lite = next(p for p in data["profiles"] if p["name"] == "review-lite")
+    assert review_lite["enabled"] is True
+    assert review_lite["fallback_metadata"]["count"] == 1
+    sleepy = next(p for p in data["profiles"] if p["name"] == "sleepy")
+    assert sleepy["enabled"] is False
+
+    payload = r.text
+    assert '"fallbacks"' not in payload
+    assert "api_key" not in payload.lower()
+    assert "token" not in payload.lower()
+
+
+def test_capability_profile_get_resolves_and_redacts_preview(client, kanban_home):
+    _write_capability_config(kanban_home)
+
+    r = client.get("/api/plugins/kanban/capabilities/profiles/review-lite")
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["active"] is True
+    assert data["profile"] == "review-lite"
+    assert data["allowed_toolsets"] == ["file", "search", "terminal"]
+    assert data["toolsets"] == ["file", "search", "terminal"]
+    assert data["fallback_metadata"]["count"] == 1
+    assert "prompt_preview" in data
+    assert "## Capability Profile: review-lite" in data["prompt_preview"]
+
+    payload = r.text
+    assert '"fallbacks"' not in payload
+    assert "api_key" not in payload.lower()
+    assert "Authorization" not in payload
+
+
+def test_capability_preview_narrows_scope_and_never_echoes_context(client, kanban_home):
+    _write_capability_config(kanban_home)
+    secret_context = "DO-NOT-ECHO-CONTEXT-sentinel"
+
+    r = client.post(
+        "/api/plugins/kanban/capabilities/preview",
+        json={
+            "profile": "review-lite",
+            "role": "leaf",
+            "parent_toolsets": ["file", "search"],
+            "requested_toolsets": ["file", "terminal"],
+            "context": secret_context,
+            "goal": "Review the code",
+        },
+    )
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["active"] is True
+    assert data["toolsets"] == ["file"]
+    assert data["allowed_toolsets"] == ["file", "search", "terminal"]
+    assert secret_context not in r.text
+    assert "Review the code" not in data["prompt_preview"]
+
+
+def test_capability_preview_without_default_returns_legacy_inactive(client, kanban_home):
+    kanban_home.joinpath("config.yaml").write_text(
+        "webui:\n  capability_inspector_enabled: true\ncapabilities:\n  profiles: {}\n",
+        encoding="utf-8",
+    )
+
+    r = client.post("/api/plugins/kanban/capabilities/preview", json={})
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["active"] is False
+    assert data["profile"] == ""
+    assert data["prompt_preview"] == ""
+
+
+def test_capability_errors_map_unknown_and_disabled_to_404(client, kanban_home):
+    _write_capability_config(kanban_home)
+
+    unknown = client.get("/api/plugins/kanban/capabilities/profiles/missing")
+    assert unknown.status_code == 404
+    assert unknown.json()["error"]["code"] == "unknown_profile"
+    assert "review-lite" in unknown.json()["error"]["valid_profiles"]
+
+    disabled = client.get("/api/plugins/kanban/capabilities/profiles/sleepy")
+    assert disabled.status_code == 404
+    assert disabled.json()["error"]["code"] == "disabled_profile"
+
+
+def test_capability_task_preview_does_not_create_and_create_embeds_metadata(client, kanban_home):
+    _write_capability_config(kanban_home)
+
+    preview = client.post(
+        "/api/plugins/kanban/tasks/preview",
+        json={
+            "title": "Review capability bridge",
+            "body": "Inspect backend bridge only.",
+            "assignee": "default",
+            "capability_profile": "review-lite",
+            "toolsets": ["file", "terminal"],
+        },
+    )
+    assert preview.status_code == 200, preview.text
+    pdata = preview.json()
+    assert pdata["task"]["title"] == "Review capability bridge"
+    assert pdata["task"]["will_create"] is False
+    assert pdata["capability"]["toolsets"] == ["file", "terminal"]
+
+    board_before = client.get("/api/plugins/kanban/board").json()
+    assert sum(len(c["tasks"]) for c in board_before["columns"]) == 0
+
+    created = client.post(
+        "/api/plugins/kanban/tasks",
+        json={
+            "title": "Review capability bridge",
+            "body": "Inspect backend bridge only.",
+            "assignee": "default",
+            "capability_profile": "review-lite",
+            "toolsets": ["file", "terminal"],
+        },
+    )
+    assert created.status_code == 200, created.text
+    task_id = created.json()["task"]["id"]
+    detail = client.get(f"/api/plugins/kanban/tasks/{task_id}")
+    meta = parse_team_meta(detail.json()["task"]["body"])
+    assert meta["capability_profile"] == "review-lite"
+    assert meta["toolsets"] == ["file", "terminal"]
+    assert meta["approval_required"] == ["push", "merge"]
+
+
+def test_capability_task_contract_rejects_out_of_scope_approval_gate(client, kanban_home):
+    _write_capability_config(kanban_home)
+
+    r = client.post(
+        "/api/plugins/kanban/tasks/preview",
+        json={
+            "title": "unsafe gate",
+            "capability_profile": "review-lite",
+            "toolsets": ["file"],
+            "approval_required": ["deploy"],
+        },
+    )
+    assert r.status_code == 422
+    assert r.json()["error"]["code"] == "unknown_approval_gate"
+
+
+def test_capability_approval_endpoint_denies_even_explicit_approve(client, kanban_home):
+    _write_capability_config(kanban_home)
+
+    r = client.post(
+        "/api/plugins/kanban/capabilities/approvals/gate-1",
+        json={"decision": "approve", "reason": "test"},
+    )
+    assert r.status_code == 200
+    data = r.json()
+    assert data["requested_decision"] == "approve"
+    assert data["decision"] == "deny"
+    assert data["status"] == "denied"
 
 
 def test_board_empty(client):
