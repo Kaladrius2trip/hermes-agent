@@ -429,8 +429,12 @@ Rules:
 - Unknown, disabled, unsafe, secret-like, or external-prompt-import profile
   config fails before a child spawns.
 
-See [`docs/architecture/capability-profiles.md`](https://github.com/NousResearch/hermes-agent/blob/main/docs/architecture/capability-profiles.md)
-for the full schema, clean-room policy, and rollback plan.
+Capability profile rollout is additive and reversible: existing `delegation:`
+config keeps working unchanged, and profile-backed surfaces stay opt-in. See
+[`docs/architecture/capability-profiles.md`](https://github.com/NousResearch/hermes-agent/blob/main/docs/architecture/capability-profiles.md)
+for the full schema, migration crosswalk, clean-room policy, rollout/rollback
+plan, and the flag-gated [WebUI API contract](https://github.com/NousResearch/hermes-agent/blob/main/docs/architecture/capability-profiles.md#webui-api-contract)
+for plan preview, effective-scope preview, and approval-gate visibility.
 
 ### Troubleshooting category routing
 

@@ -1,10 +1,10 @@
 # Capability Profiles (Phase 13)
 
-> Status: **Implemented incrementally**. The pure resolver, resolver hardening,
-> prompt renderer, `delegate_task` profile routing, Team/Kanban bridge, and
-> built-in profile pack are additive and opt-in. With no profile requested and no
-> profile config present, delegation keeps the legacy category/global/provider
-> behavior.
+> Status: **Implemented incrementally**. The resolver, hardening, prompt renderer,
+> `delegate_task` profile routing, Team/Kanban bridge, built-in profile pack,
+> canary evidence, and WebUI contract/backend bridge are additive and opt-in.
+> WebUI routes remain feature-flag gated. With no profile requested and no profile
+> config present, delegation keeps the legacy category/global/provider behavior.
 
 **Capability profiles** are a single, declarative description of *what a
 delegated agent is allowed to be* — its responsibility, prompt shape, tool
@@ -72,20 +72,24 @@ effects). The implemented runtime shape is:
 
 ```yaml
 capabilities:
-  default_profile: ""        # optional; empty keeps legacy delegation default
-  profiles:
+  default_profile: ""      # optional; empty keeps legacy delegation default
+  profiles:                # canonical; top-level `capability_profiles:` is a
+                           # supported legacy alias, normalized on load
     <profile-name>:
-      responsibility:        # WHAT this profile is for — one binding sentence
-      prompt_sections:       # ordered prompt shape (recipe ref or inline sections)
-      allowed_toolsets:      # tool scope; narrow-only, intersect semantics
-      model:                 # model/provider/budget block
+      extends:             # optional parent profile; parent merges first
+      enabled:             # false ⇒ disabled_profile error before spawn
+      category:            # optional legacy delegation-category reference
+      responsibility:      # WHAT this profile is for — one binding sentence
+      prompt_sections:     # ordered prompt shape (recipe ref or inline sections)
+      allowed_toolsets:    # tool scope; narrow-only, intersect semantics
+      model:               # model/provider/budget block
       provider:
       budget:
-      workspace_policy:      # where it may run + whether it may mutate
-      verification_policy:   # what counts as "done"
-      handoff_schema:        # structured result it must return
-      approval_gates:        # actions requiring explicit human approval
-      fallbacks:             # ordered provider/model candidates on transport error
+      workspace_policy:    # where it may run + whether it may mutate
+      verification_policy: # what counts as "done"
+      handoff_schema:      # structured result it must return
+      approval_gates:      # actions requiring explicit human approval
+      fallbacks:           # ordered provider/model candidates on transport error
 ```
 
 `capability_profiles:` is still accepted as a legacy shorthand for
@@ -97,6 +101,8 @@ capabilities:
 |-------|------|---------|---------|
 | `responsibility` | string | *required* | One binding sentence describing the slice of work this profile owns. Rendered into the child prompt as the scope contract; it is the *only* identity the child gets. No persona name. |
 | `extends` | string | none | Optional parent profile. Parent fields merge first, child overrides. Loops, unknown parents, and chains deeper than 32 profiles fail closed before any child spawn. |
+| `enabled` | bool | `true` | `false` disables the profile and returns `disabled_profile` before any child spawn. |
+| `category` | string | none | Optional legacy delegation-category reference. Category routing may seed provider/model/budget/toolset defaults; profile fields then narrow or override. Unknown or disabled categories fail closed. |
 | `prompt_sections` | recipe-ref \| list | `readonly-advisor` | Either `recipe: <name>` (a built-in from `agent_recipes.py`) or an inline ordered list of `{id, title, body, required}` sections rendered by `render_agent_recipe`. Inline sections may only *add* boundaries, never remove the base scope/role/verification sections. |
 | `allowed_toolsets` | list[str] | `[]` (no tools) | Upper bound on tool scope. Resolved with `toolsets_mode: intersect` only — effective scope is `profile ∩ parent ∩ caller-requested`, order preserved. A profile can only ever **narrow**. |
 | `model` / `provider` | string | inherit parent | Plain identifiers only — never credentials, URLs/schemes, schemeless authorities, whitespace/control chars, or shell interpolation. Empty inherits the parent's resolved model/provider/credential pool. |
@@ -130,31 +136,32 @@ read-only profile contract above.
 ### Worked example
 
 ```yaml
-capability_profiles:
-  review:
-    responsibility: >
-      Read the changed files and report correctness, security, and style
-      defects. Never execute or mutate anything.
-    prompt_sections:
-      recipe: critic-reviewer          # reuse the built-in read-only posture
-    allowed_toolsets: [file, search]   # no terminal — review must not execute
-    # model/provider omitted -> inherit parent
-    budget:
-      reasoning_effort: high
-      max_iterations: 40
-      child_timeout_seconds: 600
-    workspace_policy:
-      kind: scratch
-      mutate: false
-    verification_policy:
-      require_evidence: true
-      on_unverifiable: report
-    handoff_schema:
-      findings: list           # {file, line, severity, claim}
-      blockers: list
-    approval_gates: [push, merge, publish, send_message]
-    fallbacks:
-      - { provider: openrouter, model: "google/gemini-3-flash-preview" }
+capabilities:
+  profiles:
+    review:
+      responsibility: >
+        Read the changed files and report correctness, security, and style
+        defects. Never execute or mutate anything.
+      prompt_sections:
+        recipe: critic-reviewer        # reuse the built-in read-only posture
+      allowed_toolsets: [file, search] # no terminal — review must not execute
+      # model/provider omitted -> inherit parent
+      budget:
+        reasoning_effort: high
+        max_iterations: 40
+        child_timeout_seconds: 600
+      workspace_policy:
+        kind: scratch
+        mutate: false
+      verification_policy:
+        require_evidence: true
+        on_unverifiable: report
+      handoff_schema:
+        findings: list         # {file, line, severity, claim}
+        blockers: list
+      approval_gates: [push, merge, publish, send_message]
+      fallbacks:
+        - { provider: openrouter, model: "google/gemini-3-flash-preview" }
 ```
 
 This profile is exactly today's `review` category + `critic-reviewer` recipe +
@@ -162,22 +169,25 @@ team `reviewer` role, expressed once. Resolution order, when a profile is
 requested on `delegate_task`:
 
 1. Explicit per-call override on the call (highest).
-2. The named `capability_profiles.<name>`.
+2. The named `capabilities.profiles.<name>` entry; top-level
+   `capability_profiles.<name>` is accepted only as a legacy alias.
 3. Legacy `delegation.categories.<name>` (if the profile only references it).
 4. Global `delegation.model` / `delegation.provider`.
 5. Parent inheritance (current default, lowest).
 
-If `capability_profiles` is absent and no profile is requested, the engine falls
-through to step 3/4/5 — **exactly today's behavior**. A requested-but-unknown
-profile returns a structured `unknown_profile` error listing valid names
-*before* any child spawns, exactly as `resolve_delegation_category` does today
-for `unknown_category`.
+If `capabilities.profiles` is absent and no profile is requested, the engine
+falls through to step 3/4/5 — **exactly today's behavior**. A
+requested-but-unknown profile returns a structured `unknown_profile` error
+listing valid names *before* any child spawns, exactly as
+`resolve_delegation_category` does today for `unknown_category`.
 
 ## Mapping current concepts into profiles
 
 Profiles are designed so that everything Hermes ships today maps onto exactly
-one profile field, with no information lost. The tables below are the migration
-crosswalk implementers should preserve.
+one profile field, with no information lost. The canonical config key is
+`capabilities.profiles`; the legacy top-level `capability_profiles` map is
+accepted as an alias only so old experiments load safely. The tables below are
+the migration crosswalk implementers should preserve.
 
 ### Agent recipes → `prompt_sections`, `responsibility`, `workspace_policy`
 
@@ -271,7 +281,7 @@ The implemented layer still **does not** add:
 
 ## Backward-compatibility guarantee
 
-| Surface | Default (no `capability_profiles`) | With profiles |
+| Surface | Default (no `capabilities.profiles`) | With profiles |
 |---------|-------------------------------------|---------------|
 | `delegation.model` / `delegation.provider` | Unchanged | Still honored; profiles layer above |
 | `delegation.categories.*` | Unchanged | A profile may reference a category |
@@ -294,11 +304,19 @@ state:
 | 13.1 | Pure resolver for `capabilities.profiles` / legacy `capability_profiles` | absent key ⇒ inactive | resolver tests |
 | 13.2 | `delegate_task(profile=...)` routing + capability prompt rendering | per-call opt-in | delegate/profile tests |
 | 13.3 | Legacy category-mirror built-ins (`quick`, `deep`, `review`, `visual`, `writing`) | built-in only, no default flip | profile snapshot tests |
-| 13.5 | Named built-in profile pack (`implementation`, `review`, `testing`, `research`, `orchestration`, `documentation`, `webui-ux`) | explicit `profile=` or `default_profile` | `tests/tools/test_capability_profiles.py` + `tests/tools/test_agent_recipes.py` |
-| Pre-merge | Full integration confidence | no push/restart without approval | targeted then full pytest where practical |
+| 13.4 | Team templates may reference a profile per node and Kanban workers receive the resolved profile contract | template opt-in | `pytest -k "team or kanban"` |
+| 13.5 | Named built-in profile pack (`implementation`, `review`, `testing`, `research`, `orchestration`, `documentation`, `webui-ux`) | explicit `profile=` or `default_profile` | `tests/tools/test_capability_profiles.py` + built-in snapshot tests |
+| 13.6 | Canary/audit evidence for profile runtime | isolated temp `HERMES_HOME` | canary script/tests |
+| 13.7 | WebUI API contract for task contract, plan preview, gates, and status (docs only) | none | docs lint + contract checklist |
+| 13.7B | WebUI backend bridge exposes profile inspector/preview/status as read-only routes | feature flag | API tests; flag-off returns 404; Kanban routes unaffected |
+| 13.8 | WebUI UX MVP for capability workflow panel | feature flag | UI/static tests and WebUI lint |
+| 13.9 | Operator docs/manual workflow and canary/live playbook | none | docs build + YAML checks |
+| Pre-merge | Full integration confidence | no push/restart without approval | targeted then broad tests where practical |
 
-The runtime remains opt-in. With no `profile=` and no `capabilities.default_profile`,
-`delegate_task` still uses the legacy category/global/provider path.
+The runtime remains opt-in. With no `profile=` and no
+`capabilities.default_profile`, `delegate_task` still uses the legacy
+category/global/provider path. Steps 13.7B and 13.8 are WebUI-touching and
+independently flag-gated.
 
 ## Canary plan
 
@@ -335,56 +353,206 @@ Every step is removable by deleting keys — no migration, no data rewrite.
 |------|-----------------|--------|
 | 13.1 / 13.2 | Delete `capabilities.profiles` / legacy `capability_profiles`; stop passing `profile=` | Resolver inactive; delegation falls back to categories/global/inherit |
 | 13.3 / 13.5 | Stop using built-in `profile=` names or clear `default_profile` | Calls use legacy categories or caller toolsets |
-| Team references | Remove `profile:` from team nodes | Team nodes use inline toolsets/approval as today |
-| WebUI inspector | Disable the WebUI flag | Inspector hidden; backend unaffected |
+| 13.4 | Remove `profile:` from team nodes | Team nodes use inline toolsets/approval as today |
+| 13.7 | Revert the docs-only WebUI contract update | No runtime effect |
+| 13.7B / 13.8 | Disable the WebUI flag | Inspector/workflow hidden; backend routes unavailable; existing Kanban routes unaffected |
 
 Emergency rollback is a single config delete: removing `capabilities.profiles`
-(or legacy `capability_profiles`) and any `default_profile` reverts the engine to
-legacy delegation with no restart of any resolver state required, because
+(or the legacy alias `capability_profiles`) and any `default_profile` reverts the
+engine to legacy delegation with no restart of resolver state required, because
 resolution is pure and per-call. Because profiles never mutate existing config,
 there is nothing to un-migrate.
 
-## WebUI UX contract
+## WebUI API contract
 
-The WebUI surface for profiles remains **read-only and inspectional**.
-Editing profiles is out of scope (operators edit YAML); the UI explains and
-audits, it does not grant.
+The WebUI surface for profiles is **read-only and inspectional by default**.
+Editing profiles is out of scope (operators edit YAML); the UI explains,
+audits, and previews contracts. It uses the existing WebUI Python bridge style
+(`api/kanban_bridge.py`) and the Hermes backend resolver/renderer; it does not
+add a new server, listener, remote channel, or profile editor.
 
-Contract:
+The entire surface is gated by `webui.capability_inspector_enabled` (default
+**false**). With the flag off, every `/api/capabilities/*` route returns `404`
+and the existing `/api/kanban/*` routes continue to behave unchanged.
 
-- **Profile inspector (read-only).** For each configured profile, show:
-  `responsibility`, resolved `allowed_toolsets`, `model`/`provider` (identifiers
-  only — never credentials, which render as `[REDACTED]`), `budget`,
-  `workspace_policy`, `verification_policy`, `handoff_schema` keys,
-  `approval_gates`, and the `fallbacks` provider/model list. No field that could
-  carry a secret is rendered.
-- **Effective-scope preview.** Given a profile and the current parent's
-  toolsets, show the *resolved* `profile ∩ parent ∩ requested` set, so an
-  operator sees the real narrowing before delegating. The preview must label
-  read-only profiles (`mutate: false`, no terminal, write tools denied)
-  explicitly.
-- **Approval-gate visibility.** When a running child requests a gated action,
-  the UI surfaces a clear, blocking approval prompt naming the action and the
-  profile; declining is the default and denial is fail-closed. The UI must never
-  pre-approve or remember an approval across delegations.
-- **Audit view.** A local-only timeline of profile resolutions and fallback
-  advances for the current session, sourced from the local audit log — no remote
-  fetch. Each entry names the profile, resolved provider/model, and effective
-  toolsets.
-- **No editing, no execution, no secrets.** The UI cannot create or mutate a
-  profile, cannot launch a delegation that widens scope, and never displays
-  credential material. Disabling the WebUI flag removes the inspector with zero
-  backend effect.
+### Endpoints
+
+| Method | Path | Purpose | Mutates |
+|--------|------|---------|---------|
+| `GET` | `/api/capabilities/profiles` | List builtin + config profile names with a redacted summary | no |
+| `GET` | `/api/capabilities/profiles/{name}` | Resolved profile spec for the inspector | no |
+| `POST` | `/api/capabilities/preview` | Plan preview + effective-scope for a task contract; **no spawn** | no |
+| `GET` | `/api/capabilities/audit?session={id}` | Local-only resolution/fallback timeline | no |
+| `GET` | `/api/capabilities/approvals` | Pending gated actions and current denial/expiry state | no |
+| `POST` | `/api/capabilities/approvals/{id}` | Decide exactly one pending gated action | yes, decision only |
+
+### Task contract for preview
+
+`POST /api/capabilities/preview` accepts the delegation task contract and returns
+the same resolved spec the engine would use, without spawning a child:
+
+```json
+{
+  "profile": "review",
+  "category": null,
+  "role": "leaf",
+  "parent_toolsets": ["file", "search", "terminal"],
+  "requested_toolsets": ["file"],
+  "context": "used for resolution only; never echoed back"
+}
+```
+
+If `profile` is empty/omitted and no `default_profile` is configured, the
+response is inactive (`active: false`) and the UI labels the call as legacy
+delegation. That mirrors `resolve_capability_profile` exactly.
+
+### Inspector / plan-preview response
+
+`GET /profiles/{name}` and `POST /preview` return a redacted resolved spec:
+
+```json
+{
+  "active": true,
+  "profile": "review",
+  "category": "review",
+  "responsibility": "Read changed files and report defects without mutation.",
+  "prompt_sections": { "recipe": "critic-reviewer" },
+  "provider": "",
+  "model": "",
+  "budget": {
+    "reasoning_effort": "high",
+    "max_iterations": 40,
+    "child_timeout_seconds": 600
+  },
+  "allowed_toolsets": ["file", "search"],
+  "toolsets": ["file"],
+  "workspace_policy": { "kind": "scratch", "mutate": false },
+  "verification_policy": { "require_evidence": true, "on_unverifiable": "report" },
+  "handoff_schema": { "findings": "list", "blockers": "list" },
+  "approval_gates": ["push", "merge", "publish", "send_message"],
+  "fallback_metadata": {
+    "enabled": false,
+    "count": 0,
+    "providers": [],
+    "models": [],
+    "profiles": []
+  },
+  "prompt_preview": "## Capability Profile: review\n..."
+}
+```
+
+- `allowed_toolsets` is the profile upper bound. `toolsets` is the effective
+  `profile ∩ parent ∩ requested` set. The UI must show that narrowing before any
+  delegation starts.
+- Read-only profiles (`workspace_policy.mutate: false`, no `terminal`) must be
+  visibly labeled read-only.
+- `prompt_preview` is produced by `render_capability_profile_prompt(...)`. It is
+  a local capability contract, not a task prompt, and it must never interpolate
+  or echo user `goal`/`context` text.
+- Raw `fallbacks` are not serialized. The API returns only `fallback_metadata`.
+
+### Approval gates
+
+A running child's gated action may surface as a pending approval. The decision
+surface is the only mutating route in this contract, so it is fail-closed:
+
+```json
+{ "decision": "deny" }
+```
+
+Rules:
+
+1. **Default deny.** Missing, malformed, expired, or unknown approval requests are
+   denied.
+2. **Single-shot scope.** A decision applies to exactly one pending action for one
+   delegation. Nothing is remembered across delegations, browser sessions, or
+   profiles.
+3. **No widening.** Approval can only release an action already listed in the
+   resolved profile's `approval_gates`; it cannot add tools, change model/provider,
+   mutate profile config, or widen workspace access.
+4. **Known gates only.** The valid gate ids are `push`, `merge`, `publish`, and
+   `send_message`. Unknown actions are rejected, never approved.
+5. **Authenticated bridge only.** The route inherits the WebUI's existing request
+   authentication/CSRF boundary; direct unauthenticated writes are out of scope.
+
+### Audit / status
+
+`GET /api/capabilities/audit` returns a local-only timeline for the requested
+session: profile name, resolved provider/model identifiers, effective toolsets,
+and fallback advances. It performs no remote fetch and emits no telemetry.
+
+`GET /api/capabilities/approvals` returns pending approval state only: action id,
+profile, task/session id, expiry, and denied/expired reason if already resolved.
+It must not include child scratchpad, full prompt text, credentials, or raw
+fallback config.
+
+### Error contract
+
+Errors mirror `CapabilityProfileConfigError` so the UI renders backend truth:
+
+```json
+{
+  "error": {
+    "code": "unknown_profile",
+    "field": "profile",
+    "profile": "reviewr",
+    "valid_profiles": ["deep", "quick", "review", "visual", "writing"],
+    "message": "Unknown capability profile 'reviewr'"
+  }
+}
+```
+
+`unknown_profile` and `disabled_profile` map to `404`. All other resolver/config
+errors (`secret_field`, `unknown_recipe`, `unknown_toolset`, `toolset_widening`,
+`env_interpolation`, `extends_loop`, `unknown_category`, and similar) map to
+`422`. `valid_profiles` is derived from the resolver at request time, including
+operator-defined profiles; the example list above is illustrative. Flag-off is
+always `404` and is not an error state in the UI.
+
+### Redaction
+
+Redaction is server-side and mandatory:
+
+- Profile config rejects forbidden secret/env fields before serialization. The
+  API serializer still applies defense-in-depth redaction and emits `[REDACTED]`
+  for secret-shaped values.
+- `provider` and `model` are plain identifiers only. Credential material, headers,
+  endpoint URLs, and env references are never returned.
+- No route returns raw fallback entries, raw child prompts, or child scratchpads.
+
+### Rollback
+
+Rollback is flag-off: set `webui.capability_inspector_enabled: false` and every
+`/api/capabilities/*` route returns `404`. Profiles, Kanban tasks, and delegation
+runtime state are untouched.
+
+### Verification checklist for later backend/UI work
+
+- Flag-off: every `/api/capabilities/*` route returns `404`; `/api/kanban/*` is
+  unaffected.
+- Redaction invariant: serialized responses contain no forbidden secret/env field
+  keys and no secret-shaped values.
+- Scope math: preview `toolsets` equals resolver output for representative
+  parent/requested combinations.
+- Error mapping: unknown/disabled profiles and config errors return the status
+  and payload shape above.
+- Approval safety: malformed approval defaults to denial; approvals are
+  single-shot and non-persistent; unknown gate ids are rejected.
+- No egress: preview, inspector, audit, and approval routes make zero network
+  calls.
 
 ## CI / verification plan
 
-Phase 13.0 (this document) ships no code, so only local docs checks apply:
+Phase 13.7 (this contract update) ships no runtime code, so only local docs
+checks apply:
 
 - files exist with the expected headings,
 - no tabs and no trailing whitespace (`git diff --check`),
 - no secret-like strings (provider/model identifiers only; credentials shown as
   `[REDACTED]`),
-- no dependencies installed, no gateway/WebUI restart, no push.
+- no dependencies installed, no gateway/WebUI restart, no push,
+- contract checklist covers endpoints, redaction, flag-off rollback, approval
+  default-deny, and no-egress expectations.
 
 Later steps reuse the targeted-then-full pattern from
 [`agent-capability-layer.md`](./agent-capability-layer.md): targeted
