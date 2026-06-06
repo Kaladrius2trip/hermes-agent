@@ -24,6 +24,20 @@ prompt — and replace it with a Hermes-native, operator-owned profile whose eve
 field is explicit, reviewable, and fail-closed. A profile is data, not a
 personality.
 
+### A profile is a Task Contract
+
+Operationally, a profile is the **Task Contract** for a delegated child: the
+single record that fixes *what the child is allowed to be and what it must hand
+back*, resolved and validated before any child spawns. `responsibility` is the
+scope, `allowed_toolsets` the bounded surface (narrow-only intersect),
+`workspace_policy` the mutate/where rule, `verification_policy` the definition of
+done, `handoff_schema` the required result, and `approval_gates` the fail-closed
+list of outward actions. Binding `profile=` on a `delegate_task` call replaces a
+hand-written posture preamble with this enforced contract. The
+[user guide](../../website/docs/user-guide/features/delegation.md) shows the
+day-to-day call shapes and the dry-run → canary → live workflow; this document is
+the schema and clean-room reference.
+
 ## Clean-room constraint and no-code-copy policy
 
 This work is **clean-room with respect to external code, schemas, prompts, and
@@ -344,6 +358,35 @@ flips:
 
 `default_profile` (the analogue of `default_category`) stays empty throughout
 canary; it is only suggested for general use after the criteria above hold.
+
+## Manual operator playbook
+
+The canary plan above maps onto a concrete, operator-driven sequence using
+existing CLI and Kanban surfaces — no new tooling:
+
+| Step | Action | How |
+|------|--------|-----|
+| Dry-run | Preview the graph and profile bindings, create nothing | `hermes team plan "<goal>" --team coding --dry-run` |
+| Validate | Surface contract errors cheaply (pure resolution, no spawn) | one read-only `delegate_task(..., profile="review")`; bad config fails with `unknown_profile` / `disabled_profile` / `unknown_toolset` / `secret_field` |
+| Canary | Exercise read-only profiles first (`review`, `research`, `mutate: false`) | pass `profile=` per call; keep `default_profile: ""` |
+| Create cards | Materialize the board | `hermes team plan "<goal>" --team coding` (drop `--dry-run`) or `kanban_create` |
+| Monitor | Track counts, blockers, armed gates | `hermes team status [--team coding]`; TUI `/agents` (`/tasks`); `kanban_show` / `kanban_list` |
+| Approval gate | Confirm every gated action denies without approval | a single un-gated `push`/`merge`/`publish`/`send_message` is a hard stop |
+| Rollback | Delete profile keys; clear `default_profile`; remove `profile:` from team nodes | reverts to legacy delegation once that config is loaded; do not restart live gateway without approval |
+
+Live-safety constraints during canary:
+
+- **Do not restart the live gateway/WebUI** to test profiles. Start the canary
+  process with profile config already present, keep the live process untouched,
+  and use the WebUI profile surface as read-only inspect/audit only. A needless
+  live restart risks dropping active sessions and remains a separate release
+  action.
+- **Never reuse the live `DISCORD_BOT_TOKEN`** for a side-by-side canary
+  instance. Token-scoped gateway locks prevent two instances from sharing one
+  bot credential; give any second instance its own token and its own
+  `HERMES_HOME`.
+- **No secrets in profile config** — provider/model identifiers only;
+  credentials stay in the environment and render as `[REDACTED]`.
 
 ## Rollback plan
 

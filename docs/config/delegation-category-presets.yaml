@@ -157,3 +157,94 @@ delegation:
 #       workspace_policy:
 #         kind: scratch
 #         mutate: true
+#
+#     implementation:
+#       responsibility: >
+#         Make a scoped code change and verify it with focused tests; return
+#         changed files, commands run, test results, risks, and blockers.
+#       category: deep
+#       prompt_sections:
+#         recipe: deep-worker
+#       allowed_toolsets: [terminal, file, search]
+#       workspace_policy:
+#         kind: worktree
+#         mutate: true
+#       verification_policy:
+#         require_evidence: true
+#         on_unverifiable: fail
+#       handoff_schema:
+#         changed_files: list
+#         commands_run: list
+#         blockers: list
+#       approval_gates: [push, merge, publish, send_message]
+#
+#     testing:
+#       responsibility: >
+#         Add and run focused tests, isolate the failing case, and report tests
+#         added, commands, failures, and coverage gaps.
+#       category: deep
+#       prompt_sections:
+#         recipe: focused-executor
+#       allowed_toolsets: [terminal, file, search]
+#       workspace_policy:
+#         kind: worktree
+#         mutate: true
+#       verification_policy:
+#         require_evidence: true
+#         on_unverifiable: report
+#       handoff_schema:
+#         changed_files: list
+#         commands_run: list
+#         findings: list
+#         blockers: list
+#       approval_gates: [push, merge, publish, send_message]
+#
+#     research:
+#       responsibility: >
+#         Synthesize an evidence-backed answer from files and the web without
+#         executing or mutating anything; return sources, findings,
+#         recommendation, and confidence.
+#       category: writing
+#       prompt_sections:
+#         recipe: researcher
+#       allowed_toolsets: [file, search, web]
+#       workspace_policy:
+#         kind: scratch
+#         mutate: false
+#       verification_policy:
+#         require_evidence: true
+#         on_unverifiable: report
+#       handoff_schema:
+#         findings: list
+#         blockers: list
+#       approval_gates: [push, merge, publish, send_message]
+#
+# =============================================================================
+# Manual canary -> live profile workflow
+# =============================================================================
+# Roll a new/changed profile out on a low-blast-radius path. Operator-driven;
+# none of these steps flips a default for you.
+#   1. Dry-run:    hermes team plan "<goal>" --team coding --dry-run
+#                  (prints the planned graph + profile bindings; creates nothing)
+#   2. Validate:   one read-only delegate_task(..., profile="review"). Profile
+#                  resolution is pure, so a bad contract fails before any child
+#                  spawns (unknown_profile / disabled_profile / unknown_toolset /
+#                  secret_field), not mid-run.
+#   3. Canary:     keep default_profile "" and exercise read-only profiles first
+#                  (review, research; mutate: false) before write-capable ones.
+#   4. Create:     hermes team plan "<goal>" --team coding   (drop --dry-run)
+#   5. Monitor:    hermes team status [--team coding]; TUI /agents (alias /tasks).
+#   6. Approval:   gated actions (push/merge/publish/send_message) are fail-closed
+#                  -- confirm each denies without explicit approval.
+#   7. Rollback:   delete capabilities.profiles / capability_profiles and clear
+#                  default_profile; remove profile: from team nodes. Reverts to
+#                  legacy delegation with NO gateway restart (resolution is pure).
+#
+# Live-safety warnings:
+#   * Do NOT restart the live gateway/WebUI to pick up profiles -- resolution is
+#     per-call (no restart needed) and the WebUI profile surface is read-only.
+#   * Never reuse the live DISCORD_BOT_TOKEN for a side-by-side canary instance.
+#     Token-scoped gateway locks stop two instances sharing one bot credential;
+#     give a second instance its own token AND its own HERMES_HOME.
+#   * Secrets never live in this file -- provider/model identifiers only;
+#     credentials stay in ~/.hermes/.env and render as [REDACTED].
