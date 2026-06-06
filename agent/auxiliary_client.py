@@ -296,7 +296,12 @@ _PROVIDER_VISION_MODELS: Dict[str, str] = {
 # api.kimi.com/coding (Anthropic Messages wire) which Kimi's own docs
 # describe as having no image_in capability. Vision lives on the separate
 # Kimi Platform (api.moonshot.ai, OpenAI-wire, pay-as-you-go).  See #17076.
+#
+# deepseek: the public DeepSeek chat/reasoner/V4 API currently accepts text
+# only. Do not route image payloads to it in vision auto mode; fall through to
+# a vision-capable aggregator instead (#31179).
 _PROVIDERS_WITHOUT_VISION: frozenset = frozenset({
+    "deepseek",
     "kimi-coding",
     "kimi-coding-cn",
 })
@@ -4028,10 +4033,12 @@ def get_available_vision_backends() -> List[str]:
     # 1. Active provider — if the user configured a provider, try it first.
     main_provider = _read_main_provider()
     if main_provider and main_provider not in {"auto", ""}:
-        if main_provider in _VISION_AUTO_PROVIDER_ORDER:
+        if main_provider in _PROVIDERS_WITHOUT_VISION:
+            pass
+        elif main_provider in _VISION_AUTO_PROVIDER_ORDER:
             if _strict_vision_backend_available(main_provider):
                 available.append(main_provider)
-        else:
+        elif _main_model_supports_vision(main_provider, _read_main_model()):
             client, _ = resolve_provider_client(main_provider, _read_main_model())
             if client is not None:
                 available.append(main_provider)
