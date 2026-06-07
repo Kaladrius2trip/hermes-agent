@@ -1721,6 +1721,23 @@ DEFAULT_CONFIG = {
         },
     },
 
+    # Capability WebUI — read-only inspector bridge is opt-in. Flag-off is
+    # the rollback path: capability routes and capability-bearing task
+    # preview/create requests return 404; legacy Kanban dashboard routes
+    # and non-capability task preview/create stay unchanged.
+    "webui": {
+        "capability_inspector_enabled": False,
+    },
+
+    # Capability profiles — additive, config-backed routing contracts over
+    # delegation categories and agent recipes. Empty by default so legacy
+    # delegation behavior is unchanged unless an operator opts in.
+    # Resolved by tools/capability_profiles.resolve_capability_profile.
+    "capabilities": {
+        "default_profile": "",
+        "profiles": {},
+    },
+
     # Ephemeral prefill messages file — JSON list of {role, content} dicts
     # injected at the start of every API call for few-shot priming.
     # Never saved to sessions, logs, or trajectories.

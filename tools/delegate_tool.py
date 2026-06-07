@@ -36,6 +36,11 @@ from tools.delegation_categories import (
     resolve_delegation_category,
 )
 from tools.agent_recipes import get_builtin_recipe, render_agent_recipe
+from tools.capability_profiles import (
+    CapabilityProfileConfigError,
+    render_capability_profile_prompt,
+    resolve_capability_profile,
+)
 from tools.delegation_audit import build_delegation_run_event, record_audit_event
 
 # Sentinel value used by the runtime provider system for providers that are
@@ -649,6 +654,7 @@ def _build_child_system_prompt(
     child_depth: int = 1,
     agent_recipe: Optional[str] = None,
     recipe_values: Optional[Dict[str, Any]] = None,
+    capability_prompt: Optional[str] = None,
 ) -> str:
     """Build a focused system prompt for a child agent.
 
@@ -683,6 +689,8 @@ def _build_child_system_prompt(
         "Be thorough but concise -- your response is returned to the "
         "parent agent as a summary."
     )
+    if capability_prompt and str(capability_prompt).strip():
+        parts.append("\n" + str(capability_prompt).strip())
     if role == "orchestrator":
         child_note = (
             "Your own children MUST be leaves (cannot delegate further) "
@@ -979,6 +987,8 @@ def _build_child_agent(
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
     agent_recipe: Optional[str] = None,
+    capability_prompt: Optional[str] = None,
+    capability_profile: Optional[Dict[str, Any]] = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -1055,6 +1065,7 @@ def _build_child_agent(
             "model": model or getattr(parent_agent, "model", ""),
             "provider": override_provider or getattr(parent_agent, "provider", ""),
         },
+        capability_prompt=capability_prompt,
     )
     # Extract parent's API key so subagents inherit auth (e.g. Nous Portal).
     parent_api_key = getattr(parent_agent, "api_key", None)
@@ -1158,11 +1169,15 @@ def _build_child_agent(
     except Exception as exc:
         logger.debug("Could not load delegation reasoning_effort: %s", exc)
 
-    # Inherit the parent's fallback provider chain so subagents can recover
-    # from rate-limits and credential exhaustion exactly like the top-level
-    # agent does.  _fallback_chain is a list accepted by AIAgent's
-    # fallback_model parameter (which handles both list and dict forms).
-    parent_fallback = getattr(parent_agent, "_fallback_chain", None) or None
+    # Delegate runtime specs may carry their own provider fallback chain.  Use
+    # the scoped category/profile chain first; otherwise inherit the parent's
+    # chain so legacy subagents still recover like the top-level agent.
+    runtime_fallback = None
+    if capability_profile and capability_profile.get("fallbacks"):
+        runtime_fallback = capability_profile.get("fallbacks")
+    elif delegation_category and delegation_category.get("fallback_chain"):
+        runtime_fallback = delegation_category.get("fallback_chain")
+    parent_fallback = runtime_fallback or getattr(parent_agent, "_fallback_chain", None) or None
 
     # Inherit the parent's OpenRouter provider-preference filters by default
     # (so subagents routed to the same provider honour the same routing
@@ -1248,6 +1263,10 @@ def _build_child_agent(
         recipe_name = str(delegation_category.get("recipe") or agent_recipe or "").strip()
         if recipe_name:
             category_metadata["recipe"] = recipe_name
+        if capability_profile and capability_profile.get("profile"):
+            category_metadata["profile"] = capability_profile.get("profile")
+        elif delegation_category.get("profile"):
+            category_metadata["profile"] = delegation_category.get("profile")
         setattr(
             child,
             "_delegation_category",
@@ -2048,6 +2067,7 @@ def delegate_task(
     context: Optional[str] = None,
     toolsets: Optional[List[str]] = None,
     category: Optional[str] = None,
+    profile: Optional[str] = None,
     tasks: Optional[List[Dict[str, Any]]] = None,
     max_iterations: Optional[int] = None,
     acp_command: Optional[str] = None,
@@ -2103,6 +2123,7 @@ def delegate_task(
 
     # Load config
     cfg = _load_config()
+    full_cfg = _load_full_config()
     default_max_iter = cfg.get("max_iterations", DEFAULT_MAX_ITERATIONS)
     # Model-supplied max_iterations is ignored — the config value is authoritative
     # so users get predictable budgets. The kwarg is retained for internal callers
@@ -2141,6 +2162,7 @@ def delegate_task(
                 "context": context,
                 "toolsets": toolsets,
                 "category": category,
+                "profile": profile,
                 "role": top_role,
             }
         ]
@@ -2167,6 +2189,90 @@ def delegate_task(
     for i, task in enumerate(task_list):
         task_toolsets = task.get("toolsets") if "toolsets" in task else toolsets
         task_category = task.get("category") if "category" in task else category
+        task_profile = task.get("profile") if "profile" in task else profile
+        if not task_profile:
+            category_for_profile = task_category or cfg.get("default_category") or ""
+            category_specs = cfg.get("categories") or {}
+            category_spec = (
+                category_specs.get(category_for_profile)
+                if isinstance(category_specs, dict) and category_for_profile
+                else None
+            )
+            if isinstance(category_spec, dict):
+                task_profile = category_spec.get("default_profile") or category_spec.get("profile")
+
+        try:
+            resolved_profile = resolve_capability_profile(
+                full_cfg,
+                profile=task_profile,
+                delegation_config=cfg,
+                parent_toolsets=parent_toolsets_for_categories,
+                requested_toolsets=task_toolsets,
+                category_name=task_category,
+            )
+        except CapabilityProfileConfigError as exc:
+            return tool_error(str(exc))
+
+        capability_prompt = None
+        capability_profile = None
+        if resolved_profile.get("active"):
+            try:
+                capability_prompt = render_capability_profile_prompt(
+                    resolved_profile,
+                    goal=str(task.get("goal") or ""),
+                    context=task.get("context"),
+                )
+            except CapabilityProfileConfigError as exc:
+                return tool_error(str(exc))
+            runtime_cfg = dict(cfg)
+            if resolved_profile.get("provider"):
+                runtime_cfg["provider"] = resolved_profile.get("provider")
+            if resolved_profile.get("model"):
+                runtime_cfg["model"] = resolved_profile.get("model")
+
+            try:
+                creds = _resolve_delegation_credentials(runtime_cfg, parent_agent)
+            except ValueError as exc:
+                return tool_error(str(exc))
+
+            budget = resolved_profile.get("budget") or {}
+            runtime_max_iter = budget.get("max_iterations") or default_max_iter
+            prompt_sections = resolved_profile.get("prompt_sections") or {}
+            runtime_recipe = str(prompt_sections.get("recipe") or cfg.get("recipe") or "").strip()
+            if runtime_recipe:
+                try:
+                    get_builtin_recipe(runtime_recipe)
+                except KeyError as exc:
+                    return tool_error(str(exc))
+            resolved_category = {
+                "category": resolved_profile.get("category") or "",
+                "profile": resolved_profile.get("profile") or "",
+                "provider": resolved_profile.get("provider") or "",
+                "model": resolved_profile.get("model") or "",
+                "toolsets": resolved_profile.get("toolsets"),
+                "max_iterations": runtime_max_iter,
+                "child_timeout_seconds": budget.get("child_timeout_seconds"),
+                "fallback_chain": resolved_profile.get("fallbacks") or [],
+                "fallback_metadata": resolved_profile.get("fallback_metadata", {}),
+            }
+            if runtime_recipe:
+                resolved_category["recipe"] = runtime_recipe
+            capability_profile = resolved_profile
+            task_runtimes.append(
+                {
+                    "toolsets": resolved_profile.get("toolsets"),
+                    "category": resolved_category,
+                    "creds": creds,
+                    "max_iterations": runtime_max_iter,
+                    "reasoning_effort": budget.get("reasoning_effort") or None,
+                    "child_timeout_seconds": budget.get("child_timeout_seconds"),
+                    "recipe": runtime_recipe or None,
+                    "capability_prompt": capability_prompt,
+                    "capability_profile": capability_profile,
+                }
+            )
+            continue
+
         try:
             resolved_category = resolve_delegation_category(
                 cfg,
@@ -2199,6 +2305,8 @@ def delegate_task(
                 "reasoning_effort": resolved_category.get("reasoning_effort") or None,
                 "child_timeout_seconds": resolved_category.get("child_timeout_seconds"),
                 "recipe": runtime_recipe or None,
+                "capability_prompt": None,
+                "capability_profile": None,
             }
         )
 
@@ -2255,6 +2363,8 @@ def delegate_task(
                 ),
                 role=effective_role,
                 agent_recipe=runtime["recipe"],
+                capability_prompt=runtime.get("capability_prompt"),
+                capability_profile=runtime.get("capability_profile"),
             )
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names
@@ -2498,6 +2608,7 @@ def delegate_task(
                     session_id=getattr(child, "session_id", None),
                     parent_session_id=getattr(parent_agent, "session_id", None),
                     category_requested=task.get("category"),
+                    profile_requested=task.get("profile"),
                     resolved_category=runtime.get("category"),
                     recipe=runtime.get("recipe"),
                     provider=creds.get("provider"),
@@ -2693,6 +2804,23 @@ def _load_config() -> dict:
 
         full = load_config()
         return full.get("delegation") or {}
+    except Exception:
+        return {}
+
+
+def _load_full_config() -> dict:
+    """Load the full runtime config, preserving CLI_CONFIG overrides."""
+    try:
+        from cli import CLI_CONFIG
+
+        if isinstance(CLI_CONFIG, dict) and CLI_CONFIG:
+            return CLI_CONFIG
+    except Exception:
+        pass
+    try:
+        from hermes_cli.config import load_config
+
+        return load_config() or {}
     except Exception:
         return {}
 
@@ -2928,6 +3056,14 @@ DELEGATE_TASK_SCHEMA = {
                     "can only narrow parent/requested toolsets."
                 ),
             },
+            "profile": {
+                "type": "string",
+                "description": (
+                    "Optional capability profile configured under capabilities.profiles. "
+                    "Profiles render explicit responsibility, boundaries, verification, "
+                    "handoff schema, and can also resolve provider/model/runtime scope."
+                ),
+            },
             "tasks": {
                 "type": "array",
                 "items": {
@@ -2946,6 +3082,10 @@ DELEGATE_TASK_SCHEMA = {
                         "category": {
                             "type": "string",
                             "description": "Per-task delegation category override.",
+                        },
+                        "profile": {
+                            "type": "string",
+                            "description": "Per-task capability profile override.",
                         },
                         "acp_command": {
                             "type": "string",
@@ -3018,6 +3158,7 @@ registry.register(
         context=args.get("context"),
         toolsets=args.get("toolsets"),
         category=args.get("category"),
+        profile=args.get("profile"),
         tasks=args.get("tasks"),
         max_iterations=args.get("max_iterations"),
         acp_command=args.get("acp_command"),

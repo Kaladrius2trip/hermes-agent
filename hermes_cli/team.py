@@ -76,6 +76,7 @@ _VALID_WORKSPACES = {"scratch", "worktree", "dir"}
 #   readonly:  bool, whether this role should avoid mutating the repo
 #   workspace: scratch | worktree | dir
 #   profile:   optional Hermes profile to assign (None -> dispatcher default)
+#   capability_profile: optional Capability Profile contract for dispatcher
 #   skills:    optional list of skill bundle names to force-load
 BUILTIN_TEAMS: dict[str, dict[str, Any]] = {
     "coding": {
@@ -142,6 +143,7 @@ class TeamNode:
     readonly: bool
     workspace: str
     profile: Optional[str]
+    capability_profile: Optional[str]
     skills: list[str]
     parents_local: list[str]
     approval_guards: list[str]
@@ -259,6 +261,7 @@ def _member_spec(spec: dict, role: str) -> dict:
         "readonly": bool(spec.get("readonly", False)),
         "workspace": workspace,
         "profile": spec.get("profile") or None,
+        "capability_profile": spec.get("capability_profile") or None,
         "skills": list(spec.get("skills") or []),
     }
 
@@ -275,6 +278,7 @@ def _render_body(goal: str, team_name: str, node_view: dict,
         f"**Team:** {team_name}",
         f"**Role:** {role}",
         f"**Category:** {node_view['category']}",
+        f"**Capability profile:** {node_view.get('capability_profile') or '(none)'}",
         f"**Toolsets:** {', '.join(toolsets) if toolsets else '(profile default)'}",
         f"**Read-only:** {'yes' if node_view['readonly'] else 'no'}",
         f"**Workspace:** {node_view['workspace']}",
@@ -310,9 +314,15 @@ def _render_body(goal: str, team_name: str, node_view: dict,
         "role": role,
         "name": node_view["name"],
         "category": node_view["category"],
+        "capability_profile": node_view.get("capability_profile"),
         "toolsets": toolsets,
         "readonly": node_view["readonly"],
         "workspace": node_view["workspace"],
+        "workspace_policy": {
+            "kind": node_view["workspace"],
+            "readonly": node_view["readonly"],
+            "mutate": not bool(node_view["readonly"]),
+        },
         "approval_required": list(approval_guards),
     }
     return embed_team_meta(text, meta)
@@ -348,13 +358,16 @@ def build_team_plan(goal: str, team_name: str, teams_cfg: dict) -> TeamPlan:
             "role": role, "name": norm["name"], "title": title,
             "category": norm["category"], "toolsets": norm["toolsets"],
             "readonly": norm["readonly"], "workspace": norm["workspace"],
+            "capability_profile": norm["capability_profile"],
         }
         body = _render_body(goal, team_name, node_view, approval_guards)
         node = TeamNode(
             local_id=local_id, role=role, name=norm["name"], title=title,
             category=norm["category"], toolsets=norm["toolsets"],
             readonly=norm["readonly"], workspace=norm["workspace"],
-            profile=norm["profile"], skills=norm["skills"],
+            profile=norm["profile"],
+            capability_profile=norm["capability_profile"],
+            skills=norm["skills"],
             parents_local=parents_local, approval_guards=approval_guards,
             body=body,
         )
@@ -410,7 +423,8 @@ def _registry_comment(plan: TeamPlan) -> str:
     for n in plan.nodes:
         lines.append(
             f"- {n.role}/{n.name} [{n.category}] -> {n.task_id} "
-            f"(workspace={n.workspace}, readonly={n.readonly})"
+            f"(workspace={n.workspace}, readonly={n.readonly}, "
+            f"capability_profile={n.capability_profile or 'none'})"
         )
     return "\n".join(lines)
 
@@ -540,6 +554,7 @@ def team_status(conn, *, team: Optional[str] = None) -> dict:
         bucket["tasks"].append({
             "id": t.id, "title": t.title, "status": t.status,
             "role": meta.get("role"), "category": meta.get("category"),
+            "capability_profile": meta.get("capability_profile"),
             "assignee": getattr(t, "assignee", None),
         })
 
@@ -627,6 +642,7 @@ def plan_to_dict(plan: TeamPlan) -> dict:
                 "readonly": n.readonly,
                 "workspace": n.workspace,
                 "profile": n.profile,
+                "capability_profile": n.capability_profile,
                 "skills": list(n.skills),
                 "parents_local": list(n.parents_local),
             }

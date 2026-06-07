@@ -364,6 +364,186 @@ Override precedence: an explicit `category=` argument wins over
 the top-level `delegation.*` defaults; caller-passed `toolsets` further narrow
 the category scope.
 
+### Capability profiles
+
+Capability profiles are the higher-level delegation contract on top of categories
+and recipes. A profile bundles responsibility, category/model/budget/tool scope,
+workspace mutation policy, verification requirements, approval gates, and a
+handoff schema. Profiles are opt-in: pass `profile=` on a `delegate_task` call or
+set `capabilities.default_profile`; otherwise legacy delegation is unchanged.
+
+Built-in profiles:
+
+| Profile | Use | Mutates | Default toolsets |
+|---------|-----|---------|------------------|
+| `implementation` | scoped code changes with tests | yes | `[terminal, file, search]` |
+| `review` | read-only correctness/security review | no | `[file, search]` |
+| `testing` | add/run focused tests and isolate failures | yes | `[terminal, file, search]` |
+| `research` | evidence-backed synthesis from files/web | no | `[file, search, web]` |
+| `orchestration` | decompose and route child work | no | `[delegation, file, search]` |
+| `documentation` | update docs from verified project facts | yes | `[file, search, web]` |
+| `webui-ux` | inspect/fix WebUI UX with visual evidence | yes | `[browser, vision, file, search, terminal]` |
+
+Example call:
+
+```python
+delegate_task(
+    goal="Implement retry handling in src/client.py and verify focused tests",
+    profile="implementation"
+)
+```
+
+Custom profile YAML:
+
+```yaml
+capabilities:
+  default_profile: ""  # keep empty for opt-in per call
+  profiles:
+    security-review:
+      responsibility: >
+        Review changed files for security regressions and return findings only.
+      category: review
+      prompt_sections:
+        recipe: critic-reviewer
+      allowed_toolsets: [file, search]
+      workspace_policy:
+        kind: scratch
+        mutate: false
+      verification_policy:
+        require_evidence: true
+        on_unverifiable: report
+      handoff_schema:
+        findings: list
+        evidence: list
+        blockers: list
+      approval_gates: [push, merge, publish, send_message]
+```
+
+Rules:
+
+- Profiles can only narrow tool scope: `profile ∩ category ∩ parent ∩ caller-requested`.
+- `provider`/`model` are identifiers only; never put `api_key`, `password`,
+  `base_url`, or auth headers in a profile.
+- `capability_profiles:` is accepted as a legacy shorthand for
+  `capabilities.profiles`, but new configs should use `capabilities.profiles`.
+- Unknown, disabled, unsafe, secret-like, or external-prompt-import profile
+  config fails before a child spawns.
+
+Capability profile rollout is additive and reversible: existing `delegation:`
+config keeps working unchanged, and profile-backed surfaces stay opt-in. See
+[`docs/architecture/capability-profiles.md`](https://github.com/NousResearch/hermes-agent/blob/main/docs/architecture/capability-profiles.md)
+for the full schema, migration crosswalk, clean-room policy, rollout/rollback
+plan, and the flag-gated [WebUI API contract](https://github.com/NousResearch/hermes-agent/blob/main/docs/architecture/capability-profiles.md#webui-api-contract)
+for plan preview, effective-scope preview, and approval-gate visibility.
+
+#### Profiles as Task Contracts
+
+A profile *is* the **Task Contract** for a delegated agent: one declarative record
+that answers "what is this child allowed to be, and what must it return?" Instead
+of re-writing posture, tool scope, and guardrails into each `goal`/`context`
+string, you bind one profile and the contract is resolved (and validated) before
+any child spawns. The contract fields:
+
+| Contract field | Answers | Fail-closed default |
+|----------------|---------|---------------------|
+| `responsibility` | What slice of work it owns (its only identity — no persona) | *required* |
+| `allowed_toolsets` | What it may touch — `profile ∩ category ∩ parent ∩ caller` (narrow only) | `[]` (no tools) |
+| `workspace_policy` | Where it runs and whether it may mutate | `{kind: scratch, mutate: false}` |
+| `verification_policy` | What counts as "done" (`require_evidence`, `on_unverifiable`) | `{require_evidence: true}` |
+| `handoff_schema` | The structured result it must hand back | minimal summary |
+| `approval_gates` | Outward actions that need explicit human approval | `[push, merge, publish, send_message]` |
+| `model`/`provider`/`budget`/`fallbacks` | Routing and runtime caps (identifiers only — never credentials) | inherit parent |
+
+The built-in pack gives you a ready contract per intent. Pass `profile=`; the
+contract does the rest:
+
+```python
+# implementation — mutates; returns changed files, commands, tests, risks, blockers
+delegate_task(goal="Add retry handling to src/client.py and run focused tests",
+              profile="implementation")
+
+# review — read-only (no terminal); returns findings, evidence, blockers
+delegate_task(goal="Review the changed auth files for correctness and security",
+              profile="review")
+
+# research — read-only with web; returns sources, findings, recommendation, confidence
+delegate_task(goal="Compare two rate-limit strategies for our gateway",
+              profile="research")
+
+# testing — mutates; returns tests added, commands, failures, coverage gaps
+delegate_task(goal="Add focused tests for the parser and isolate the failing case",
+              profile="testing")
+```
+
+A requested-but-unknown profile fails before any child runs with a structured
+error naming the valid profiles (`unknown_profile`); a profile marked
+`enabled: false` fails with `disabled_profile`. Resolution is pure — no I/O, no
+spawn — so contract mistakes are caught up front, not mid-run.
+
+### Manual profile workflow: dry-run → canary → live
+
+Roll a new or changed profile out on a low-blast-radius path before you trust it
+broadly. The whole flow is operator-driven; nothing here flips a default for you.
+
+1. **Dry-run the plan.** Preview the graph and profile assignments without
+   touching the board:
+
+   ```bash
+   hermes team plan "Harden the gateway retry path" --team coding --dry-run
+   ```
+
+   This prints the planned cards and per-node profile bindings and creates **no**
+   tasks. `delegate_task` itself has no dry-run, but because profile resolution
+   is pure, an invalid contract fails fast (`unknown_profile`,
+   `disabled_profile`, `unknown_toolset`, `secret_field`, …) before a child
+   spawns — run a single read-only delegation to surface any resolution error
+   cheaply.
+
+2. **Canary read-only profiles first.** Keep `default_profile: ""` and pass
+   `profile=` per call. Exercise `review` and `research` (both `mutate: false`)
+   first, so the worst-case canary failure is a no-op read/synthesis run. Promote
+   to write-capable (`implementation`, `testing`) and child-spawning
+   (`orchestration`) profiles only after the read-only ones behave.
+
+3. **Create cards.** Re-run the plan without `--dry-run` to materialize the
+   board (the agent can also call `kanban_create` directly). Each card carries
+   its profile binding and approval gates in team metadata:
+
+   ```bash
+   hermes team plan "Harden the gateway retry path" --team coding
+   ```
+
+4. **Monitor status.** Watch progress, blockers, and which gates are armed:
+
+   ```bash
+   hermes team status --team coding
+   ```
+
+   `hermes team status` reports per-team card counts, blocked cards, and the
+   active **approval gates**. In the TUI, the `/agents` overlay (alias `/tasks`)
+   shows the live subagent tree; `kanban_show` / `kanban_list` inspect individual
+   cards.
+
+5. **Approval gate.** Gated actions (`push`, `merge`, `publish`, `send_message`)
+   are fail-closed: denied unless a human explicitly approves. During canary,
+   confirm every gate denies without approval — a single un-gated push is a hard
+   stop, not a warning.
+
+6. **Rollback.** Reverting is a config delete, not a migration. Remove
+   `capabilities.profiles` (or legacy `capability_profiles`) and clear
+   `default_profile` to fall straight back to legacy category/global/inherit
+   delegation once the gateway/session loads that config; remove `profile:`
+   from team nodes to revert those. There is no resolver database or migration
+   state to clean up. Do **not** restart the live gateway/WebUI for rollback
+   unless that separate release action is approved.
+
+:::warning Canary & live safety
+- **Canary first — and don't restart the live gateway/WebUI to test a profile.** Start the canary process with the profile config already present, keep the live process untouched, and use the WebUI profile surface as read-only inspect/audit only (never edit or execute). Bouncing the live gateway mid-canary risks dropping live sessions and remains a separate release action.
+- **Side-by-side Discord bot token.** Never run a canary instance with the **same** `DISCORD_BOT_TOKEN` as your live bot. Hermes uses token-scoped gateway locks so two instances cannot share one bot credential; give any second instance its own token **and** its own `HERMES_HOME`. Reusing the live token collides with the running bot.
+- **Secrets stay out of profiles.** Profiles and presets carry provider/model **identifiers only** — never `api_key`, `password`, `base_url`, or auth headers (shown as `[REDACTED]` in docs). Children inherit the parent's resolved credentials, so you almost never set credentials per profile.
+- **Clean-room.** Profile names are operator-chosen labels with no built-in behavior; there is no registry of magic persona names. Do not import external personas, prompts, or schemas — `responsibility` plus the explicit fields are the whole identity.
+:::
+
 ### Troubleshooting category routing
 
 | Symptom | Cause | Fix |

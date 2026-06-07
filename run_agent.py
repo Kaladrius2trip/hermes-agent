@@ -4950,6 +4950,7 @@ class AIAgent:
             tasks=function_args.get("tasks"),
             max_iterations=function_args.get("max_iterations"),
             category=function_args.get("category"),
+            profile=function_args.get("profile"),
             acp_command=function_args.get("acp_command"),
             acp_args=function_args.get("acp_args"),
             role=function_args.get("role"),

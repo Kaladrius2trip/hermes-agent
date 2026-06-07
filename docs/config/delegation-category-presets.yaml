@@ -29,6 +29,13 @@
 #   2. `default_category: quick` opts in globally for fast, narrow delegation.
 #      Set it to "" if you prefer per-call category selection only.
 #   3. Delete `default_category` and `categories` to revert to legacy behavior.
+#
+# Future direction (RFC, no behavior change):
+#   Each category below maps one-to-one onto a future *capability profile* — a
+#   single named record that also carries responsibility, workspace/verification
+#   policy, handoff schema, and approval gates. The mapping is additive and
+#   backward-compatible; this file keeps working unchanged. See
+#   docs/architecture/capability-profiles.md for the schema and crosswalk.
 # =============================================================================
 
 delegation:
@@ -88,3 +95,156 @@ delegation:
       child_timeout_seconds: 600
       toolsets_mode: intersect
       toolsets: [file, search, web]
+
+# =============================================================================
+# Optional Capability Profile examples (Phase 13 schema)
+# =============================================================================
+# This `capabilities:` block is independent from `delegation:`. Leaving
+# `default_profile` empty preserves legacy behavior. A profile may reference one
+# of the categories above, then add responsibility, workspace/verification
+# policy, handoff schema, approval gates, and safe fallbacks.
+#
+# Safety properties (enforced by resolve_capability_profile):
+#   * Toolsets still use intersect-only semantics: profile ∩ category ∩ parent ∩
+#     caller-requested. Profiles and fallbacks may narrow only.
+#   * Unknown toolsets, unsafe approval gate names, env/secret injection fields,
+#     and recursive fallback profile loops fail before any child spawn.
+#   * Provider/model values are plain identifiers only. Credentials stay outside
+#     config and are never written here.
+#
+# How to use:
+#   1. Keep `default_profile: ""` for per-call opt-in, or set `quick`/`review`.
+#   2. Override only fields you own. Omitted provider/model inherits existing
+#      delegation or parent routing.
+#   3. Delete the `capabilities:` block to revert fully.
+#
+# capabilities:
+#   default_profile: ""
+#   profiles:
+#     review:
+#       responsibility: >
+#         Read changed files and report correctness, security, and style defects
+#         without executing commands or mutating files.
+#       category: review
+#       prompt_sections:
+#         recipe: critic-reviewer
+#       allowed_toolsets: [file, search]
+#       budget:
+#         reasoning_effort: high
+#         max_iterations: 40
+#         child_timeout_seconds: 600
+#       workspace_policy:
+#         kind: scratch
+#         mutate: false
+#       verification_policy:
+#         require_evidence: true
+#         on_unverifiable: report
+#       handoff_schema:
+#         findings: list
+#         blockers: list
+#       approval_gates: [push, merge, publish, send_message]
+#       fallbacks:
+#         - provider: openrouter
+#           model: "google/gemini-3-flash-preview"
+#
+#     quick:
+#       responsibility: >
+#         Complete small scoped implementation, lookup, or mechanical fix tasks.
+#       category: quick
+#       prompt_sections:
+#         recipe: focused-executor
+#       allowed_toolsets: [file, search]
+#       workspace_policy:
+#         kind: scratch
+#         mutate: true
+#
+#     implementation:
+#       responsibility: >
+#         Make a scoped code change and verify it with focused tests; return
+#         changed files, commands run, test results, risks, and blockers.
+#       category: deep
+#       prompt_sections:
+#         recipe: deep-worker
+#       allowed_toolsets: [terminal, file, search]
+#       workspace_policy:
+#         kind: worktree
+#         mutate: true
+#       verification_policy:
+#         require_evidence: true
+#         on_unverifiable: fail
+#       handoff_schema:
+#         changed_files: list
+#         commands_run: list
+#         blockers: list
+#       approval_gates: [push, merge, publish, send_message]
+#
+#     testing:
+#       responsibility: >
+#         Add and run focused tests, isolate the failing case, and report tests
+#         added, commands, failures, and coverage gaps.
+#       category: deep
+#       prompt_sections:
+#         recipe: focused-executor
+#       allowed_toolsets: [terminal, file, search]
+#       workspace_policy:
+#         kind: worktree
+#         mutate: true
+#       verification_policy:
+#         require_evidence: true
+#         on_unverifiable: report
+#       handoff_schema:
+#         changed_files: list
+#         commands_run: list
+#         findings: list
+#         blockers: list
+#       approval_gates: [push, merge, publish, send_message]
+#
+#     research:
+#       responsibility: >
+#         Synthesize an evidence-backed answer from files and the web without
+#         executing or mutating anything; return sources, findings,
+#         recommendation, and confidence.
+#       category: writing
+#       prompt_sections:
+#         recipe: researcher
+#       allowed_toolsets: [file, search, web]
+#       workspace_policy:
+#         kind: scratch
+#         mutate: false
+#       verification_policy:
+#         require_evidence: true
+#         on_unverifiable: report
+#       handoff_schema:
+#         findings: list
+#         blockers: list
+#       approval_gates: [push, merge, publish, send_message]
+#
+# =============================================================================
+# Manual canary -> live profile workflow
+# =============================================================================
+# Roll a new/changed profile out on a low-blast-radius path. Operator-driven;
+# none of these steps flips a default for you.
+#   1. Dry-run:    hermes team plan "<goal>" --team coding --dry-run
+#                  (prints the planned graph + profile bindings; creates nothing)
+#   2. Validate:   one read-only delegate_task(..., profile="review"). Profile
+#                  resolution is pure, so a bad contract fails before any child
+#                  spawns (unknown_profile / disabled_profile / unknown_toolset /
+#                  secret_field), not mid-run.
+#   3. Canary:     keep default_profile "" and exercise read-only profiles first
+#                  (review, research; mutate: false) before write-capable ones.
+#   4. Create:     hermes team plan "<goal>" --team coding   (drop --dry-run)
+#   5. Monitor:    hermes team status [--team coding]; TUI /agents (alias /tasks).
+#   6. Approval:   gated actions (push/merge/publish/send_message) are fail-closed
+#                  -- confirm each denies without explicit approval.
+#   7. Rollback:   delete capabilities.profiles / capability_profiles and clear
+#                  default_profile; remove profile: from team nodes. Reverts to
+#                  legacy delegation with NO gateway restart (resolution is pure).
+#
+# Live-safety warnings:
+#   * Do NOT restart the live gateway/WebUI to pick up profiles -- resolution is
+#     per-call (no restart needed) and the WebUI profile surface is read-only.
+#   * Never reuse the live DISCORD_BOT_TOKEN for a side-by-side canary instance.
+#     Token-scoped gateway locks stop two instances sharing one bot credential;
+#     give a second instance its own token AND its own HERMES_HOME.
+#   * Secrets never live in this file -- provider/model identifiers only;
+#     credentials stay in ~/.hermes/.env and render as [REDACTED].

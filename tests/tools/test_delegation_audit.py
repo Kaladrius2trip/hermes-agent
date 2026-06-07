@@ -161,7 +161,44 @@ def test_build_delegation_run_event_tolerates_non_mapping_category():
     )
 
     assert event["category_resolved"] == ""
+    assert event["profile_resolved"] == ""
     assert event["fallback_metadata"] == {"enabled": False, "count": 0}
+
+
+def test_build_delegation_run_event_includes_profile_route_metadata():
+    event = audit.build_delegation_run_event(
+        session_id="sess-profile",
+        category_requested="quick",
+        profile_requested="safe-review",
+        resolved_category={
+            "category": "quick",
+            "profile": "safe-review",
+            "recipe": "critic-reviewer",
+            "provider": "local-lmstudio",
+            "model": "qwen/qwen3.6-35b-a3b",
+            "fallback_metadata": {
+                "enabled": True,
+                "count": 1,
+                "providers": ["openrouter"],
+                "models": ["anthropic/claude-haiku"],
+                "profiles": [],
+            },
+        },
+        status="completed",
+    )
+
+    assert event["category_requested"] == "quick"
+    assert event["category_resolved"] == "quick"
+    assert event["profile_requested"] == "safe-review"
+    assert event["profile_resolved"] == "safe-review"
+    assert event["recipe"] == "critic-reviewer"
+    assert event["fallback_metadata"] == {
+        "enabled": True,
+        "count": 1,
+        "providers": ["openrouter"],
+        "models": ["anthropic/claude-haiku"],
+        "profiles": [],
+    }
 
 
 def test_delegate_task_records_runtime_audit_event_without_prompt_or_credentials(tmp_path):
