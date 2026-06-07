@@ -260,6 +260,83 @@ def test_configured_profile_overrides_builtin_without_widening_tools():
     assert resolved["approval_gates"] == ["push", "merge"]
 
 
+def test_top_level_legacy_capability_profiles_survive_default_config_merge():
+    full_config_shape = {
+        "capabilities": {"default_profile": "", "profiles": {}},
+        "capability_profiles": {
+            "legacy-review": {
+                "responsibility": "Review only from legacy alias.",
+                "category": "review",
+                "allowed_toolsets": ["file", "search"],
+            }
+        },
+    }
+
+    resolved = resolve_capability_profile(
+        full_config_shape,
+        profile="legacy-review",
+        delegation_config=_delegation_config(),
+        parent_toolsets=["file", "search", "terminal"],
+        requested_toolsets=["file", "search"],
+    )
+
+    assert resolved["profile"] == "legacy-review"
+    assert resolved["responsibility"] == "Review only from legacy alias."
+    assert resolved["category"] == "review"
+    assert resolved["toolsets"] == ["file", "search"]
+
+
+def test_canonical_capability_profile_wins_over_legacy_alias_name_collision():
+    full_config_shape = {
+        "capabilities": {
+            "profiles": {
+                "safe-review": {
+                    "responsibility": "Canonical profile wins.",
+                    "category": "review",
+                    "allowed_toolsets": ["file"],
+                }
+            }
+        },
+        "capability_profiles": {
+            "safe-review": {
+                "responsibility": "Legacy should not override canonical.",
+                "category": "deep",
+                "allowed_toolsets": ["terminal", "web"],
+            }
+        },
+    }
+
+    resolved = resolve_capability_profile(
+        full_config_shape,
+        profile="safe-review",
+        delegation_config=_delegation_config(),
+        parent_toolsets=["file", "terminal", "web"],
+        requested_toolsets=["file", "terminal", "web"],
+    )
+
+    assert resolved["responsibility"] == "Canonical profile wins."
+    assert resolved["category"] == "review"
+    assert resolved["toolsets"] == ["file"]
+
+
+def test_malformed_canonical_profiles_is_not_masked_by_legacy_alias():
+    with pytest.raises(CapabilityProfileConfigError) as excinfo:
+        resolve_capability_profile(
+            {
+                "capabilities": {"profiles": "not-a-map"},
+                "capability_profiles": {
+                    "legacy-review": {
+                        "responsibility": "Do not mask malformed canonical config.",
+                        "allowed_toolsets": ["file"],
+                    }
+                },
+            },
+            profile="legacy-review",
+        )
+
+    assert excinfo.value.code == "profiles_type"
+
+
 def test_profile_can_reference_legacy_category_without_changing_category_resolver_behavior():
     capabilities = {
         "profiles": {

@@ -385,15 +385,40 @@ def _intersect_preserving_order(base: Sequence[str], allowed: Sequence[str]) -> 
     return [item for item in base if item in allowed_set]
 
 
+def _merge_legacy_capability_profiles(
+    canonical: Dict[str, Any], legacy_profiles: Any
+) -> Dict[str, Any]:
+    """Merge legacy top-level ``capability_profiles`` into canonical config.
+
+    ``load_config()`` deep-merges ``DEFAULT_CONFIG`` first, so a full config
+    always contains ``capabilities.profiles`` even when an older user config
+    only defines top-level ``capability_profiles``. Preserve that alias without
+    letting it override explicit canonical profile definitions or mask a
+    malformed canonical ``profiles`` value.
+    """
+    if not isinstance(legacy_profiles, Mapping):
+        return canonical
+
+    merged = dict(canonical)
+    profiles = merged.get("profiles")
+    if isinstance(profiles, Mapping):
+        profile_map = dict(legacy_profiles)
+        profile_map.update(profiles)
+        merged["profiles"] = profile_map
+    elif "profiles" not in merged or profiles is None:
+        merged["profiles"] = dict(legacy_profiles)
+    return merged
+
+
 def _normalise_capabilities_config(capabilities_config: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
     cfg = dict(capabilities_config or {})
+    legacy_profiles = cfg.get("capability_profiles")
     if "capabilities" in cfg and "profiles" not in cfg:
         nested = cfg.get("capabilities")
-        return dict(nested or {}) if isinstance(nested, Mapping) else {}
-    if "capability_profiles" in cfg and "profiles" not in cfg:
-        legacy_profiles = cfg.get("capability_profiles")
-        if isinstance(legacy_profiles, Mapping):
-            return {"profiles": dict(legacy_profiles)}
+        canonical = dict(nested or {}) if isinstance(nested, Mapping) else {}
+        return _merge_legacy_capability_profiles(canonical, legacy_profiles)
+    if "capability_profiles" in cfg:
+        return _merge_legacy_capability_profiles(cfg, legacy_profiles)
     return cfg
 
 
@@ -857,8 +882,16 @@ def resolve_capability_profile(
         CapabilityProfileConfigError on malformed or unsafe profile config.
     """
     capabilities = _normalise_capabilities_config(capabilities_config)
-    raw_profiles = capabilities.get("profiles") or {}
-    config_profiles = dict(raw_profiles) if isinstance(raw_profiles, Mapping) else {}
+    raw_profiles = capabilities.get("profiles", {})
+    if raw_profiles is None:
+        raw_profiles = {}
+    if not isinstance(raw_profiles, Mapping):
+        raise CapabilityProfileConfigError(
+            "Capability profiles config must be a mapping",
+            code="profiles_type",
+            field="profiles",
+        )
+    config_profiles = dict(raw_profiles)
     valid_profiles = _valid_profile_names(config_profiles)
 
     if profile is None and profile_name is not None:
