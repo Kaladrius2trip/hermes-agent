@@ -477,7 +477,9 @@ const ReasoningAccordionGroup: FC<{ children?: ReactNode; endIndex: number; star
     s =>
       s.thread.isRunning &&
       s.message.status?.type === 'running' &&
-      s.message.parts.slice(Math.max(0, startIndex)).some(p => p?.type === 'reasoning' && p.status?.type !== 'complete')
+      s.message.parts
+        .slice(Math.max(0, startIndex), endIndex + 1)
+        .some(p => p?.type === 'reasoning' && p.status?.type !== 'complete')
   )
 
   // A reasoning group with no actual text is pure noise — drop the whole
@@ -720,8 +722,14 @@ function StickyHumanMessageContainer({ children }: { children: ReactNode }) {
 // edit composer render the same bubble surface (rounded glass card);
 // they only differ in border weight, cursor, and padding-right (the
 // read-only view reserves room for the restore icon).
+//
+// no-drag: sticky bubbles park at --sticky-human-top (~4px), sliding under the
+// titlebar's [-webkit-app-region:drag] strips (app-shell.tsx). Electron resolves
+// drag regions at the compositor level — z-index and pointer-events don't help —
+// so without the carve-out, clicking a stuck bubble drags the window instead of
+// opening the edit composer.
 const USER_BUBBLE_BASE_CLASS =
-  'composer-human-message standalone-glass relative flex w-full min-w-0 max-w-full flex-col gap-1.5 overflow-hidden rounded-xl border bg-(--dt-user-bubble) px-3 py-2 text-left'
+  'composer-human-message standalone-glass relative flex w-full min-w-0 max-w-full flex-col gap-1.5 overflow-hidden rounded-xl border bg-(--dt-user-bubble) px-3 py-2 text-left [-webkit-app-region:no-drag]'
 
 const USER_ACTION_ICON_BUTTON_CLASS =
   'grid place-items-center rounded-md bg-transparent text-(--ui-text-secondary) transition-colors hover:bg-(--ui-control-active-background) hover:text-foreground disabled:cursor-default disabled:text-(--ui-text-quaternary) disabled:opacity-70'
@@ -921,22 +929,42 @@ const SystemMessage: FC = () => {
   const slashStatus = text.match(SLASH_STATUS_RE)
 
   if (slashStatus?.groups) {
+    const output = slashStatus.groups.output.trim()
+    // Single-line status (e.g. "model → x") reads best centered inline; padded
+    // multiline output (catalogs, usage tables) needs left-aligned, wider room
+    // or the column alignment breaks.
+    const multiline = output.includes('\n')
+
     return (
       <MessagePrimitive.Root
-        className="max-w-[min(86%,44rem)] self-center px-2 py-0.5 text-center text-[0.6875rem] leading-5 text-muted-foreground/60"
+        className={cn(
+          'w-[60%] max-w-[44rem] self-center px-2 py-0.5 text-[0.6875rem] leading-5 text-muted-foreground/60',
+          multiline ? 'text-left' : 'text-center'
+        )}
         data-role="system"
         data-slot="aui_system-message-root"
       >
         <span className="font-mono text-muted-foreground/55">{slashStatus.groups.command}</span>
-        <span className="mx-1.5 text-muted-foreground/35">·</span>
-        <LinkifiedText className="whitespace-pre-wrap" explicitOnly pretty={false} text={slashStatus.groups.output.trim()} />
+        {multiline ? (
+          <LinkifiedText className="mt-0.5 block whitespace-pre-wrap" explicitOnly pretty={false} text={output} />
+        ) : (
+          <>
+            <span className="mx-1.5 text-muted-foreground/35">·</span>
+            <LinkifiedText className="whitespace-pre-wrap" explicitOnly pretty={false} text={output} />
+          </>
+        )}
       </MessagePrimitive.Root>
     )
   }
 
+  const multiline = text.includes('\n')
+
   return (
     <MessagePrimitive.Root
-      className="max-w-[min(86%,44rem)] self-center px-2 py-0.5 text-center text-[0.6875rem] leading-5 text-muted-foreground/55"
+      className={cn(
+        'w-[60%] max-w-[44rem] self-center px-2 py-0.5 text-[0.6875rem] leading-5 text-muted-foreground/55',
+        multiline ? 'text-left' : 'text-center'
+      )}
       data-role="system"
       data-slot="aui_system-message-root"
     >
@@ -1500,6 +1528,8 @@ const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sessionId }
           >
             <div
               aria-label={copy.editMessage}
+              autoCapitalize="off"
+              autoCorrect="off"
               autoFocus
               className={cn(
                 'ui-prompt-input-editor__input max-h-48 w-full resize-none bg-transparent p-0 pr-7 text-[length:var(--conversation-text-font-size)] leading-(--dt-line-height) text-foreground/95 outline-none',
@@ -1521,9 +1551,26 @@ const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sessionId }
               onPaste={handlePaste}
               ref={editorRef}
               role="textbox"
+              spellCheck={false}
               suppressContentEditableWarning
             />
-            <ComposerPrimitive.Input className="sr-only" tabIndex={-1} unstable_focusOnScrollToBottom={false} />
+            <ComposerPrimitive.Input
+              asChild
+              className="sr-only"
+              submitMode="ctrlEnter"
+              tabIndex={-1}
+              unstable_focusOnScrollToBottom={false}
+            >
+              <textarea
+                aria-hidden
+                autoCapitalize="off"
+                autoComplete="off"
+                autoCorrect="off"
+                className="sr-only"
+                spellCheck={false}
+                tabIndex={-1}
+              />
+            </ComposerPrimitive.Input>
             {staging && (
               <span
                 className="pointer-events-none absolute bottom-2 left-2 inline-flex items-center gap-1 rounded-full bg-background/80 px-1.5 py-0.5 text-[0.62rem] text-muted-foreground backdrop-blur-[1px]"

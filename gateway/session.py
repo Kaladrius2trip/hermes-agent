@@ -92,6 +92,7 @@ class SessionSource:
     user_role_ids: Optional[List[str]] = None  # Discord role IDs observed on the triggering message
     parent_chat_id: Optional[str] = None  # Parent channel when chat_id refers to a thread
     message_id: Optional[str] = None  # ID of the triggering message (for pin/reply/react)
+    role_authorized: bool = False  # True when adapter granted access via role (not user ID)
     
     @property
     def description(self) -> str:
@@ -319,6 +320,22 @@ def build_session_context_prompt(
     # Channel topic (if available - provides context about the channel's purpose)
     if context.source.chat_topic:
         lines.append(f"**Channel Topic:** {context.source.chat_topic}")
+
+    if context.source.platform == Platform.MATRIX:
+        src = context.source
+        room_name = src.chat_name or src.chat_id
+        room_id = _hash_chat_id(src.chat_id) if redact_pii else src.chat_id
+        lines.append("")
+        lines.append(f"**Matrix Room:** {room_name}")
+        lines.append(f"**Matrix Room ID:** {room_id}")
+        if src.thread_id:
+            thread_id = _hash_chat_id(src.thread_id) if redact_pii else src.thread_id
+            lines.append(f"**Matrix Thread:** {thread_id}")
+        lines.append(
+            "**Matrix room boundary:** Treat this turn as scoped to the current "
+            "Matrix room/thread only. Do not assume unresolved references are "
+            "about other Matrix rooms or projects unless the user explicitly says so."
+        )
 
     # User identity.
     # In shared multi-user sessions (shared threads OR shared non-thread groups
@@ -1290,6 +1307,17 @@ class SessionStore:
         entries.sort(key=lambda e: e.updated_at, reverse=True)
 
         return entries
+
+    def lookup_by_session_id(self, session_id: str) -> Optional[SessionEntry]:
+        """Return the active session entry for a persisted session ID, if any."""
+        if not session_id:
+            return None
+        with self._lock:
+            self._ensure_loaded_locked()
+            for entry in self._entries.values():
+                if entry.session_id == session_id:
+                    return entry
+        return None
     
     def append_to_transcript(self, session_id: str, message: Dict[str, Any], skip_db: bool = False) -> None:
         """Append a message to a session's transcript (SQLite).
