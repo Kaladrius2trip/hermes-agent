@@ -7053,10 +7053,14 @@ def _default_spawn(
 def worker_tmux_enabled(kanban_cfg: Optional[dict] = None) -> bool:
     """True when workers should run inside capturable tmux sessions.
 
-    Opt-in via ``kanban.worker_tmux: true`` (config.yaml) or
-    ``HERMES_KANBAN_WORKER_TMUX=1``. Default off: the tmux path changes PID
-    semantics (pane pid vs Popen pid) and needs a tmux server in the
-    dispatcher's environment.
+    Resolution order:
+    1. ``HERMES_KANBAN_WORKER_TMUX`` env (1/true/on or 0/false/off).
+    2. ``kanban.worker_tmux`` in config.yaml (true/false, or "auto").
+    3. Default **auto**: enabled whenever a ``tmux`` binary is available
+       (non-Windows). The spawn path verifies the session actually starts
+       and falls back to plain Popen on any tmux failure, so auto-on is
+       safe — the worst case is the old behavior. Set ``worker_tmux: false``
+       to force the plain Popen path.
     """
     env_raw = os.environ.get("HERMES_KANBAN_WORKER_TMUX", "").strip().lower()
     if env_raw in {"1", "true", "yes", "on"}:
@@ -7070,7 +7074,13 @@ def worker_tmux_enabled(kanban_cfg: Optional[dict] = None) -> bool:
             kanban_cfg = (load_config().get("kanban") or {})
         except Exception:
             kanban_cfg = {}
-    return str((kanban_cfg or {}).get("worker_tmux", "")).strip().lower() in {"1", "true", "yes", "on"}
+    cfg_raw = str((kanban_cfg or {}).get("worker_tmux", "")).strip().lower()
+    if cfg_raw in {"1", "true", "yes", "on"}:
+        return True
+    if cfg_raw in {"0", "false", "no", "off"}:
+        return False
+    # auto (default): on when tmux is usable on this platform.
+    return (not _IS_WINDOWS) and shutil.which("tmux") is not None
 
 
 def worker_pane_log_path(task_id: str, *, board: Optional[str] = None) -> Path:

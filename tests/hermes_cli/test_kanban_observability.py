@@ -91,3 +91,23 @@ class TestRecordDelegationEvent:
     def test_failure_is_swallowed(self, board, monkeypatch):
         monkeypatch.setattr(kb, "connect_closing", lambda *a, **k: (_ for _ in ()).throw(OSError("no db")))
         assert kb.record_delegation_event("t_x", {"agents": []}) is False
+
+
+class TestWorkerTmuxEnabled:
+    def test_env_override_wins(self, monkeypatch):
+        monkeypatch.setenv("HERMES_KANBAN_WORKER_TMUX", "0")
+        assert kb.worker_tmux_enabled({"worker_tmux": True}) is False
+        monkeypatch.setenv("HERMES_KANBAN_WORKER_TMUX", "1")
+        assert kb.worker_tmux_enabled({"worker_tmux": False}) is True
+
+    def test_config_explicit_values(self, monkeypatch):
+        monkeypatch.delenv("HERMES_KANBAN_WORKER_TMUX", raising=False)
+        assert kb.worker_tmux_enabled({"worker_tmux": True}) is True
+        assert kb.worker_tmux_enabled({"worker_tmux": False}) is False
+
+    def test_auto_follows_tmux_availability(self, monkeypatch):
+        monkeypatch.delenv("HERMES_KANBAN_WORKER_TMUX", raising=False)
+        monkeypatch.setattr(kb.shutil, "which", lambda name: "/usr/bin/tmux" if name == "tmux" else None)
+        assert kb.worker_tmux_enabled({}) is (not kb._IS_WINDOWS)
+        monkeypatch.setattr(kb.shutil, "which", lambda name: None)
+        assert kb.worker_tmux_enabled({}) is False
