@@ -1599,7 +1599,7 @@ def merge_pending_message_event(
     event: MessageEvent,
     *,
     merge_text: bool = False,
-) -> None:
+) -> Optional[MessageEvent]:
     """Store or merge a pending event for a session.
 
     Photo bursts/albums often arrive as multiple near-simultaneous PHOTO
@@ -1610,6 +1610,11 @@ def merge_pending_message_event(
     instead of replacing the pending turn. This is used for Telegram bursty
     follow-ups so a multi-part user thought is not silently truncated to only
     the last queued fragment.
+
+    Returns the displaced pending event when a different requester's queued
+    turn was replaced (cross-requester turns are never merged for ACL
+    reasons), so the caller can notify the displaced user instead of silently
+    dropping their message. Returns None otherwise.
     """
     existing = pending_messages.get(session_key)
     if existing:
@@ -1624,7 +1629,7 @@ def merge_pending_message_event(
         # request under the higher user's tool policy.
         if _source_identity(getattr(existing, "source", None)) != _source_identity(getattr(event, "source", None)):
             pending_messages[session_key] = event
-            return
+            return existing
         # Same requester: keep latest source metadata (roles/display/thread attrs)
         # for the eventual ACL/context resolution.
         existing.source = event.source

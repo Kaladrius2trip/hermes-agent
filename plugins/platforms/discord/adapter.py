@@ -3715,6 +3715,14 @@ class DiscordAdapter(BasePlatformAdapter):
         # For forum threads, inherit the parent forum's topic.
         chat_topic = self._get_effective_topic(interaction.channel, is_thread=is_thread)
 
+        # Thread sources need parent_chat_id so channel-scoped ACL grants on
+        # the parent channel apply inside the thread (the message path sets
+        # it; without it _acl_channel_id_for_source fail-closes to deny).
+        parent_chat_id = None
+        if is_thread:
+            _parent = self._thread_parent_channel(interaction.channel)
+            parent_chat_id = str(getattr(_parent, "id", "") or "") or None
+
         source = self.build_source(
             chat_id=str(interaction.channel_id),
             chat_name=chat_name,
@@ -3725,6 +3733,7 @@ class DiscordAdapter(BasePlatformAdapter):
             chat_topic=chat_topic,
             guild_id=str(getattr(getattr(interaction, "guild", None), "id", "") or "") or None,
             user_role_ids=_discord_role_ids(interaction.user),
+            parent_chat_id=parent_chat_id,
         )
 
         msg_type = MessageType.COMMAND if text.startswith("/") else MessageType.TEXT
@@ -3799,6 +3808,13 @@ class DiscordAdapter(BasePlatformAdapter):
         _chan = getattr(interaction, "channel", None)
         chat_topic = self._get_effective_topic(_chan, is_thread=True) if _chan else None
 
+        _parent_channel = self._thread_parent_channel(getattr(interaction, "channel", None))
+        _parent_id = str(getattr(_parent_channel, "id", "") or "")
+        # The /thread interaction fires from the parent channel itself, so
+        # fall back to the interaction channel id when it isn't a thread.
+        if not _parent_id and not isinstance(getattr(interaction, "channel", None), discord.Thread):
+            _parent_id = str(getattr(interaction, "channel_id", "") or "")
+
         source = self.build_source(
             chat_id=thread_id,
             chat_name=chat_name,
@@ -3809,10 +3825,8 @@ class DiscordAdapter(BasePlatformAdapter):
             chat_topic=chat_topic,
             guild_id=str(getattr(getattr(interaction, "guild", None), "id", "") or "") or None,
             user_role_ids=_discord_role_ids(interaction.user),
+            parent_chat_id=_parent_id or None,
         )
-
-        _parent_channel = self._thread_parent_channel(getattr(interaction, "channel", None))
-        _parent_id = str(getattr(_parent_channel, "id", "") or "")
         _skills = self._resolve_channel_skills(thread_id, _parent_id or None)
         _channel_prompt = self._resolve_channel_prompt(thread_id, _parent_id or None)
         event = MessageEvent(

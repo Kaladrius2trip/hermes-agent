@@ -585,6 +585,12 @@ def collect_bootstrap_super_admins(
 
     add("discord", env.get("DISCORD_ACL_SUPER_ADMINS"))
     add("discord", env.get("GATEWAY_ACL_SUPER_ADMINS"))
+    # Per the ACL design spec (docs/superpowers/specs/2026-05-13-gateway-acl-
+    # design.md): "Users in DISCORD_ALLOWED_USERS or platform allow_from are
+    # Hermes ACL super-admins." Without this, every pre-ACL deployment whose
+    # owner is only in DISCORD_ALLOWED_USERS is locked out of chat AND of the
+    # /acl command needed to fix it.
+    add("discord", env.get("DISCORD_ALLOWED_USERS"))
 
     for key, cfg in (platform_configs or {}).items():
         platform = _platform_key_to_name(key)
@@ -593,6 +599,9 @@ def collect_bootstrap_super_admins(
             add(platform, extra.get("acl_super_admins"))
             add(platform, extra.get("allow_admin_from"))
             add(platform, _flatten_group_mapping(extra.get("group_allow_admin_from")))
+            # Legacy bootstrap authority (see spec note above).
+            add(platform, extra.get("allowed_users"))
+            add(platform, extra.get("allow_from"))
         else:
             # Other platforms can opt into the same explicit ACL admin naming.
             # Chat allowlists and roles are intentionally ignored for bootstrap

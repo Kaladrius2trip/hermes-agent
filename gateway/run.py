@@ -6960,7 +6960,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.debug("PRIORITY photo follow-up for session %s — queueing without interrupt", _quick_key)
                 adapter = self.adapters.get(source.platform)
                 if adapter:
-                    merge_pending_message_event(adapter._pending_messages, _quick_key, event)
+                    _displaced = merge_pending_message_event(adapter._pending_messages, _quick_key, event)
+                    await self._notify_displaced_pending_event(_displaced)
                 return None
 
             _telegram_followup_grace = float(
@@ -6984,12 +6985,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if self._busy_input_mode == "queue":
                         self._enqueue_fifo(_quick_key, event, adapter)
                     else:
-                        merge_pending_message_event(
+                        _displaced = merge_pending_message_event(
                             adapter._pending_messages,
                             _quick_key,
                             event,
                             merge_text=True,
                         )
+                        await self._notify_displaced_pending_event(_displaced)
                 return None
 
             running_agent = self._running_agents.get(_quick_key)
@@ -7004,12 +7006,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # agent starts.
                 adapter = self.adapters.get(source.platform)
                 if adapter:
-                    merge_pending_message_event(
+                    _displaced = merge_pending_message_event(
                         adapter._pending_messages,
                         _quick_key,
                         event,
                         merge_text=True,
                     )
+                    await self._notify_displaced_pending_event(_displaced)
                 return None
             if self._draining:
                 if self._queue_during_drain_enabled():
@@ -9303,6 +9306,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "acl.allowed_tool_names": sorted(getattr(policy, "allowed_tool_names", set()) or []),
             "acl.bootstrap_super_admin": bool(getattr(policy, "bootstrap_super_admin", False)),
         }
+
+    async def _notify_displaced_pending_event(self, displaced) -> None:
+        """Tell a user whose queued pending turn was replaced by another
+        requester's message that it will not run (cross-requester pending
+        events are never merged for ACL reasons; silently dropping the
+        displaced turn was avoidable data loss — audit acl-008)."""
+        if displaced is None:
+            return
+        src = getattr(displaced, "source", None)
+        adapter = self.adapters.get(getattr(src, "platform", None)) if src else None
+        if adapter is None:
+            return
+        name = str(getattr(src, "user_name", "") or "").strip()
+        mention = f"{name}: " if name else ""
+        try:
+            await adapter.send(
+                src.chat_id,
+                f"⚠️ {mention}your queued message was replaced by a newer "
+                "message from another user and will not run. Send it again "
+                "when the agent is free.",
+                metadata=self._thread_metadata_for_source(src, None),
+            )
+        except Exception:
+            logger.debug("Failed to notify displaced pending-event user", exc_info=True)
 
     def _check_slash_access(
         self, source: SessionSource, canonical_cmd: str
@@ -12503,16 +12530,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not user_id:
             return False
 
-        chat_type = str(getattr(source, "chat_type", "") or "").lower()
-        is_dm = chat_type in {"", "dm", "direct", "private"}
+        # allowed_users / DISCORD_ALLOWED_USERS confer bootstrap super-admin
+        # authority per the ACL design spec, so they also receive private
+        # context. GATEWAY_ALLOWED_USERS is intentionally NOT consulted: it is
+        # a cross-platform chat allowlist whose IDs would conflate other
+        # platforms' users into Discord admin status.
         admin_ids = set(_coerce_string_list(platform_extra.get("allowed_users")))
         admin_ids.update(_coerce_string_list(os.getenv("DISCORD_ALLOWED_USERS", "")))
-        admin_ids.update(_coerce_string_list(os.getenv("GATEWAY_ALLOWED_USERS", "")))
-        if is_dm:
-            admin_ids.update(_coerce_string_list(platform_extra.get("allow_admin_from")))
-        else:
-            admin_ids.update(_coerce_string_list(platform_extra.get("allow_admin_from")))
-            admin_ids.update(_coerce_string_list(platform_extra.get("group_allow_admin_from")))
+        admin_ids.update(_coerce_string_list(platform_extra.get("acl_super_admins")))
+        admin_ids.update(_coerce_string_list(os.getenv("DISCORD_ACL_SUPER_ADMINS", "")))
+        admin_ids.update(_coerce_string_list(platform_extra.get("allow_admin_from")))
+        admin_ids.update(_coerce_string_list(platform_extra.get("group_allow_admin_from")))
         if user_id in admin_ids:
             return True
         return False

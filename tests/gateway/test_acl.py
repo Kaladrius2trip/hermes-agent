@@ -208,7 +208,11 @@ def test_unknown_user_denied_except_harmless_discovery_commands(tmp_path):
     assert policy.denied_reason == "no_acl_membership"
 
 
-def test_bootstrap_super_admins_come_from_explicit_admin_config_not_chat_allowlists(monkeypatch, tmp_path):
+def test_bootstrap_super_admins_include_legacy_allowlists_per_spec(monkeypatch, tmp_path):
+    """Per docs/superpowers/specs/2026-05-13-gateway-acl-design.md, users in
+    DISCORD_ALLOWED_USERS or platform allow_from ARE bootstrap super-admins —
+    otherwise every pre-ACL deployment is locked out of chat and of /acl
+    (audit agent-gateway-acl-004). Roles still never confer admin."""
     monkeypatch.setenv("DISCORD_ALLOWED_USERS", "env-owner, env-admin")
     monkeypatch.setenv("DISCORD_ACL_SUPER_ADMINS", "env-acl-admin")
     monkeypatch.setenv("DISCORD_ALLOWED_ROLES", "role-should-not-count")
@@ -231,9 +235,9 @@ def test_bootstrap_super_admins_come_from_explicit_admin_config_not_chat_allowli
     assert bootstrap.is_super_admin("discord", "env-acl-admin")
     assert bootstrap.is_super_admin("discord", "slash-admin")
     assert bootstrap.is_super_admin("discord", "group-admin")
-    assert not bootstrap.is_super_admin("discord", "env-owner")
-    assert not bootstrap.is_super_admin("discord", "cfg-owner")
-    assert not bootstrap.is_super_admin("discord", "chat-user")
+    assert bootstrap.is_super_admin("discord", "env-owner")
+    assert bootstrap.is_super_admin("discord", "cfg-owner")
+    assert bootstrap.is_super_admin("discord", "chat-user")
     assert not bootstrap.is_super_admin("discord", "role1")
     assert not bootstrap.is_super_admin("discord", "role-should-not-count")
 
@@ -265,9 +269,10 @@ def test_bootstrap_super_admins_come_from_explicit_admin_config_not_chat_allowli
         ),
         bootstrap=bootstrap,
     )
-    assert chat_allowlisted.can_chat is False
-    assert chat_allowlisted.bootstrap_super_admin is False
-    assert "acl" not in chat_allowlisted.allowed_slash_commands
+    # Legacy allowed_users entries are bootstrap super-admins per the spec.
+    assert chat_allowlisted.can_chat is True
+    assert chat_allowlisted.bootstrap_super_admin is True
+    assert "acl" in chat_allowlisted.allowed_slash_commands
 
     role_only = resolve_acl(
         ACLStore(tmp_path / "acl2.sqlite3"),
