@@ -3368,8 +3368,16 @@ def convert_flat_skill(
     output_dir: Optional[Union[str, Path]] = None,
     dry_run: bool = False,
     force: bool = False,
+    record: bool = True,
 ) -> Dict[str, Any]:
-    """Convert a legacy flat markdown skill to ``<output>/<name>/SKILL.md``."""
+    """Convert a legacy flat markdown skill to ``<output>/<name>/SKILL.md``.
+
+    When ``record`` is true and the target lands inside the live SKILLS_DIR,
+    the converted skill is registered in the hub lock file and audit log so
+    it can be listed, audited, uninstalled, and rolled back like any other
+    hub install. ``import_skill_path`` passes ``record=False`` because it
+    records its own IMPORT entry afterwards.
+    """
     source_path = Path(path).expanduser().resolve()
     report = doctor_skill_path(source_path)
     if report["kind"] != "flat_markdown":
@@ -3411,6 +3419,22 @@ def convert_flat_skill(
 
     target_dir.mkdir(parents=True, exist_ok=True)
     target_file.write_text(content, encoding="utf-8")
+    if record and output_root.resolve(strict=False) == SKILLS_DIR.resolve(strict=False):
+        HubLockFile().record_install(
+            name=skill_name,
+            source="local",
+            identifier=f"local:{source_path}",
+            trust_level=scan_result.trust_level,
+            scan_verdict=scan_result.verdict,
+            skill_hash=content_hash(target_dir),
+            install_path=install_rel_path,
+            files=_relative_skill_files(target_dir),
+            metadata={"converted_from": str(source_path), **(metadata or {})},
+        )
+        append_audit_log(
+            "CONVERT", skill_name, "local", scan_result.trust_level,
+            scan_result.verdict, str(source_path),
+        )
     return result
 
 
@@ -3470,7 +3494,7 @@ def import_skill_path(
     if report["kind"] == "flat_markdown":
         if not convert_flat:
             raise ValueError("flat_markdown skill pack requires --convert-flat before import")
-        converted = convert_flat_skill(source_path, output_dir=output_root, dry_run=dry_run, force=force)
+        converted = convert_flat_skill(source_path, output_dir=output_root, dry_run=dry_run, force=force, record=False)
         if dry_run:
             return {**converted, "status": "would_import", "kind": "flat_markdown"}
         source_path = Path(converted["target_path"]).parent.resolve()

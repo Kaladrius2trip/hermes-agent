@@ -992,6 +992,19 @@ def do_update(name: Optional[str] = None, console: Optional[Console] = None,
     for entry in updates:
         installed = lock.get_installed(entry["name"])
         category = _derive_category_from_install_path(installed.get("install_path", "")) if installed else ""
+        # Back up the current copy first so `hermes skills rollback` can
+        # actually revert the update (the rollback docstring promises
+        # update reversibility; do_install overwrites files in place).
+        if installed:
+            try:
+                from tools.skills_hub import _backup_installed_skill, _resolve_lock_install_path
+
+                install_path = _resolve_lock_install_path(
+                    installed.get("install_path", ""), entry["name"]
+                )
+                _backup_installed_skill(entry["name"], install_path, installed)
+            except Exception as exc:
+                c.print(f"[yellow]Warning:[/] pre-update backup failed for {entry['name']}: {exc}")
         c.print(f"[bold]Updating:[/] {entry['name']}")
         do_install(entry["identifier"], category=category, force=True, console=c)
 
