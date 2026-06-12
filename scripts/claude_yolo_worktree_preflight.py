@@ -94,6 +94,10 @@ class CheckResult:
     def is_warn(self) -> bool:
         return self.status == WARN
 
+    @property
+    def is_skip(self) -> bool:
+        return self.status == SKIP
+
 
 # --------------------------------------------------------------------------- #
 # Pure helpers (no subprocess / no mutation) -- unit-testable in isolation.
@@ -114,8 +118,12 @@ def parse_git_pointer(text: str) -> Optional[str]:
 
 
 def is_under(path: Path, prefixes: Sequence[str]) -> bool:
-    """True if ``path`` (as an absolute string) starts with any prefix."""
-    p = str(path)
+    """True if ``path`` (normalized, symlinks resolved) starts with any prefix.
+
+    Normalization matters: a pointer like ``/safe/dir/../../../root/.config``
+    must classify by its real target, not its lexical spelling.
+    """
+    p = os.path.realpath(str(path))
     return any(p == prefix.rstrip("/") or p.startswith(prefix) for prefix in prefixes)
 
 
@@ -127,7 +135,9 @@ def resolve_commondir(gitdir: Path, commondir_text: str) -> Path:
     value = commondir_text.strip()
     candidate = Path(value)
     if candidate.is_absolute():
-        return candidate
+        # Resolve absolute values too — '..' segments and symlinks must not
+        # let a root-only target classify as PASS by lexical comparison.
+        return Path(os.path.realpath(candidate))
     return (gitdir / candidate).resolve()
 
 
@@ -147,7 +157,7 @@ def classify_pointer(
             FAIL,
             ".git has no 'gitdir:' line (not a worktree pointer)",
         )
-    gp = Path(gitdir_path)
+    gp = Path(os.path.normpath(gitdir_path))
     if is_under(gp, root_prefixes):
         return CheckResult(
             "git-pointer",
@@ -173,13 +183,21 @@ def classify_pointer(
 
 
 def _default_runner(argv: Sequence[str]) -> "subprocess.CompletedProcess[str]":
-    return subprocess.run(
-        list(argv),
-        capture_output=True,
-        text=True,
-        timeout=60,
-        check=False,
-    )
+    try:
+        return subprocess.run(
+            list(argv),
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        # A hung runuser/git/hermes-command is exactly the failure mode this
+        # script diagnoses — surface it as a failed check, not a traceback.
+        return subprocess.CompletedProcess(
+            args=list(argv), returncode=124,
+            stdout="", stderr="timed out after 60s",
+        )
 
 
 def _first_output_line(text: str, fallback: str) -> str:
@@ -497,12 +515,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     fails = [r for r in results if r.is_fail]
     warns = [r for r in results if r.is_warn]
+    skips = [r for r in results if r.is_skip]
     print(
-        f"\nSummary: {len(results) - len(fails) - len(warns)} pass, "
-        f"{len(warns)} warn, {len(fails)} fail"
+        f"\nSummary: {len(results) - len(fails) - len(warns) - len(skips)} pass, "
+        f"{len(warns)} warn, {len(skips)} skip, {len(fails)} fail"
     )
 
-    if fails or (args.strict and warns):
+    # --strict: a SKIPped authoritative user-git-status means the one check
+    # that actually proves non-root readability never ran — that cannot count
+    # as success.
+    strict_skips = [
+        r for r in skips if args.strict and r.name in {"user-git-status", "safe-directory"}
+    ]
+    if fails or (args.strict and (warns or strict_skips)):
         return 1
     return 0
 

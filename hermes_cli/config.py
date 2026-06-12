@@ -1885,7 +1885,7 @@ DEFAULT_CONFIG = {
         "group_user_allowed_commands": "",  # Group slash commands non-admins may run
         "private_context_admin_only": False,  # Strip memory/SOUL/sensitive tools for non-admin Discord users
         "private_context_safe_toolsets": [
-            "web", "search", "code_execution", "vision", "image_gen", "tts", "clarify", "todo",
+            "web", "search", "vision", "image_gen", "tts", "clarify", "todo",
         ],
         "auto_thread": True,           # Auto-create threads on @mention in channels (like Slack)
         "thread_require_mention": False,  # If True, require @mention in threads too (multi-bot threads)

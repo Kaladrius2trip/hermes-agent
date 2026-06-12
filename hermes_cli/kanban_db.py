@@ -6702,6 +6702,26 @@ def _resolve_task_capability_profile(task: Task) -> Optional[dict[str, Any]]:
     if not name:
         return None
 
+    # Opt-in gate (matches the dashboard inspector's posture): capability
+    # metadata embedded in task bodies must not drive worker toolsets/model
+    # unless the operator enabled the capability workflow. Task bodies are a
+    # less-trusted surface than operator config — agents can write them.
+    try:
+        from hermes_cli import config as _hermes_config
+
+        _cfg = _hermes_config.load_config() or {}
+        _webui = _cfg.get("webui") or {}
+        _enabled = str(_webui.get("capability_inspector_enabled", False)).strip().lower() in {
+            "1", "true", "yes", "on",
+        }
+    except Exception:
+        _enabled = False
+    if not _enabled:
+        raise RuntimeError(
+            f"capability_profile {name!r} on task {task.id} ignored: capability "
+            "workflow is not enabled (set webui.capability_inspector_enabled: true)"
+        )
+
     raw_toolsets = meta.get("toolsets")
     if not isinstance(raw_toolsets, list):
         raise RuntimeError(

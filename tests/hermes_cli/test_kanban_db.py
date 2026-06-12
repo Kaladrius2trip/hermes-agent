@@ -2569,6 +2569,7 @@ class TestSharedBoardPaths:
         self._set_home(monkeypatch, tmp_path, default_home)
 
         monkeypatch.setattr(hermes_config, "load_config", lambda: {
+            "webui": {"capability_inspector_enabled": True},
             "capabilities": {
                 "profiles": {
                     "team-impl": {
@@ -2638,11 +2639,16 @@ class TestSharedBoardPaths:
     def test_dispatcher_rejects_profile_without_explicit_team_toolsets(
         self, tmp_path, monkeypatch
     ):
+        from hermes_cli import config as hermes_config
         from hermes_cli import team
 
         default_home = tmp_path / ".hermes"
         default_home.mkdir()
         self._set_home(monkeypatch, tmp_path, default_home)
+        monkeypatch.setattr(hermes_config, "load_config", lambda: {
+            "webui": {"capability_inspector_enabled": True},
+            "capabilities": {},
+        })
 
         body = team.embed_team_meta("body", {
             "version": team.TEAM_META_VERSION,
@@ -2682,6 +2688,7 @@ class TestSharedBoardPaths:
         default_home.mkdir()
         self._set_home(monkeypatch, tmp_path, default_home)
         monkeypatch.setattr(hermes_config, "load_config", lambda: {
+            "webui": {"capability_inspector_enabled": True},
             "capabilities": {
                 "profiles": {
                     "team-impl": {
@@ -2732,7 +2739,10 @@ class TestSharedBoardPaths:
         default_home = tmp_path / ".hermes"
         default_home.mkdir()
         self._set_home(monkeypatch, tmp_path, default_home)
-        monkeypatch.setattr(hermes_config, "load_config", lambda: {"capabilities": {}})
+        monkeypatch.setattr(hermes_config, "load_config", lambda: {
+            "webui": {"capability_inspector_enabled": True},
+            "capabilities": {},
+        })
         monkeypatch.setattr(cp, "resolve_capability_profile", lambda *a, **k: {
             "active": True,
             "profile": "team-impl",

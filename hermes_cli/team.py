@@ -254,14 +254,25 @@ def _member_spec(spec: dict, role: str) -> dict:
             f"invalid workspace {workspace!r} for {name!r}; "
             f"must be one of {sorted(_VALID_WORKSPACES)}"
         )
+    toolsets = list(spec.get("toolsets") or [])
+    capability_profile = spec.get("capability_profile") or None
+    if capability_profile and not toolsets:
+        # Fail at plan time: the dispatcher refuses capability_profile cards
+        # without explicit non-empty toolsets, so creating such cards only
+        # produces spawn failures until the card is auto-blocked.
+        raise ValueError(
+            f"member {name!r} sets capability_profile {capability_profile!r} "
+            "but has no toolsets; capability cards require an explicit "
+            "non-empty toolsets list"
+        )
     return {
         "name": name,
         "category": str(spec.get("category") or role),
-        "toolsets": list(spec.get("toolsets") or []),
+        "toolsets": toolsets,
         "readonly": bool(spec.get("readonly", False)),
         "workspace": workspace,
         "profile": spec.get("profile") or None,
-        "capability_profile": spec.get("capability_profile") or None,
+        "capability_profile": capability_profile,
         "skills": list(spec.get("skills") or []),
     }
 

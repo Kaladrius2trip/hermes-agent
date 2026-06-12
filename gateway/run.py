@@ -66,9 +66,12 @@ _AGENT_CACHE_IDLE_TTL_SECS = 3600.0  # evict agents idle for >1h
 _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
+# NOTE: code_execution is deliberately NOT in this set — execute_code runs a
+# real Python subprocess with full filesystem access, which would re-acquire
+# exactly the file/secret access the private-context gate strips from
+# non-admins. Operators can still opt in via private_context_safe_toolsets.
 _DISCORD_PRIVATE_CONTEXT_DEFAULT_SAFE_TOOLSETS = frozenset({
     "clarify",
-    "code_execution",
     "image_gen",
     "search",
     "todo",

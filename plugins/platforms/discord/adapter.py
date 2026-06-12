@@ -5459,6 +5459,33 @@ def _define_discord_view_classes() -> None:
                 )
                 return
 
+            # Resolve FIRST via the module-level primitive: a requester-bound
+            # confirm rejects clicks from anyone but the original requester
+            # WITHOUT consuming the pending entry, and the view must stay
+            # interactive in that case (otherwise the message falsely shows
+            # "Approved by <wrong user>" and the real requester can no longer
+            # answer via buttons).
+            try:
+                from tools import slash_confirm as _slash_confirm_mod
+                result_text = await _slash_confirm_mod.resolve_for_requester(
+                    self.session_key,
+                    self.confirm_id,
+                    choice,
+                    requester_platform="discord",
+                    requester_user_id=str(getattr(interaction.user, "id", "") or ""),
+                )
+            except Exception as exc:
+                logger.error("Discord slash-confirm resolve failed: %s", exc, exc_info=True)
+                await interaction.response.send_message(
+                    "Failed to resolve the confirmation — try the /approve text fallback.",
+                    ephemeral=True,
+                )
+                return
+
+            if result_text and "Only the requester" in result_text:
+                await interaction.response.send_message(result_text, ephemeral=True)
+                return
+
             self.resolved = True
 
             embed = interaction.message.embeds[0] if interaction.message.embeds else None
@@ -5471,17 +5498,7 @@ def _define_discord_view_classes() -> None:
 
             await interaction.response.edit_message(embed=embed, view=self)
 
-            # Resolve via the module-level primitive.  If the handler
-            # returns a follow-up message, post it in the same channel.
             try:
-                from tools import slash_confirm as _slash_confirm_mod
-                result_text = await _slash_confirm_mod.resolve_for_requester(
-                    self.session_key,
-                    self.confirm_id,
-                    choice,
-                    requester_platform="discord",
-                    requester_user_id=str(getattr(interaction.user, "id", "") or ""),
-                )
                 if result_text:
                     await interaction.followup.send(result_text)
                 logger.info(
@@ -5490,7 +5507,7 @@ def _define_discord_view_classes() -> None:
                     self.session_key, choice, interaction.user.display_name,
                 )
             except Exception as exc:
-                logger.error("Discord slash-confirm resolve failed: %s", exc, exc_info=True)
+                logger.error("Discord slash-confirm follow-up failed: %s", exc, exc_info=True)
 
         @discord.ui.button(label="Approve Once", style=discord.ButtonStyle.green)
         async def approve_once(
