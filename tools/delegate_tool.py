@@ -1036,19 +1036,33 @@ def _build_child_agent(
     parent_toolset_list = _parent_toolsets_for_delegation(parent_agent)
     parent_toolsets = set(parent_toolset_list)
 
+    # Category/profile scopes document "category ∩ parent ∩ caller-requested"
+    # as the safety guarantee — re-adding the parent's MCP toolsets past a
+    # narrowed scope would silently hand a read-only child arbitrary-
+    # capability MCP servers. MCP inheritance only applies to plain
+    # (non-category, non-profile) delegation.
+    _scope_narrowed = bool(
+        (delegation_category and delegation_category.get("category"))
+        or (capability_profile and capability_profile.get("active"))
+    )
     if toolsets is not None:
         # Intersect with parent — subagent must not gain tools the parent lacks.
         # Expand composite toolsets (e.g. hermes-cli) so that individual
         # toolset names (e.g. web, terminal) are recognised during intersection.
         expanded_parent = _expand_parent_toolsets(parent_toolsets)
         child_toolsets = [t for t in toolsets if t in expanded_parent]
-        if child_toolsets and _get_inherit_mcp_toolsets():
+        if child_toolsets and _get_inherit_mcp_toolsets() and not _scope_narrowed:
             child_toolsets = _preserve_parent_mcp_toolsets(
                 child_toolsets, parent_toolsets
             )
         child_toolsets = _strip_blocked_tools(child_toolsets)
     elif parent_agent and parent_toolsets:
         child_toolsets = _strip_blocked_tools(parent_toolset_list)
+    elif parent_agent and getattr(parent_agent, "enabled_toolsets", None) is not None:
+        # Parent explicitly has zero toolsets: the child gets zero too.
+        # Falling through to DEFAULT_TOOLSETS here would escalate a
+        # zero-privilege parent's child to terminal+file+web.
+        child_toolsets = []
     else:
         child_toolsets = _strip_blocked_tools(DEFAULT_TOOLSETS)
 
@@ -1285,6 +1299,9 @@ def _build_child_agent(
         child.allowed_tool_names = sorted(_allow - MUTATE_DENIED_TOOL_NAMES)
 
     child._print_fn = getattr(parent_agent, "_print_fn", None)
+    # The final scope actually given to the child (audit events record this,
+    # not the resolver output).
+    child._delegate_effective_toolsets = list(child_toolsets)
     # Set delegation depth so children can't spawn grandchildren
     child._delegate_depth = child_depth
     # Stash the post-degrade role for introspection (leaf if the
@@ -2241,7 +2258,10 @@ def delegate_task(
     parent_toolsets_for_categories = _parent_toolsets_for_delegation(parent_agent)
     task_runtimes: List[Dict[str, Any]] = []
     for i, task in enumerate(task_list):
-        task_toolsets = task.get("toolsets") if "toolsets" in task else toolsets
+        # Explicit null per-task toolsets means "no per-task narrowing" and
+        # must inherit the top-level restriction (model-generated JSON
+        # commonly emits explicit nulls); an explicit [] is meaningful.
+        task_toolsets = task["toolsets"] if task.get("toolsets") is not None else toolsets
         task_category = task.get("category") if "category" in task else category
         task_profile = task.get("profile") if "profile" in task else profile
         if not task_profile:
@@ -2336,6 +2356,15 @@ def delegate_task(
             )
         except DelegationCategoryConfigError as exc:
             return tool_error(str(exc))
+
+        # Fail fast when a category scope intersects to nothing instead of
+        # silently spawning a tool-less child that burns a full API run.
+        if task_category and resolved_category.get("toolsets") == []:
+            return tool_error(
+                f"Delegation category {task_category!r} resolves to an empty toolset scope: "
+                f"category ∩ parent {sorted(parent_toolsets_for_categories or [])} "
+                f"∩ requested {task_toolsets!r} is empty (code=empty_toolset_scope)."
+            )
 
         runtime_cfg = _config_for_resolved_category(cfg, resolved_category)
         try:
@@ -2668,7 +2697,15 @@ def delegate_task(
                     provider=creds.get("provider"),
                     model=creds.get("model") or getattr(child, "model", None),
                     base_url=creds.get("base_url"),
-                    toolsets=runtime.get("toolsets"),
+                    # Record the child's ACTUAL effective toolsets (after MCP
+                    # inheritance, role re-adds and blocked-tool strips), not
+                    # the pure resolver output — the audit bundle must not
+                    # misrepresent the child's capability scope.
+                    toolsets=(
+                        getattr(child, "_delegate_effective_toolsets", None)
+                        if child is not None
+                        else None
+                    ) or runtime.get("toolsets"),
                     child_timeout_seconds=runtime.get("child_timeout_seconds"),
                     max_iterations=runtime.get("max_iterations"),
                     status=entry.get("status"),

@@ -813,14 +813,20 @@ class TestDelegateTask(unittest.TestCase):
             }
             MockAgent.return_value = mock_child
 
-            delegate_task(
-                goal="web would escalate outside quick category",
-                category="quick",
-                toolsets=["web"],
-                parent_agent=parent,
+            result = json.loads(
+                delegate_task(
+                    goal="web would escalate outside quick category",
+                    category="quick",
+                    toolsets=["web"],
+                    parent_agent=parent,
+                )
             )
 
-        self.assertEqual(MockAgent.call_args.kwargs["enabled_toolsets"], [])
+        # An empty category ∩ requested intersection now fails fast at
+        # resolution instead of silently spawning a tool-less child
+        # (audit delegation-006).
+        self.assertIn("empty_toolset_scope", result.get("error", ""))
+        MockAgent.assert_not_called()
 
     def test_child_inherits_parent_print_fn(self):
         parent = _make_mock_parent(depth=0)

@@ -48,15 +48,17 @@ _AUDIT_FILENAME = "delegation-audit.jsonl"
 # secret, while "api_key", "OPENAI_API_KEY", "access_token", "client_secret",
 # and "authorization" all match.
 _SECRET_KEY_RE = re.compile(
-    r"(?:^|_)(?:"
+    # Anchors accept both underscore- and hyphen-separated key styles so
+    # HTTP-header-shaped keys (x-api-key, proxy-authorization) match too.
+    r"(?:^|[_-])(?:"
     r"api[_-]?key|apikey|"
     r"secret|client[_-]?secret|secret[_-]?value|raw[_-]?secret|"
     r"password|passwd|passphrase|"
     r"token|access[_-]?token|refresh[_-]?token|id[_-]?token|session[_-]?token|"
     r"auth[_-]?token|bearer|"
     r"credential|credentials|private[_-]?key|key[_-]?material|"
-    r"authorization|connection[_-]?string"
-    r")(?:$|_)",
+    r"authorization|connection[_-]?string|cookie|set[_-]?cookie"
+    r")(?:$|[_-])",
     re.IGNORECASE,
 )
 
