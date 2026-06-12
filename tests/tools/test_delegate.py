@@ -322,7 +322,9 @@ class TestChildSystemPrompt(unittest.TestCase):
         prompt = kwargs["ephemeral_system_prompt"]
         self.assertEqual(kwargs["provider"], "openrouter")
         self.assertEqual(kwargs["model"], "anthropic/claude-sonnet-4.5")
-        self.assertEqual(kwargs["enabled_toolsets"], ["file", "terminal"])
+        # mutate:false strips mutation-capable toolsets (terminal) from the
+        # child scope at runtime — audit cap-001 enforcement.
+        self.assertEqual(kwargs["enabled_toolsets"], ["file"])
         self.assertIn("## Capability Profile: safe-review", prompt)
         self.assertIn("### Responsibility", prompt)
         self.assertIn("Review changed files only", prompt)
@@ -712,7 +714,9 @@ class TestDelegateTask(unittest.TestCase):
         self.assertEqual(kwargs["provider"], "local-lmstudio")
         self.assertEqual(kwargs["model"], "qwen/qwen3.6-35b-a3b")
         self.assertEqual(kwargs["max_iterations"], 9)
-        self.assertEqual(kwargs["enabled_toolsets"], ["file", "terminal"])
+        # The default workspace policy is mutate:false, so the runtime strip
+        # removes terminal from the child scope (audit cap-001).
+        self.assertEqual(kwargs["enabled_toolsets"], ["file"])
         self.assertEqual(
             kwargs["fallback_model"],
             [{"provider": "openrouter", "model": "anthropic/claude-haiku"}],

@@ -63,6 +63,15 @@ DELEGATE_BLOCKED_TOOLS = frozenset(
     ]
 )
 
+# Runtime enforcement surface for capability profiles with
+# workspace_policy.mutate=false: concrete mutation tools stripped from the
+# child's tool schemas, and toolsets that allow arbitrary mutation (shell,
+# sandboxed code, desktop control) removed from the child scope entirely.
+MUTATE_DENIED_TOOL_NAMES = frozenset(["write_file", "patch"])
+_MUTATION_CAPABLE_TOOLSETS = frozenset(
+    ["terminal", "code_execution", "computer_use", "homeassistant"]
+)
+
 
 # ---------------------------------------------------------------------------
 # Subagent approval callbacks
@@ -1050,6 +1059,25 @@ def _build_child_agent(
     if effective_role == "orchestrator" and "delegation" not in child_toolsets:
         child_toolsets.append("delegation")
 
+    # Runtime enforcement of workspace_policy.mutate=false (capability
+    # profiles): mutation-capable toolsets are removed from the child scope
+    # here, and the concrete mutation tools are stripped from the constructed
+    # child's tool surface below. Without this the policy was prompt-only.
+    mutate_denied = bool(
+        capability_profile
+        and isinstance(capability_profile.get("workspace_policy"), dict)
+        and capability_profile["workspace_policy"].get("mutate") is False
+    )
+    if mutate_denied:
+        _removed_toolsets = [t for t in child_toolsets if t in _MUTATION_CAPABLE_TOOLSETS]
+        if _removed_toolsets:
+            logger.warning(
+                "Capability profile %s has mutate=false; removing mutation-capable toolsets %s from child scope",
+                (capability_profile or {}).get("profile") or "?",
+                _removed_toolsets,
+            )
+            child_toolsets = [t for t in child_toolsets if t not in _MUTATION_CAPABLE_TOOLSETS]
+
     workspace_hint = _resolve_workspace_hint(parent_agent)
     child_prompt = _build_child_system_prompt(
         goal,
@@ -1232,6 +1260,30 @@ def _build_child_agent(
         tool_progress_callback=child_progress_cb,
         iteration_budget=None,  # fresh budget per subagent
     )
+    if mutate_denied:
+        # Strip mutation tools from the constructed child's tool surface and
+        # pin the remaining names as the ACL whitelist so the dispatch-layer
+        # backstop also denies them (capability profile mutate=false is a
+        # runtime guarantee, not just prompt text — audit cap-001).
+        child.tools = [
+            tool_def
+            for tool_def in (getattr(child, "tools", None) or [])
+            if (tool_def.get("function") or {}).get("name") not in MUTATE_DENIED_TOOL_NAMES
+        ]
+        if getattr(child, "valid_tool_names", None):
+            child.valid_tool_names = {
+                tool_name
+                for tool_name in child.valid_tool_names
+                if tool_name not in MUTATE_DENIED_TOOL_NAMES
+            }
+        _surface_names = {
+            (tool_def.get("function") or {}).get("name")
+            for tool_def in (getattr(child, "tools", None) or [])
+        } - {None, ""}
+        _existing_allow = getattr(child, "allowed_tool_names", None)
+        _allow = set(_existing_allow) if _existing_allow is not None else _surface_names
+        child.allowed_tool_names = sorted(_allow - MUTATE_DENIED_TOOL_NAMES)
+
     child._print_fn = getattr(parent_agent, "_print_fn", None)
     # Set delegation depth so children can't spawn grandchildren
     child._delegate_depth = child_depth

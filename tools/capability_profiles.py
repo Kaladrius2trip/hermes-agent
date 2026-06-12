@@ -480,10 +480,24 @@ def _profile_spec(
 
     builtins = _builtins()
     base = builtins.get(name, {})
-    override = config_profiles.get(name) or {}
-    if not isinstance(override, Mapping):
+    override = config_profiles.get(name)
+    if override is None:
         override = {}
+    if not isinstance(override, Mapping):
+        # A malformed body (string, list, ...) must be a structured config
+        # error, not a silently-empty profile (and not a raw ValueError when
+        # the resolver later re-reads it).
+        raise CapabilityProfileConfigError(
+            f"Capability profile {name!r} body must be a mapping",
+            code="invalid_profile_body",
+            profile=name,
+            valid_profiles=profile_names,
+        )
     spec = _deep_merge(base, override)
+    # Track whether 'category' was contributed by user config (directly or via
+    # a user-defined extends parent) so unknown categories fail closed for the
+    # whole chain, not only for the directly-overridden profile.
+    user_set_category = "category" in override
     parent_name = spec.get("extends")
     if parent_name:
         parent_key = str(parent_name)
@@ -501,7 +515,14 @@ def _profile_spec(
             stack=path + [name],
             valid_profiles=profile_names,
         )
-        spec = _deep_merge(parent_spec, {k: v for k, v in spec.items() if k != "extends"})
+        parent_user_category = bool(parent_spec.pop("_category_from_user", False))
+        spec = _deep_merge(
+            parent_spec,
+            {k: v for k, v in spec.items() if k not in ("extends", "_category_from_user")},
+        )
+        if not user_set_category and "category" not in base:
+            user_set_category = parent_user_category
+    spec["_category_from_user"] = user_set_category
     return spec
 
 
@@ -765,6 +786,24 @@ def _normalise_prompt_sections(value: Any, *, profile: str) -> Dict[str, Any]:
             field="prompt_sections",
         )
     result = copy.deepcopy(dict(value))
+    # External prompt imports get their specific error before the generic
+    # unknown-key rejection below.
+    _assert_no_external_prompt_imports(result, profile=profile)
+    # Only the 'recipe' key is rendered into the child prompt. Inline
+    # sections and any other keys were previously accepted but silently
+    # dropped — an operator writing inline guard text believed it
+    # constrained the child while it never reached the prompt. Reject
+    # unknown keys so the gap is loud instead of a silent security no-op.
+    unknown_keys = sorted(str(k) for k in result if str(k) != "recipe")
+    if unknown_keys:
+        raise CapabilityProfileConfigError(
+            f"Capability profile {profile!r} prompt_sections supports only the "
+            f"'recipe' key; unsupported keys {', '.join(unknown_keys)} would be "
+            "silently dropped and never reach the child prompt",
+            code="invalid_prompt_sections",
+            profile=profile,
+            field="prompt_sections",
+        )
     recipe = result.get("recipe")
     if recipe and str(recipe) not in set(list_builtin_recipes()):
         raise CapabilityProfileConfigError(
@@ -808,6 +847,45 @@ def _plain_identifier(value: Any, *, profile: str, field: str) -> str:
             field=field,
         )
     return value
+
+
+def _validate_budget(value: Any, *, profile: str) -> None:
+    if value is None:
+        return
+    if not isinstance(value, Mapping):
+        raise CapabilityProfileConfigError(
+            f"Capability profile {profile!r} budget must be a mapping",
+            code="invalid_budget",
+            profile=profile,
+            field="budget",
+        )
+    for key, item in value.items():
+        key_text = str(key)
+        if key_text not in DEFAULT_BUDGET:
+            raise CapabilityProfileConfigError(
+                f"Capability profile {profile!r} has unknown budget key {key_text!r}",
+                code="invalid_budget",
+                profile=profile,
+                field=f"budget.{key_text}",
+            )
+        if item is None or item == "":
+            continue
+        if key_text == "reasoning_effort":
+            if not isinstance(item, str):
+                raise CapabilityProfileConfigError(
+                    f"Capability profile {profile!r} budget.reasoning_effort must be a string",
+                    code="invalid_budget",
+                    profile=profile,
+                    field="budget.reasoning_effort",
+                )
+            continue
+        if isinstance(item, bool) or not isinstance(item, (int, float)) or item <= 0:
+            raise CapabilityProfileConfigError(
+                f"Capability profile {profile!r} budget.{key_text} must be a positive number",
+                code="invalid_budget",
+                profile=profile,
+                field=f"budget.{key_text}",
+            )
 
 
 def _merge_budget(*parts: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
@@ -911,6 +989,7 @@ def resolve_capability_profile(
         )
 
     spec = _profile_spec(name, config_profiles, valid_profiles=valid_profiles)
+    category_from_user = bool(spec.pop("_category_from_user", False))
     _validate_no_secret_fields(spec, profile=name)
     _validate_profile_allowed_keys(spec, profile=name)
 
@@ -929,8 +1008,8 @@ def resolve_capability_profile(
     category_toolsets: Optional[List[str]] = None
     category_fallbacks: List[Dict[str, Any]] = []
     category_exists = category_name in dict((delegation_config or {}).get("categories") or {})
-    explicit_user_category = category_name and (
-        category_override_requested or "category" in dict(config_profiles.get(name) or {})
+    explicit_user_category = bool(category_name) and (
+        category_override_requested or category_from_user
     )
     if category_name and category_exists:
         try:
@@ -994,6 +1073,8 @@ def resolve_capability_profile(
         valid_profiles=valid_profiles,
         allowed_toolsets=effective_toolsets,
     )
+
+    _validate_budget(spec.get("budget"), profile=name)
 
     workspace_policy = _merge_mapping(DEFAULT_WORKSPACE_POLICY, spec.get("workspace_policy"))
     if workspace_policy.get("kind") not in _WORKSPACE_KINDS:

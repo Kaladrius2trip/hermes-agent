@@ -763,10 +763,10 @@ def test_render_capability_profile_prompt_refuses_external_prompt_imports():
             }
         }
     }
-    resolved = resolve_capability_profile(capabilities, profile="unsafe")
-
+    # The import attempt now fails at resolve time (before any child spawn),
+    # not only when the prompt is rendered.
     with pytest.raises(CapabilityProfileConfigError) as excinfo:
-        render_capability_profile_prompt(resolved, goal="Review diff")
+        resolve_capability_profile(capabilities, profile="unsafe")
 
     assert excinfo.value.code == "external_prompt_import"
     assert excinfo.value.field == "prompt_sections.copy_from"

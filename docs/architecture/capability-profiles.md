@@ -117,14 +117,14 @@ capabilities:
 | `extends` | string | none | Optional parent profile. Parent fields merge first, child overrides. Loops, unknown parents, and chains deeper than 32 profiles fail closed before any child spawn. |
 | `enabled` | bool | `true` | `false` disables the profile and returns `disabled_profile` before any child spawn. |
 | `category` | string | none | Optional legacy delegation-category reference. Category routing may seed provider/model/budget/toolset defaults; profile fields then narrow or override. Unknown or disabled categories fail closed. |
-| `prompt_sections` | recipe-ref \| list | `readonly-advisor` | Either `recipe: <name>` (a built-in from `agent_recipes.py`) or an inline ordered list of `{id, title, body, required}` sections rendered by `render_agent_recipe`. Inline sections may only *add* boundaries, never remove the base scope/role/verification sections. |
+| `prompt_sections` | recipe-ref | `readonly-advisor` | `recipe: <name>` referencing a built-in from `agent_recipes.py`. Only the `recipe` key is supported; any other key (including inline section lists) is rejected at resolution time so unrendered guard text can never be silently dropped. |
 | `allowed_toolsets` | list[str] | `[]` (no tools) | Upper bound on tool scope. Resolved with `toolsets_mode: intersect` only — effective scope is `profile ∩ parent ∩ caller-requested`, order preserved. A profile can only ever **narrow**. |
 | `model` / `provider` | string | inherit parent | Plain identifiers only — never credentials, URLs/schemes, schemeless authorities, whitespace/control chars, or shell interpolation. Empty inherits the parent's resolved model/provider/credential pool. |
 | `budget` | mapping | inherits legacy caps until enforcement | `{reasoning_effort, max_iterations, child_timeout_seconds}`. Bounds runtime cost once child-spawn enforcement lands. Phase 13.1 resolver preserves existing unset-category behavior (`None`/inherit) for backward compatibility; enforcement phases must set concrete caps before using a profile for spawning. |
-| `workspace_policy` | mapping | `{kind: scratch, mutate: false}` | `kind` ∈ `scratch \| worktree \| dir`; `mutate` gates whether the child may write. Read-only profiles set `mutate: false`; runtime dispatch denies mutation tools (`write_file`, `patch`, destructive terminal commands) even if a broad read surface such as `file` is present. |
+| `workspace_policy` | mapping | `{kind: scratch, mutate: false}` | `kind` ∈ `scratch \| worktree \| dir`; `mutate` gates whether the child may write. For `mutate: false` the child spawn path strips the mutation tools (`write_file`, `patch`) from the child's tool surface and removes mutation-capable toolsets (`terminal`, `code_execution`, `computer_use`, `homeassistant`) from its scope. Fine-grained denial of individual destructive terminal commands is NOT implemented — the whole shell surface is withheld instead. |
 | `verification_policy` | mapping | `{require_evidence: true}` | What the child must do before claiming success: `require_evidence`, optional `commands` (named, advisory), and `on_unverifiable` ∈ `report \| fail`. Mirrors the recipe's *Verification Gates* section, made declarative. |
 | `handoff_schema` | mapping | minimal summary | Structured fields the child must return: `changed_files`, `commands_run`, `findings`, `blockers`, plus any profile-specific keys. Drives the parent-visible summary; nothing else enters the parent context. |
-| `approval_gates` | list[str] | `[push, merge, publish, send_message]` | Actions that require explicit human approval before the child may perform them. Fail-closed: an action on this list is denied unless an operator approves. |
+| `approval_gates` | list[str] | `[push, merge, publish, send_message]` | **Advisory prompt contract + audit metadata (not yet runtime-enforced).** Gate names are validated, rendered into the child prompt, and recorded for audit/team metadata, but there is no tool-dispatch hook that blocks these actions pending approval. The only runtime gate today is the generic dangerous-command approval (`tools/approval.py`), which catches force pushes and similar destructive shell patterns — a child with `terminal` access can plain `git push` without a prompt. Treat gates as policy you must back with toolset scope (e.g. omit `terminal`/`messaging`) until enforcement lands. |
 | `fallbacks` | list | `[]` | Ordered `{provider, model}` candidates tried on a *retryable transport/availability* error only (auth, model-not-found, timeout, rate limit) — never on a model-produced task failure. An entry may include `profile` or a narrowed `allowed_toolsets` list, but no other keys. Provider/model/profile values must be plain identifiers: no env interpolation, URLs/schemes, headers, API keys, tokens, or secret-like fields. String values anywhere in a profile are rejected if they contain shell-style env/command interpolation (`${VAR}`, `${VAR:-default}`, `$VAR`, `%VAR%`, `$(...)`, backticks; Unicode-normalized before scan). An entry may narrow but never widen the final effective toolset scope. |
 
 ### Built-in profile pack
@@ -281,8 +281,11 @@ The implemented layer still **does not** add:
    identity. Renaming a profile must never change what it can do.
 3. **No live side effects by default.** A profile with no explicit grants runs
    read-only, in a scratch workspace, with the full `approval_gates` list
-   active. Every outward action (push, merge, publish, send) is fail-closed and
-   requires explicit approval. Profiles cannot widen scope — only narrow it.
+   recorded. Outward actions are prevented by the empty default toolset scope
+   (`allowed_toolsets: []`) and the `mutate: false` runtime strip — not by a
+   per-action approval gate; `approval_gates` is an advisory contract plus
+   audit metadata until dispatch-level enforcement lands. Profiles cannot
+   widen scope — only narrow it.
 4. **No new spawning path, daemon, or inbound remote channel.** Profiles ride on
    `delegate_task` and the existing Kanban; they add no listener and no network
    trigger surface.
