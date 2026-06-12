@@ -2718,6 +2718,40 @@ def delegate_task(
         except Exception:
             logger.debug("delegation audit event build failed", exc_info=True)
 
+    # Kanban delegation visibility: when this parent runs as a kanban worker
+    # (dispatcher injects HERMES_KANBAN_TASK / HERMES_KANBAN_RUN_ID), persist a
+    # delegation-tree snapshot as a task_events row so the dashboards and the
+    # WebUI kanban panel can show what delegation happened on the card — the
+    # existing event streams broadcast it with no transport changes.
+    _kanban_task_id = os.getenv("HERMES_KANBAN_TASK", "").strip()
+    if _kanban_task_id:
+        try:
+            from hermes_cli import kanban_db as _kanban_db
+
+            _run_id_raw = os.getenv("HERMES_KANBAN_RUN_ID", "").strip()
+            _tree = []
+            for entry in results[:50]:
+                idx = int(entry.get("task_index", 0) or 0)
+                runtime = task_runtimes[idx] if idx < len(task_runtimes) else {}
+                child = children[idx][2] if idx < len(children) else None
+                task = task_list[idx] if idx < len(task_list) else {}
+                _tree.append({
+                    "subagent_id": getattr(child, "_subagent_id", None),
+                    "parent_id": getattr(child, "_parent_subagent_id", None),
+                    "goal_preview": str(task.get("goal") or "")[:160],
+                    "model": getattr(child, "model", None),
+                    "toolsets": getattr(child, "_delegate_effective_toolsets", None),
+                    "status": entry.get("status"),
+                    "duration_seconds": entry.get("duration_seconds"),
+                })
+            _kanban_db.record_delegation_event(
+                _kanban_task_id,
+                {"agents": _tree, "count": len(results), "total_duration_seconds": total_duration},
+                run_id=int(_run_id_raw) if _run_id_raw.isdigit() else None,
+            )
+        except Exception:
+            logger.debug("kanban delegation event write failed", exc_info=True)
+
     return json.dumps(
         {
             "results": results,

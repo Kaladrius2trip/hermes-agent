@@ -2721,6 +2721,33 @@ def _append_event(
     )
 
 
+def record_delegation_event(
+    task_id: str,
+    payload: Optional[dict] = None,
+    *,
+    run_id: Optional[int] = None,
+    kind: str = "delegation",
+    board: Optional[str] = None,
+) -> bool:
+    """Record a delegation telemetry event from a worker process.
+
+    Workers call this (via tools/delegate_tool.py) when HERMES_KANBAN_TASK is
+    set, so the kanban UIs can show what delegation happened on a card — both
+    live (the event streams already broadcast every task_events row) and
+    post-hoc in the detail panel. Opens its own short-lived connection (WAL
+    handles dispatcher concurrency) and never raises: delegation must not
+    fail because telemetry could not be written.
+    """
+    try:
+        with connect_closing(board=board) as conn:
+            with conn:
+                _append_event(conn, task_id, kind, payload, run_id=run_id)
+        return True
+    except Exception:
+        _log.debug("record_delegation_event failed for task %s", task_id, exc_info=True)
+        return False
+
+
 def _end_run(
     conn: sqlite3.Connection,
     task_id: str,
@@ -7622,6 +7649,41 @@ def worker_log_path(task_id: str, *, board: Optional[str] = None) -> Path:
     board explicitly to avoid any resolution ambiguity when multiple
     boards exist."""
     return worker_logs_dir(board=board) / f"{task_id}.log"
+
+
+def read_worker_log_chunk(
+    task_id: str, *, offset: int = 0, max_bytes: int = 65536,
+    board: Optional[str] = None,
+) -> Optional[dict]:
+    """Incrementally read the worker log for live tailing.
+
+    Returns ``{"content", "offset", "size", "rotated"}`` where ``offset`` is
+    the position to pass on the next poll. ``rotated`` is True when the
+    caller's offset exceeded the current file size (log rotated/truncated
+    mid-follow) — the read restarts from 0 in that case. Returns None when
+    the log file doesn't exist.
+    """
+    path = worker_log_path(task_id, board=board)
+    if not path.exists():
+        return None
+    try:
+        size = path.stat().st_size
+        offset = max(0, int(offset or 0))
+        rotated = offset > size
+        if rotated:
+            offset = 0
+        with open(path, "rb") as f:
+            f.seek(offset)
+            data = f.read(max(0, int(max_bytes)))
+            new_offset = f.tell()
+        return {
+            "content": data.decode("utf-8", errors="replace"),
+            "offset": new_offset,
+            "size": size,
+            "rotated": rotated,
+        }
+    except (OSError, ValueError):
+        return None
 
 
 def read_worker_log(
