@@ -658,7 +658,10 @@ async def test_gateway_text_approve_for_acl_confirm_is_requester_bound(tmp_path)
     )
 
     assert isinstance(output, str)
-    assert "Only the requester" in output
+    # The intruder is now stopped by the pre-intercept ACL gate (audit
+    # acl-003) before requester binding even gets a chance to reject —
+    # either denial is acceptable as long as the pending confirm survives.
+    assert "Only the requester" in output or "denied by ACL" in output
     assert runner.acl_store is not None
     assert runner.acl_store.list_memberships(
         platform="discord", subject_type="user", subject_id="u1"

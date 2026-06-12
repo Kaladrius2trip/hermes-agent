@@ -6538,6 +6538,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                 _update_prompts.pop(_quick_key, None)
 
+        # ACL gate for the pre-dispatch intercepts below (clarify and
+        # slash-confirm). Both resolve state that belongs to a privileged
+        # running agent, so a user the ACL denies must never reach them even
+        # when legacy authorization admitted the message (channel/guild
+        # allowlists, adapter-trust deployments). Denied users simply fall
+        # through to normal dispatch, where the chat/command gates produce
+        # the denial message.
+        _intercept_acl_denied = None
+        if not is_internal:
+            _intercept_acl_denied = self._check_acl_access(source, None)
+
         # Intercept messages that are responses to a pending clarify
         # request that is awaiting free-form text (either an open-ended
         # clarify with no choices, or one where the user picked the
@@ -6549,7 +6560,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _pending_clarify = _clarify_mod.get_pending_for_session(_quick_key)
         except Exception:
             _pending_clarify = None
-        if _pending_clarify is not None:
+        if _pending_clarify is not None and _intercept_acl_denied is None:
             _raw_clarify_reply = (event.text or "").strip()
             # Skip slash commands — the user clearly wanted to issue a
             # command, not answer the clarify.  Leave the clarify pending
@@ -6587,7 +6598,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _tool_approval_live = has_blocking_approval(_quick_key)
         except Exception:
             _tool_approval_live = False
-        if _pending_confirm and not _tool_approval_live:
+        if _pending_confirm and not _tool_approval_live and _intercept_acl_denied is None:
             _raw_reply = (event.text or "").strip()
             _cmd_reply = event.get_command()
             _confirm_choice = None
@@ -6680,8 +6691,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if _quick_key in self._running_agents:
             if event.get_command() == "status":
                 # /status is intentionally pre-gate on the running-agent
-                # fast-path so users can inspect session state even when
-                # slash command access is otherwise restricted.
+                # fast-path with respect to the legacy slash-access policy so
+                # users can inspect session state even when slash command
+                # access is otherwise restricted — but ACL-denied users must
+                # not read session state (the cold path ACL-gates /status;
+                # the fast path must match or it leaks session info exactly
+                # when another user's agent is busy).
+                if not is_internal:
+                    _denied = self._check_acl_access(source, "status")
+                    if _denied is not None:
+                        return _denied
                 return await self._handle_status_command(event)
 
             # Resolve the command once for all early-intercept checks below.
@@ -10274,6 +10293,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 skip_context_files,
                 _privacy_restricted,
             ) = self._discord_effective_agent_privacy(source, enabled_toolsets)
+            # Background agents must run under the requester's ACL tool policy
+            # — without this a user granted only cmd:background would get the
+            # platform's full toolset (terminal, file, ...) via /background.
+            # Mirrors the _run_agent gate.
+            allowed_tool_names = None
+            if source.platform == Platform.DISCORD and getattr(self, "acl_store", None) is not None:
+                acl_policy = self._resolve_acl_policy_for_source(source)
+                if not getattr(acl_policy, "can_chat", False):
+                    await adapter.send(
+                        source.chat_id,
+                        self._check_acl_access(source, None, policy=acl_policy) or "⛔ Chat denied by ACL.",
+                        metadata=_thread_metadata,
+                    )
+                    return
+                allowed_tool_names = sorted(getattr(acl_policy, "allowed_tool_names", set()) or [])
             agent_cfg = user_config.get("agent") or {}
             disabled_toolsets = agent_cfg.get("disabled_toolsets") or None
 
@@ -10312,6 +10346,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     skip_context_files=skip_context_files,
                     enabled_toolsets=enabled_toolsets,
                     disabled_toolsets=disabled_toolsets,
+                    allowed_tool_names=allowed_tool_names,
                     reasoning_config=reasoning_config,
                     service_tier=self._service_tier,
                     request_overrides=turn_route.get("request_overrides"),
@@ -11092,9 +11127,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         title: str,
         message: str,
         handler,
-        requester_bound: bool = False,
+        requester_bound: bool = True,
     ) -> Optional[str]:
         """Ask the user to confirm an expensive slash command.
+
+        Requester binding is the default: only the platform user who
+        triggered the confirmable command can approve or cancel it, so
+        another user in a shared channel cannot resolve someone else's
+        pending confirm (e.g. a destructive /new reset) with the original
+        requester's authority.
 
         ``handler`` is an async callable ``handler(choice: str) -> str``
         where ``choice`` is ``"once"``, ``"always"``, or ``"cancel"``.

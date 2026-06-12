@@ -178,6 +178,7 @@ async def test_resolve_once_runs_execute_and_returns_result():
 
     resolved = await _slash_confirm_mod.resolve(
         session_key, pending["confirm_id"], "once",
+        requester_platform="telegram", requester_user_id="u1",
     )
 
     execute.assert_awaited_once()
@@ -211,6 +212,7 @@ async def test_resolve_cancel_does_not_run_execute():
 
     resolved = await _slash_confirm_mod.resolve(
         session_key, pending["confirm_id"], "cancel",
+        requester_platform="telegram", requester_user_id="u1",
     )
 
     execute.assert_not_awaited()
@@ -252,6 +254,7 @@ async def test_resolve_always_persists_opt_out_and_runs_execute(monkeypatch):
     assert pending is not None
     resolved = await _slash_confirm_mod.resolve(
         session_key, pending["confirm_id"], "always",
+        requester_platform="telegram", requester_user_id="u1",
     )
 
     execute.assert_awaited_once()
