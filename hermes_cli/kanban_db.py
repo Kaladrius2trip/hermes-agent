@@ -3957,7 +3957,40 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
 
 
 def _cleanup_worker_tmux(conn: sqlite3.Connection, task_id: str) -> None:
-    """Kill the tmux session associated with a task's assignee, if dead."""
+    """Kill dead tmux sessions associated with a task's worker.
+
+    Handles both the per-task ``kanban-{task_id}`` sessions created by the
+    opt-in tmux spawn path (with a final pane snapshot before kill) and the
+    legacy ``swarm-{assignee}`` naming convention.
+    """
+    # Per-task session from the worker_tmux spawn path.
+    try:
+        session = f"kanban-{task_id}"
+        out = subprocess.run(
+            ["tmux", "list-panes", "-t", session, "-F", "#{pane_dead}"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if out.returncode == 0 and out.stdout.strip() == "1":
+            # Belt-and-braces: snapshot the last screenful before the session
+            # (and its scrollback) disappears.
+            try:
+                snap = subprocess.run(
+                    ["tmux", "capture-pane", "-t", session, "-p", "-S", "-2000"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                if snap.returncode == 0 and snap.stdout.strip():
+                    final_path = worker_logs_dir() / f"{task_id}.pane.final.txt"
+                    final_path.parent.mkdir(parents=True, exist_ok=True)
+                    final_path.write_text(snap.stdout, encoding="utf-8")
+            except Exception:
+                pass
+            subprocess.run(
+                ["tmux", "kill-session", "-t", session],
+                capture_output=True, timeout=5,
+            )
+            _log.debug("Killed stale tmux session: %s", session)
+    except Exception:
+        pass  # best-effort — never block completion
     try:
         row = conn.execute(
             "SELECT assignee FROM tasks WHERE id = ?", (task_id,)
@@ -6979,6 +7012,17 @@ def _default_spawn(
     rotate_bytes, backup_count = worker_log_rotation_config()
     _rotate_worker_log(log_path, rotate_bytes, backup_count)
 
+    # Opt-in tmux path: full terminal capture (pipe-pane) + attachable
+    # session `kanban-{task_id}` for live inspection of Claude Code workers.
+    if worker_tmux_enabled() and not _IS_WINDOWS and shutil.which("tmux"):
+        pane_pid = _spawn_worker_tmux(
+            cmd, task=task, workspace=workspace, env=env,
+            log_path=log_path, board=board,
+        )
+        if pane_pid:
+            return pane_pid
+        # tmux failed — fall through to the plain Popen path.
+
     # Use 'a' so a re-run on unblock appends rather than overwrites.
     log_f = open(log_path, "ab")
     try:
@@ -7004,6 +7048,80 @@ def _default_spawn(
     # reference goes out of scope and is GC'd, but the OS-level FD stays
     # open in the child until the child exits.
     return proc.pid
+
+
+def worker_tmux_enabled(kanban_cfg: Optional[dict] = None) -> bool:
+    """True when workers should run inside capturable tmux sessions.
+
+    Opt-in via ``kanban.worker_tmux: true`` (config.yaml) or
+    ``HERMES_KANBAN_WORKER_TMUX=1``. Default off: the tmux path changes PID
+    semantics (pane pid vs Popen pid) and needs a tmux server in the
+    dispatcher's environment.
+    """
+    env_raw = os.environ.get("HERMES_KANBAN_WORKER_TMUX", "").strip().lower()
+    if env_raw in {"1", "true", "yes", "on"}:
+        return True
+    if env_raw in {"0", "false", "no", "off"}:
+        return False
+    if kanban_cfg is None:
+        try:
+            from hermes_cli.config import load_config
+
+            kanban_cfg = (load_config().get("kanban") or {})
+        except Exception:
+            kanban_cfg = {}
+    return str((kanban_cfg or {}).get("worker_tmux", "")).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def worker_pane_log_path(task_id: str, *, board: Optional[str] = None) -> Path:
+    """Sidecar capturing the worker's full terminal output via tmux pipe-pane.
+
+    Unlike the stdout redirect in ``<task_id>.log``, the pane log contains
+    everything the process printed to the terminal — including interactive
+    Claude Code output that a plain file redirect would swallow.
+    """
+    return worker_logs_dir(board=board) / f"{task_id}.pane.log"
+
+
+def _spawn_worker_tmux(cmd, *, task, workspace, env, log_path, board=None):
+    """Spawn the worker inside ``tmux session kanban-{task_id}`` with pipe-pane capture.
+
+    Returns the pane PID (used exactly like the Popen pid by heartbeat/reclaim
+    logic) or None when tmux is unavailable — the caller falls back to Popen.
+    """
+    import shlex
+
+    session = f"kanban-{task.id}"
+    pane_log = worker_pane_log_path(task.id, board=board)
+    try:
+        subprocess.run(["tmux", "kill-session", "-t", session],
+                       capture_output=True, timeout=10, check=False)
+        new_cmd = ["tmux", "new-session", "-d", "-s", session]
+        for key, value in env.items():
+            if key.startswith("HERMES_"):
+                new_cmd.extend(["-e", f"{key}={value}"])
+        if workspace and os.path.isdir(workspace):
+            new_cmd.extend(["-c", workspace])
+        shell_cmd = " ".join(shlex.quote(str(part)) for part in cmd)
+        # Mirror stdout into the regular worker log too so `hermes kanban log`
+        # and the offset-tail endpoints keep working identically.
+        new_cmd.append(f"{shell_cmd} >> {shlex.quote(str(log_path))} 2>&1")
+        result = subprocess.run(new_cmd, capture_output=True, text=True, timeout=15, check=False, env=env)
+        if result.returncode != 0:
+            return None
+        subprocess.run(
+            ["tmux", "pipe-pane", "-o", "-t", session,
+             f"cat >> {shlex.quote(str(pane_log))}"],
+            capture_output=True, timeout=10, check=False,
+        )
+        pid_out = subprocess.run(
+            ["tmux", "list-panes", "-t", session, "-F", "#{pane_pid}"],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+        pane_pid = (pid_out.stdout or "").strip().splitlines()
+        return int(pane_pid[0]) if pane_pid and pane_pid[0].isdigit() else None
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
 
 
 # ---------------------------------------------------------------------------
