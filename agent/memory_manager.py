@@ -44,6 +44,78 @@ logger = logging.getLogger(__name__)
 _SYNC_DRAIN_TIMEOUT_S = 5.0
 
 
+def memory_provider_tools_enabled(enabled_toolsets: Optional[List[str]]) -> bool:
+    """Return whether external memory-provider tools should be exposed."""
+    if enabled_toolsets is None:
+        return True
+    if not enabled_toolsets:
+        return False
+    if "memory" in enabled_toolsets:
+        return True
+
+    try:
+        from toolsets import resolve_toolset
+
+        return any("memory" in resolve_toolset(name) for name in enabled_toolsets)
+    except Exception:
+        logger.debug("Failed to resolve enabled toolsets for memory-provider tools", exc_info=True)
+        return False
+
+
+def inject_memory_provider_tools(agent: Any, allowed_tool_names: Any = None) -> int:
+    """Append external memory-provider tool schemas to an agent tool surface.
+
+    When ``allowed_tool_names`` is provided (an ACL allow-set), memory tools whose
+    names are not in the set are skipped — so a per-channel/role ACL that excludes
+    memory does not leak fact_store/etc. into the tool surface. ``None`` means no
+    ACL filter (backward-compatible default).
+    """
+    memory_manager = getattr(agent, "_memory_manager", None)
+    tools = getattr(agent, "tools", None)
+    if not memory_manager or tools is None:
+        return 0
+
+    acl_allowed = (
+        None if allowed_tool_names is None else {str(name) for name in allowed_tool_names}
+    )
+
+    existing_tool_names = {
+        tool.get("function", {}).get("name")
+        for tool in tools
+        if isinstance(tool, dict)
+    }
+    if (
+        "memory" not in existing_tool_names
+        and not memory_provider_tools_enabled(getattr(agent, "enabled_toolsets", None))
+    ):
+        return 0
+
+    get_schemas = getattr(memory_manager, "get_all_tool_schemas", None)
+    if not callable(get_schemas):
+        return 0
+
+    valid_tool_names = getattr(agent, "valid_tool_names", None)
+    if valid_tool_names is None:
+        valid_tool_names = set()
+        agent.valid_tool_names = valid_tool_names
+
+    added = 0
+    for schema in get_schemas():
+        if not isinstance(schema, dict):
+            continue
+        tool_name = schema.get("name", "")
+        if acl_allowed is not None and tool_name not in acl_allowed:
+            continue
+        if not tool_name or tool_name in existing_tool_names:
+            continue
+        tools.append({"type": "function", "function": schema})
+        valid_tool_names.add(tool_name)
+        existing_tool_names.add(tool_name)
+        added += 1
+
+    return added
+
+
 # ---------------------------------------------------------------------------
 # Context fencing helpers
 # ---------------------------------------------------------------------------
