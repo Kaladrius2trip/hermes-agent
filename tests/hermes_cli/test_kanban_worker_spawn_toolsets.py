@@ -62,6 +62,11 @@ agent:
     from hermes_cli import kanban_db as kb
 
     monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    # Fork worker_tmux is AUTO (on when the tmux binary exists), which would
+    # divert _default_spawn through _spawn_worker_tmux (subprocess.run) instead
+    # of the plain Popen path this test patches. Disable it so the spawned argv
+    # — including the --toolsets pin asserted below — is captured via Popen.
+    monkeypatch.setattr(kb, "worker_tmux_enabled", lambda: False)
 
     captured = {}
 
