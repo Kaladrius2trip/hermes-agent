@@ -1,0 +1,4 @@
+name: meridian
+kind: model-provider
+version: 1.0.0
+description: Meridian local Claude SDK proxy via OpenAI-compatible /v1 API

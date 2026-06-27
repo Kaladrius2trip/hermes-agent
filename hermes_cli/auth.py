@@ -136,11 +136,12 @@ SERVICE_PROVIDER_NAMES: Dict[str, str] = {
 DEFAULT_GEMINI_CLOUDCODE_BASE_URL = "cloudcode-pa://google"
 GEMINI_OAUTH_ACCESS_TOKEN_REFRESH_SKEW_SECONDS = 60  # refresh 60s before expiry
 
-# LM Studio's default no-auth mode still requires *some* non-empty bearer for
-# the API-key code paths (auxiliary_client, runtime resolver) to treat the
-# provider as configured. This sentinel is sent only to LM Studio, never to
-# any remote service.
+# Local no-auth providers still require *some* non-empty bearer for the
+# API-key code paths (auxiliary_client, runtime resolver) to treat the
+# provider as configured. These sentinels are sent only to local endpoints,
+# never to remote services.
 LMSTUDIO_NOAUTH_PLACEHOLDER = "dummy-lm-api-key"
+MERIDIAN_NOAUTH_PLACEHOLDER = "dummy-meridian-api-key"
 
 
 # =============================================================================
@@ -1604,7 +1605,7 @@ def resolve_provider(
         # whose availability isn't implied by LM_API_KEY presence (it may be
         # offline, and the no-auth setup uses a placeholder value), so it
         # also requires explicit selection.
-        if pid in {"copilot", "lmstudio"}:
+        if pid in {"copilot", "lmstudio", "meridian"}:
             continue
         for env_var in pconfig.api_key_env_vars:
             if has_usable_secret(os.getenv(env_var, "")):
@@ -5850,6 +5851,10 @@ def get_api_key_provider_status(provider_id: str) -> Dict[str, Any]:
     key_source = ""
     api_key, key_source = _resolve_api_key_provider_secret(provider_id, pconfig)
 
+    if not api_key and provider_id == "meridian":
+        api_key = MERIDIAN_NOAUTH_PLACEHOLDER
+        key_source = "default"
+
     env_url = ""
     if pconfig.base_url_env_var:
         env_url = os.getenv(pconfig.base_url_env_var, "").strip()
@@ -6032,11 +6037,15 @@ def resolve_api_key_provider_credentials(provider_id: str) -> Dict[str, Any]:
     key_source = ""
     api_key, key_source = _resolve_api_key_provider_secret(provider_id, pconfig)
 
-    # No-auth LM Studio: substitute a placeholder so runtime / auxiliary_client
-    # see the local server as configured. doctor still reports unconfigured
-    # because get_api_key_provider_status uses the raw secret resolver.
-    if not api_key and provider_id == "lmstudio":
-        api_key = LMSTUDIO_NOAUTH_PLACEHOLDER
+    # No-auth local providers: substitute a placeholder so runtime /
+    # auxiliary_client see the local server as configured. The endpoint's own
+    # daemon handles real upstream auth (e.g. Meridian profile credentials).
+    if not api_key and provider_id in {"lmstudio", "meridian"}:
+        api_key = (
+            LMSTUDIO_NOAUTH_PLACEHOLDER
+            if provider_id == "lmstudio"
+            else MERIDIAN_NOAUTH_PLACEHOLDER
+        )
         key_source = key_source or "default"
 
     env_url = ""
