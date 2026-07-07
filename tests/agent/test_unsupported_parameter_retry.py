@@ -79,6 +79,38 @@ def _dummy_response():
     return {"ok": True}
 
 
+def test_moa_reference_rate_limit_does_not_retry_or_fallback():
+    """A rate-limited MoA reference must fail once, not burn more quota.
+
+    Reference labels name a specific provider/model. Retrying or falling back
+    under that label both wastes quota and makes the MoA transcript misleading.
+    """
+    client = MagicMock()
+    client.base_url = "https://api.anthropic.com"
+    class RateLimitError(RuntimeError):
+        status_code = 429
+
+    err = RateLimitError("rate_limit_error")
+    client.chat.completions.create.side_effect = err
+
+    with (
+        patch("agent.auxiliary_client._resolve_task_provider_model",
+              return_value=("anthropic", "claude-fable-5", None, None, "anthropic_messages")),
+        patch("agent.auxiliary_client._get_cached_client",
+              return_value=(client, "claude-fable-5")),
+        patch("agent.auxiliary_client._validate_llm_response",
+              side_effect=lambda resp, _task: resp),
+    ):
+        with pytest.raises(RuntimeError):
+            call_llm(
+                task="moa_reference",
+                messages=[{"role": "user", "content": "hi"}],
+                temperature=0.3,
+            )
+
+    assert client.chat.completions.create.call_count == 1
+
+
 class TestMaxTokensRetryHardening:
     """The max_tokens retry branch now (a) gates on ``max_tokens is not None``
     and (b) also matches the generic phrasings via the helper.

@@ -57,10 +57,14 @@ def _slot_runtime(slot: dict[str, str]) -> dict[str, Any]:
         rt = resolve_runtime_provider(requested=provider, target_model=model)
         resolved_provider = str(rt.get("provider") or provider).strip().lower()
         # call_llm treats an explicit base_url as a custom endpoint. That is
-        # correct for ordinary OpenAI-compatible targets, but wrong for OAuth /
-        # adapter-backed providers whose provider branch adds auth headers and
-        # request-shape adapters. Keep those providers identified by name.
-        if resolved_provider in {"openai-codex", "xai-oauth"}:
+        # correct for ordinary OpenAI-compatible custom targets, but wrong for
+        # first-class providers whose provider branch adds auth headers,
+        # request-shape adapters, credential-pool rotation, or special fallback
+        # semantics. Keep those providers identified by name and pass only the
+        # resolved API key through.
+        if resolved_provider in {"openai-codex", "xai-oauth", "openrouter", "anthropic", "meridian"}:
+            if resolved_provider in {"openrouter", "anthropic", "meridian"} and rt.get("api_key"):
+                out["api_key"] = rt["api_key"]
             return out
         # Pass the resolved endpoint through so call_llm builds the request for
         # the provider's actual API surface instead of auto-detecting. base_url
@@ -176,6 +180,15 @@ def _reference_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if role not in ("user", "assistant"):
             # Drop system prompt and tool-result messages.
             continue
+        if role == "assistant" and msg.get("tool_calls"):
+            # Assistant+tool_call turns are not reusable advisory history for
+            # reference models: the references did not emit those tool calls,
+            # and strict providers can treat the visible assistant text before a
+            # stripped tool result as an assistant prefill. Dropping the whole
+            # turn also keeps the advisory view stable across tool-loop
+            # iterations, so references run once per user turn instead of once
+            # per tool result.
+            continue
         content = msg.get("content")
         if not isinstance(content, str):
             # Skip non-text (multimodal/tool-call-only) assistant turns.
@@ -185,13 +198,27 @@ def _reference_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if role == "assistant" and not text.strip():
             # Assistant turn that was purely tool calls — nothing advisory.
             continue
-        trimmed.append({"role": role, "content": text})
+        if trimmed and trimmed[-1].get("role") == role:
+            prev = trimmed[-1].get("content", "")
+            trimmed[-1]["content"] = (str(prev).rstrip() + "\n\n" + text.lstrip()).strip()
+        else:
+            trimmed.append({"role": role, "content": text})
     if not trimmed:
         # Degenerate case (e.g. first turn was stripped): fall back to a
         # minimal user turn so the reference still has something to answer.
         for msg in reversed(messages):
             if msg.get("role") == "user" and isinstance(msg.get("content"), str):
                 return [{"role": "user", "content": msg["content"]}]
+    elif trimmed[-1].get("role") == "assistant":
+        # Native Anthropic and newer Claude models reject assistant-message
+        # prefill for these requests: "The conversation must end with a user
+        # message." Reference calls are advisory, so close the transcript with a
+        # tiny user instruction instead of asking the provider to continue an
+        # assistant turn.
+        trimmed.append({
+            "role": "user",
+            "content": "Provide concise advisory guidance for the current user task.",
+        })
     return trimmed
 
 

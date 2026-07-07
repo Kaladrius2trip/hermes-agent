@@ -77,6 +77,18 @@ class ProviderProfile:
     # Only agentic models that support tool calling should appear here.
     fallback_models: tuple = ()
 
+    # ── Runtime preferences ───────────────────────────────────
+    # True = Hermes may prefer the streaming request path even when no UI/TTS
+    # stream consumer is attached. Set False for providers whose streaming
+    # endpoint is functionally usable for happy-path tokens but loses/obscures
+    # upstream error bodies; the non-streaming path then preserves actionable
+    # HTTP errors for the retry/fallback machinery and user diagnostics.
+    prefer_streaming: bool = True
+    # True = live /models is source of truth. Static fallback catalogs and
+    # stale disk cache are ignored when discovery fails, so the picker never
+    # advertises models the provider did not currently report.
+    live_models_authoritative: bool = False
+
     # hostname: base hostname for URL→provider reverse-mapping in model_metadata.py
     # e.g. "api.gmi-serving.com". Derived from base_url when empty.
     hostname: str = ""
@@ -183,8 +195,8 @@ class ProviderProfile:
         and forwards self.default_headers. Override to customise auth, path,
         response shape, or to return None for providers with no REST catalog.
 
-        Callers must always fall back to the static _PROVIDER_MODELS list
-        when this returns None.
+        Callers may fall back to static catalogs when this returns None unless
+        live_models_authoritative=True for the provider.
         """
         effective_base = base_url or self.base_url
         url = (self.models_url or "").strip()

@@ -5929,6 +5929,16 @@ def call_llm(
                     effective_extra_body=effective_extra_body,
                 )
 
+        # MoA references are explicitly selected advisory slots. If one hits a
+        # provider rate limit, fail that reference in the MoA block instead of
+        # retrying/falling back under the same label and burning more quota.
+        if task == "moa_reference" and _is_rate_limit_error(first_err):
+            logger.info(
+                "Auxiliary moa_reference: rate limit on %s/%s; not retrying reference slot",
+                resolved_provider, final_model,
+            )
+            raise
+
         # ── Same-provider credential-pool recovery ─────────────────────
         pool_provider = _recoverable_pool_provider(resolved_provider, client, main_runtime=main_runtime)
         # Capture the exact API key used so mark_exhausted_and_rotate can find

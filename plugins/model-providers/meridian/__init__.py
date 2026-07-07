@@ -4,15 +4,6 @@ from providers import register_provider
 from providers.base import ProviderProfile
 
 
-MERIDIAN_MODELS = (
-    "claude-opus-4-8",
-    "claude-opus-4-7",
-    "claude-opus-4-6",
-    "claude-sonnet-4-6",
-    "claude-haiku-4-5",
-)
-
-
 meridian = ProviderProfile(
     name="meridian",
     aliases=(
@@ -28,7 +19,15 @@ meridian = ProviderProfile(
     auth_type="api_key",
     supports_health_check=True,
     default_aux_model="claude-haiku-4-5",
-    fallback_models=MERIDIAN_MODELS,
+    # Meridian's OpenAI-compatible SSE path can return HTTP 200 with an empty
+    # stream when Claude Code rejects the upstream request (for example Claude
+    # third-party-app extra-usage errors). Non-streaming preserves the actual
+    # error JSON, so prefer it for Hermes agent calls.
+    prefer_streaming=False,
+    # Meridian exposes the current subscription-routable catalog at /v1/models.
+    # Use that live list directly. No static fallback: a fake list can contain
+    # unroutable model IDs and break selection.
+    live_models_authoritative=True,
 )
 
 register_provider(meridian)

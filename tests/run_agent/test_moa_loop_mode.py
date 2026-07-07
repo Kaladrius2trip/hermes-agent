@@ -198,6 +198,37 @@ def test_moa_codex_slot_preserves_provider_identity(monkeypatch):
     assert rt == {"provider": "openai-codex", "model": "gpt-5.5"}
 
 
+def test_moa_openrouter_slot_preserves_provider_identity(monkeypatch):
+    """OpenRouter slots must not be downgraded to custom endpoints.
+
+    Passing base_url into call_llm forces provider=custom, bypassing the
+    OpenRouter branch and risking wrong fallback credentials. Keep provider
+    identity and pass only the resolved credential.
+    """
+    from agent import moa_loop
+
+    def fake_resolve(*, requested, target_model=None):
+        return {
+            "provider": requested,
+            "api_mode": "chat_completions",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_key": "openrouter-test-key",
+        }
+
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider", fake_resolve
+    )
+
+    rt = moa_loop._slot_runtime({"provider": "openrouter", "model": "z-ai/glm-5.2"})
+
+    assert rt == {
+        "provider": "openrouter",
+        "model": "z-ai/glm-5.2",
+        "api_key": "openrouter-test-key",
+    }
+    assert "base_url" not in rt
+
+
 def test_moa_slot_runtime_falls_back_on_resolution_error(monkeypatch):
     """A slot whose provider can't be resolved still attempts the call with the
     bare provider/model rather than aborting the whole MoA turn."""
@@ -233,13 +264,35 @@ def test_reference_messages_strips_system_and_tool_history():
 
     trimmed = _reference_messages(messages)
 
-    # System prompt, tool-call-only assistant turn, and tool result are gone.
+    # System prompt, tool-call assistant turn, and tool result are gone.
+    # A final assistant answer is closed with an advisory user instruction so
+    # Anthropic-family references do not see assistant-message prefill.
     assert all(m["role"] in ("user", "assistant") for m in trimmed)
     assert all("tool_calls" not in m for m in trimmed)
     assert trimmed == [
         {"role": "user", "content": "do the thing"},
         {"role": "assistant", "content": "here is my answer"},
+        {
+            "role": "user",
+            "content": "Provide concise advisory guidance for the current user task.",
+        },
     ]
+
+
+def test_reference_messages_skips_visible_tool_call_turns_and_ends_user():
+    from agent.moa_loop import _reference_messages
+
+    messages = [
+        {"role": "user", "content": "inspect repo"},
+        {
+            "role": "assistant",
+            "content": "I will inspect files.",
+            "tool_calls": [{"id": "c1", "function": {"name": "terminal", "arguments": "{}"}}],
+        },
+        {"role": "tool", "tool_call_id": "c1", "content": "result"},
+    ]
+
+    assert _reference_messages(messages) == [{"role": "user", "content": "inspect repo"}]
 
 
 def test_moa_facade_references_get_trimmed_messages(monkeypatch, tmp_path):
@@ -466,7 +519,7 @@ def test_moa_facade_caches_references_within_a_turn(monkeypatch, tmp_path):
     facade.create(
         messages=base_msgs
         + [
-            {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "function": {"name": "f", "arguments": "{}"}}]},
+            {"role": "assistant", "content": "Using tool.", "tool_calls": [{"id": "c1", "function": {"name": "f", "arguments": "{}"}}]},
             {"role": "tool", "tool_call_id": "c1", "content": "result"},
         ],
         tools=[{"type": "function"}],

@@ -13,6 +13,7 @@ from hermes_cli.models import (
     CANONICAL_PROVIDERS,
     _PROVIDER_LABELS,
     _PROVIDER_MODELS,
+    cached_provider_model_ids,
     get_default_model_for_provider,
     normalize_provider,
     parse_model_input,
@@ -36,7 +37,9 @@ def test_meridian_provider_profile_registered():
     assert profile.models_url == "http://127.0.0.1:3456/v1/models"
     assert profile.env_vars == ("MERIDIAN_API_KEY", "MERIDIAN_BASE_URL")
     assert profile.default_aux_model == "claude-haiku-4-5"
-    assert profile.fallback_models[0] == "claude-opus-4-8"
+    assert profile.fallback_models == ()
+    assert profile.prefer_streaming is False
+    assert profile.live_models_authoritative is True
 
 
 def test_meridian_aliases_resolve_in_profile_and_cli_layers():
@@ -80,13 +83,38 @@ def test_meridian_base_url_env_override(monkeypatch):
 def test_meridian_model_catalog_and_default(monkeypatch):
     profile = get_provider_profile("meridian")
     assert profile is not None
-    monkeypatch.setattr(profile, "fetch_models", lambda api_key=None, timeout=8.0: None)
+    monkeypatch.setattr(
+        profile,
+        "fetch_models",
+        lambda api_key=None, base_url=None, timeout=8.0: ["live-a", "live-b"],
+    )
 
     assert "meridian" in [p.slug for p in CANONICAL_PROVIDERS]
     assert _PROVIDER_LABELS["meridian"] == "Meridian"
-    assert _PROVIDER_MODELS["meridian"][0] == "claude-opus-4-8"
-    assert get_default_model_for_provider("meridian") == "claude-opus-4-8"
-    assert provider_model_ids("meridian") == list(_PROVIDER_MODELS["meridian"])
+    assert _PROVIDER_MODELS["meridian"] == []
+    assert get_default_model_for_provider("meridian") == "live-a"
+    assert provider_model_ids("meridian") == ["live-a", "live-b"]
+
+
+def test_meridian_no_static_or_stale_fallback_when_live_unavailable(monkeypatch):
+    profile = get_provider_profile("meridian")
+    assert profile is not None
+
+    monkeypatch.setattr(
+        profile,
+        "fetch_models",
+        lambda api_key=None, base_url=None, timeout=8.0: ["live-a"],
+    )
+    assert cached_provider_model_ids("meridian", force_refresh=True) == ["live-a"]
+
+    monkeypatch.setattr(
+        profile,
+        "fetch_models",
+        lambda api_key=None, base_url=None, timeout=8.0: None,
+    )
+    assert provider_model_ids("meridian") == []
+    assert cached_provider_model_ids("meridian") == []
+    assert get_default_model_for_provider("meridian") == ""
 
 
 def test_meridian_model_input_provider_prefix():

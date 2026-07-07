@@ -1155,17 +1155,25 @@ def run_conversation(
                 # session instead of re-failing every retry.
                 if getattr(agent, "_disable_streaming", False):
                     _use_streaming = False
+                else:
+                    try:
+                        from providers import get_provider_profile
+                        _profile = get_provider_profile(agent.provider)
+                        if _profile is not None and not getattr(_profile, "prefer_streaming", True):
+                            _use_streaming = False
+                    except Exception:
+                        pass
                 # CopilotACPClient communicates via subprocess stdio and
                 # returns a plain SimpleNamespace — not an iterable
                 # stream.  Mirror the ACP exclusion used for Responses
                 # API upgrade (lines ~1083-1085).
-                elif (
+                if _use_streaming and (
                     agent.provider in {"copilot-acp", "moa"}
                     or str(agent.base_url or "").lower().startswith("acp://copilot")
                     or str(agent.base_url or "").lower().startswith("acp+tcp://")
                 ):
                     _use_streaming = False
-                elif not agent._has_stream_consumers():
+                elif _use_streaming and not agent._has_stream_consumers():
                     # No display/TTS consumer. Still prefer streaming for
                     # health checking, but skip for Mock clients in tests
                     # (mocks return SimpleNamespace, not stream iterators).

@@ -239,13 +239,10 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
     ],
     "openai-codex": _codex_curated_models(),
     "xai-oauth": _xai_curated_models(),
-    "meridian": [
-        "claude-opus-4-8",
-        "claude-opus-4-7",
-        "claude-opus-4-6",
-        "claude-sonnet-4-6",
-        "claude-haiku-4-5",
-    ],
+    # Meridian's local proxy exposes the authoritative subscription catalog at
+    # /v1/models. Keep this empty so Hermes never invents static Claude slugs
+    # when Meridian is down or the subscription catalog changes.
+    "meridian": [],
     "copilot-acp": [
         "copilot-acp",
     ],
@@ -1291,6 +1288,16 @@ def get_default_model_for_provider(provider: str) -> str:
     ``_PROVIDER_SILENT_DEFAULT_OVERRIDES``; a missing model must never
     auto-escalate to the flagship.
     """
+    try:
+        import importlib
+        _providers = importlib.import_module("providers")
+        _p = getattr(_providers, "get_provider_profile")(provider)
+        if _p is not None and getattr(_p, "live_models_authoritative", False):
+            live = provider_model_ids(provider, force_refresh=True)
+            return live[0] if live else ""
+    except Exception:
+        return ""
+
     models = _PROVIDER_MODELS.get(provider, [])
     override = _PROVIDER_SILENT_DEFAULT_OVERRIDES.get(provider)
     if override and override in models:
@@ -2411,12 +2418,14 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
     # ── Profile-based generic live fetch (all simple api-key providers) ──
     # Handles any provider registered in providers/ with auth_type="api_key".
     # Replaces per-provider copy-paste blocks (stepfun, gmi, zai, etc.).
+    profile_live_authoritative = False
     try:
         from providers import get_provider_profile
         from hermes_cli.auth import resolve_api_key_provider_credentials
 
         _p = get_provider_profile(normalized)
         if _p and _p.auth_type == "api_key" and _p.base_url:
+            profile_live_authoritative = bool(getattr(_p, "live_models_authoritative", False))
             try:
                 creds = resolve_api_key_provider_credentials(normalized)
                 api_key = str(creds.get("api_key") or "").strip()
@@ -2428,6 +2437,8 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
             if api_key:
                 live = _p.fetch_models(api_key=api_key, base_url=base_url or None)
                 if live:
+                    if profile_live_authoritative:
+                        return live
                     # Merge static curated list with live API results so
                     # models that the live endpoint omits (stale cache,
                     # partial rollout) still appear in the picker.
@@ -2445,10 +2456,14 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
                                 merged_lower.add(m.lower())
                         return merged
                     return live
+            if profile_live_authoritative:
+                return []
             # Use profile's fallback_models if defined
             if _p.fallback_models:
                 return list(_p.fallback_models)
     except Exception:
+        if profile_live_authoritative:
+            return []
         pass
 
     curated_static = list(_PROVIDER_MODELS.get(normalized, []))
@@ -2596,6 +2611,15 @@ def cached_provider_model_ids(
     if not normalized:
         return []
 
+    live_authoritative = False
+    try:
+        import importlib
+        _providers = importlib.import_module("providers")
+        _p = getattr(_providers, "get_provider_profile")(normalized)
+        live_authoritative = bool(_p is not None and getattr(_p, "live_models_authoritative", False))
+    except Exception:
+        live_authoritative = False
+
     cache = _load_provider_models_cache()
     fp = _credential_fingerprint(normalized)
     entry = cache.get(normalized)
@@ -2603,6 +2627,7 @@ def cached_provider_model_ids(
 
     if (
         not force_refresh
+        and not live_authoritative
         and isinstance(entry, dict)
         and entry.get("fp") == fp
         and isinstance(entry.get("models"), list)
@@ -2624,7 +2649,10 @@ def cached_provider_model_ids(
 
     # Live fetch returned nothing. If we have a stale entry with the
     # SAME fingerprint, prefer it over an empty result — stale data
-    # beats no data when the network is flaky.
+    # beats no data when the network is flaky. Live-authoritative providers
+    # (Meridian) must not use stale/fake catalogs: no live list means no models.
+    if live_authoritative:
+        return []
     if (
         isinstance(entry, dict)
         and entry.get("fp") == fp
