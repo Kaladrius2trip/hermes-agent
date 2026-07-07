@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from hermes_constants import get_hermes_home
+from hermes_cli._subprocess_compat import windows_hide_flags
 from agent.skill_utils import is_excluded_skill_path
 from typing import Any, Dict, List, Optional, Tuple, Union
 from urllib.parse import urljoin, urlparse, urlunparse
@@ -45,19 +46,78 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
+# Resolved per-call (not frozen at import) so the profile override is honored;
+# import-time constants leaked across profiles in single-process multi-profile
+# runtimes. Legacy names (SKILLS_DIR, ...) are re-exposed via __getattr__ below
+# so external `from tools.skills_hub import SKILLS_DIR` callers still work.
 
-HERMES_HOME = get_hermes_home()
-SKILLS_DIR = HERMES_HOME / "skills"
-HUB_DIR = SKILLS_DIR / ".hub"
-LOCK_FILE = HUB_DIR / "lock.json"
-QUARANTINE_DIR = HUB_DIR / "quarantine"
-AUDIT_LOG = HUB_DIR / "audit.log"
-TAPS_FILE = HUB_DIR / "taps.json"
-INDEX_CACHE_DIR = HUB_DIR / "index-cache"
-BACKUP_DIR = HUB_DIR / "backups"
-
-# Cache duration for remote index fetches
 INDEX_CACHE_TTL = 3600  # 1 hour
+
+
+# _override lets a test-injected real module attribute (patch.object/monkeypatch
+# on SKILLS_DIR etc.) win over dynamic resolution; None means resolve live.
+def _override(name: str):
+    return globals().get(name)
+
+
+def _hermes_home() -> Path:
+    return get_hermes_home()
+
+
+def _skills_dir() -> Path:
+    forced = _override("SKILLS_DIR")
+    return Path(forced) if forced is not None else _hermes_home() / "skills"
+
+
+def _hub_dir() -> Path:
+    forced = _override("HUB_DIR")
+    return Path(forced) if forced is not None else _skills_dir() / ".hub"
+
+
+def _lock_file() -> Path:
+    forced = _override("LOCK_FILE")
+    return Path(forced) if forced is not None else _hub_dir() / "lock.json"
+
+
+def _quarantine_dir() -> Path:
+    forced = _override("QUARANTINE_DIR")
+    return Path(forced) if forced is not None else _hub_dir() / "quarantine"
+
+
+def _audit_log() -> Path:
+    forced = _override("AUDIT_LOG")
+    return Path(forced) if forced is not None else _hub_dir() / "audit.log"
+
+
+def _taps_file() -> Path:
+    forced = _override("TAPS_FILE")
+    return Path(forced) if forced is not None else _hub_dir() / "taps.json"
+
+
+def _index_cache_dir() -> Path:
+    forced = _override("INDEX_CACHE_DIR")
+    return Path(forced) if forced is not None else _hub_dir() / "index-cache"
+
+
+_DYNAMIC_PATH_RESOLVERS = {
+    "HERMES_HOME": _hermes_home,
+    "SKILLS_DIR": _skills_dir,
+    "HUB_DIR": _hub_dir,
+    "LOCK_FILE": _lock_file,
+    "QUARANTINE_DIR": _quarantine_dir,
+    "AUDIT_LOG": _audit_log,
+    "TAPS_FILE": _taps_file,
+    "INDEX_CACHE_DIR": _index_cache_dir,
+}
+
+
+def __getattr__(name: str):
+    """Resolve legacy path constants dynamically (PEP 562) so they reflect the
+    active profile override; a test's patch.object-set real attribute shadows it."""
+    resolver = _DYNAMIC_PATH_RESOLVERS.get(name)
+    if resolver is not None:
+        return resolver()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 _REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
 _MAX_SKILL_FETCH_REDIRECTS = 5
@@ -176,9 +236,10 @@ def _resolve_lock_install_path(install_path: str, skill_name: str) -> Path:
        and ``rmtree(SKILLS_DIR)`` would wipe every installed skill.
     """
     normalized = _normalize_lock_install_path(install_path, skill_name)
-    skills_root = SKILLS_DIR.resolve()
+    skills_dir = _skills_dir()
+    skills_root = skills_dir.resolve()
 
-    target = SKILLS_DIR
+    target = skills_dir
     for part in normalized.split("/"):
         target = target / part
         if _is_path_redirect(target):
@@ -303,6 +364,7 @@ class GitHubAuth:
                 ["gh", "auth", "token"],
                 capture_output=True, text=True, timeout=5,
                 stdin=subprocess.DEVNULL,
+                creationflags=windows_hide_flags(),
             )
             if result.returncode == 0 and result.stdout.strip():
                 return result.stdout.strip()
@@ -847,12 +909,13 @@ class GitHubSource(SkillSource):
     def _download_directory_recursive(self, repo: str, path: str) -> Dict[str, str]:
         """Recursively download via Contents API (fallback)."""
         url = f"https://api.github.com/repos/{repo}/contents/{path.rstrip('/')}"
-        try:
-            resp = httpx.get(url, headers=self.auth.get_headers(), timeout=15, follow_redirects=True)
-            if resp.status_code != 200:
-                logger.debug("Contents API returned %d for %s/%s", resp.status_code, repo, path)
-                return {}
-        except httpx.HTTPError:
+        # Route through _github_get so directory listing gets the same
+        # 429/403-rate-limit retry + backoff as file fetches (#3033).
+        resp = self._github_get(url)
+        if resp is None:
+            return {}
+        if resp.status_code != 200:
+            logger.debug("Contents API returned %d for %s/%s", resp.status_code, repo, path)
             return {}
 
         entries = resp.json()
@@ -972,7 +1035,7 @@ class GitHubSource(SkillSource):
 
     def _read_cache(self, key: str) -> Optional[list]:
         """Read cached index if not expired."""
-        cache_file = INDEX_CACHE_DIR / f"{key}.json"
+        cache_file = _index_cache_dir() / f"{key}.json"
         if not cache_file.exists():
             return None
         try:
@@ -985,8 +1048,9 @@ class GitHubSource(SkillSource):
 
     def _write_cache(self, key: str, data: list) -> None:
         """Write index data to cache."""
-        INDEX_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        cache_file = INDEX_CACHE_DIR / f"{key}.json"
+        index_cache_dir = _index_cache_dir()
+        index_cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_file = index_cache_dir / f"{key}.json"
         try:
             cache_file.write_text(json.dumps(data, ensure_ascii=False))
         except OSError as e:
@@ -2989,6 +3053,8 @@ class OptionalSkillSource(SkillSource):
     (search / install / inspect) and labelled "official" with "builtin" trust.
     """
 
+    OFFICIAL_REPO = "NousResearch/hermes-agent"
+
     def __init__(self):
         from hermes_constants import get_optional_skills_dir
 
@@ -3027,7 +3093,8 @@ class OptionalSkillSource(SkillSource):
         # Guard against path traversal (e.g. "official/../../etc")
         try:
             resolved = skill_dir.resolve()
-            if not str(resolved).startswith(str(self._optional_dir.resolve())):
+            optional_root = self._optional_dir.resolve()
+            if not resolved.is_relative_to(optional_root):
                 return None
         except (OSError, ValueError):
             return None
@@ -3119,7 +3186,7 @@ class OptionalSkillSource(SkillSource):
                 if isinstance(hermes_meta, dict):
                     tags = hermes_meta.get("tags", [])
 
-            rel_path = str(parent.relative_to(self._optional_dir))
+            rel_path = parent.relative_to(self._optional_dir).as_posix()
 
             results.append(SkillMeta(
                 name=name,
@@ -3127,7 +3194,9 @@ class OptionalSkillSource(SkillSource):
                 source="official",
                 identifier=f"official/{rel_path}",
                 trust_level="builtin",
-                path=rel_path,
+                repo=self.OFFICIAL_REPO,
+                # The centralized skills index consumes repo-root-relative paths.
+                path=f"optional-skills/{rel_path}",
                 tags=tags if isinstance(tags, list) else [],
             ))
 
@@ -3155,7 +3224,7 @@ class OptionalSkillSource(SkillSource):
 
 def _read_index_cache(key: str) -> Optional[Any]:
     """Read cached data if not expired."""
-    cache_file = INDEX_CACHE_DIR / f"{key}.json"
+    cache_file = _index_cache_dir() / f"{key}.json"
     if not cache_file.exists():
         return None
     try:
@@ -3169,17 +3238,18 @@ def _read_index_cache(key: str) -> Optional[Any]:
 
 def _write_index_cache(key: str, data: Any) -> None:
     """Write data to cache."""
-    INDEX_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    index_cache_dir = _index_cache_dir()
+    index_cache_dir.mkdir(parents=True, exist_ok=True)
     # Ensure .ignore exists so ripgrep (and tools respecting .ignore) skip
     # this directory.  Cache files contain unvetted community content that
     # could include adversarial text (prompt injection via catalog entries).
-    ignore_file = HUB_DIR / ".ignore"
+    ignore_file = _hub_dir() / ".ignore"
     if not ignore_file.exists():
         try:
             ignore_file.write_text("# Exclude hub internals from search tools\n*\n")
         except OSError:
             pass
-    cache_file = INDEX_CACHE_DIR / f"{key}.json"
+    cache_file = index_cache_dir / f"{key}.json"
     try:
         cache_file.write_text(json.dumps(data, ensure_ascii=False, default=str))
     except OSError as e:
@@ -3208,8 +3278,8 @@ def _skill_meta_to_dict(meta: SkillMeta) -> dict:
 class HubLockFile:
     """Manages skills/.hub/lock.json — tracks provenance of installed hub skills."""
 
-    def __init__(self, path: Path = LOCK_FILE):
-        self.path = path
+    def __init__(self, path: Optional[Path] = None):
+        self.path = path if path is not None else _lock_file()
 
     def load(self) -> dict:
         if not self.path.exists():
@@ -3280,8 +3350,8 @@ class HubLockFile:
 class TapsManager:
     """Manages the taps.json file — custom GitHub repo sources."""
 
-    def __init__(self, path: Path = TAPS_FILE):
-        self.path = path
+    def __init__(self, path: Optional[Path] = None):
+        self.path = path if path is not None else _taps_file()
 
     def load(self) -> List[dict]:
         if not self.path.exists():
@@ -3325,14 +3395,15 @@ class TapsManager:
 def append_audit_log(action: str, skill_name: str, source: str,
                      trust_level: str, verdict: str, extra: str = "") -> None:
     """Append a line to the audit log."""
-    AUDIT_LOG.parent.mkdir(parents=True, exist_ok=True)
+    audit_log = _audit_log()
+    audit_log.parent.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     parts = [timestamp, action, skill_name, f"{source}:{trust_level}", verdict]
     if extra:
         parts.append(extra)
     line = " ".join(parts) + "\n"
     try:
-        with open(AUDIT_LOG, "a", encoding="utf-8") as f:
+        with open(audit_log, "a", encoding="utf-8") as f:
             f.write(line)
     except OSError as e:
         logger.debug("Could not write audit log: %s", e)
@@ -3344,16 +3415,19 @@ def append_audit_log(action: str, skill_name: str, source: str,
 
 def ensure_hub_dirs() -> None:
     """Create the .hub directory structure if it doesn't exist."""
-    HUB_DIR.mkdir(parents=True, exist_ok=True)
-    QUARANTINE_DIR.mkdir(exist_ok=True)
-    INDEX_CACHE_DIR.mkdir(exist_ok=True)
-    BACKUP_DIR.mkdir(exist_ok=True)
-    if not LOCK_FILE.exists():
-        LOCK_FILE.write_text('{"version": 1, "installed": {}}\n')
-    if not AUDIT_LOG.exists():
-        AUDIT_LOG.touch()
-    if not TAPS_FILE.exists():
-        TAPS_FILE.write_text('{"taps": []}\n')
+    hub_dir = _hub_dir()
+    lock_file = _lock_file()
+    audit_log = _audit_log()
+    taps_file = _taps_file()
+    hub_dir.mkdir(parents=True, exist_ok=True)
+    _quarantine_dir().mkdir(exist_ok=True)
+    _index_cache_dir().mkdir(exist_ok=True)
+    if not lock_file.exists():
+        lock_file.write_text('{"version": 1, "installed": {}}\n')
+    if not audit_log.exists():
+        audit_log.touch()
+    if not taps_file.exists():
+        taps_file.write_text('{"taps": []}\n')
 
 
 def quarantine_bundle(bundle: SkillBundle) -> Path:
@@ -3365,7 +3439,7 @@ def quarantine_bundle(bundle: SkillBundle) -> Path:
         safe_rel_path = _validate_bundle_rel_path(rel_path)
         validated_files.append((safe_rel_path, file_content))
 
-    dest = QUARANTINE_DIR / skill_name
+    dest = _quarantine_dir() / skill_name
     if dest.exists():
         shutil.rmtree(dest)
     dest.mkdir(parents=True)
@@ -3381,344 +3455,6 @@ def quarantine_bundle(bundle: SkillBundle) -> Path:
     return dest
 
 
-_PERMISSIVE_LICENSES = {
-    "", "mit", "apache-2.0", "bsd-2-clause", "bsd-3-clause", "isc",
-    "mpl-2.0", "unlicense", "cc0-1.0", "public-domain",
-}
-
-
-def _read_frontmatter_file(path: Path) -> Tuple[Dict[str, Any], str]:
-    """Return YAML frontmatter dict and original content for a markdown skill file."""
-    content = path.read_text(encoding="utf-8")
-    metadata: Dict[str, Any] = {}
-    if content.startswith("---\n"):
-        end = content.find("\n---", 4)
-        if end != -1:
-            raw = content[4:end]
-            try:
-                parsed = yaml.safe_load(raw) or {}
-                if isinstance(parsed, dict):
-                    metadata = parsed
-            except yaml.YAMLError:
-                metadata = {}
-    return metadata, content
-
-
-def _license_warnings(metadata: Dict[str, Any]) -> List[Dict[str, str]]:
-    license_value = str(metadata.get("license", "")).strip()
-    if license_value.lower() in _PERMISSIVE_LICENSES:
-        return []
-    return [{
-        "code": "restrictive_license",
-        "message": f"License '{license_value}' may restrict reuse; review before publishing or sharing.",
-    }]
-
-
-def doctor_skill_path(path: Union[str, Path]) -> Dict[str, Any]:
-    """Inspect a skill directory or legacy flat markdown skill pack."""
-    source_path = Path(path).expanduser().resolve()
-    issues: List[Dict[str, str]] = []
-    warnings: List[Dict[str, str]] = []
-    metadata: Dict[str, Any] = {}
-    kind = "missing"
-    valid = False
-    suggested_action = "fix"
-
-    if not source_path.exists():
-        issues.append({"code": "path_missing", "message": f"Path does not exist: {source_path}"})
-    elif source_path.is_file():
-        kind = "flat_markdown" if source_path.suffix.lower() in {".md", ".markdown"} else "file"
-        if kind == "flat_markdown":
-            metadata, _ = _read_frontmatter_file(source_path)
-            warnings.extend(_license_warnings(metadata))
-            issues.append({
-                "code": "flat_markdown_requires_convert",
-                "message": "Flat markdown skills must be converted to a skill directory first.",
-            })
-            suggested_action = "convert_flat"
-        else:
-            issues.append({"code": "unsupported_file", "message": "Only markdown skill files can be imported directly."})
-    elif source_path.is_dir():
-        kind = "skill_directory"
-        skill_md = source_path / "SKILL.md"
-        if not skill_md.exists():
-            issues.append({"code": "missing_skill_md", "message": "Skill directory must contain SKILL.md."})
-        else:
-            metadata, _ = _read_frontmatter_file(skill_md)
-            if not metadata.get("name"):
-                issues.append({"code": "missing_name", "message": "SKILL.md frontmatter needs a name."})
-            if not metadata.get("description"):
-                issues.append({"code": "missing_description", "message": "SKILL.md frontmatter needs a description."})
-            warnings.extend(_license_warnings(metadata))
-            valid = not issues
-            suggested_action = "import" if valid else "fix"
-    else:
-        issues.append({"code": "unsupported_path", "message": f"Unsupported path type: {source_path}"})
-
-    return {
-        "valid": valid,
-        "kind": kind,
-        "metadata": metadata,
-        "issues": issues,
-        "warnings": warnings,
-        "suggested_action": suggested_action,
-        "provenance": {"source_path": str(source_path)},
-    }
-
-
-def convert_flat_skill(
-    path: Union[str, Path],
-    *,
-    output_dir: Optional[Union[str, Path]] = None,
-    dry_run: bool = False,
-    force: bool = False,
-    record: bool = True,
-) -> Dict[str, Any]:
-    """Convert a legacy flat markdown skill to ``<output>/<name>/SKILL.md``.
-
-    When ``record`` is true and the target lands inside the live SKILLS_DIR,
-    the converted skill is registered in the hub lock file and audit log so
-    it can be listed, audited, uninstalled, and rolled back like any other
-    hub install. ``import_skill_path`` passes ``record=False`` because it
-    records its own IMPORT entry afterwards.
-    """
-    source_path = Path(path).expanduser().resolve()
-    report = doctor_skill_path(source_path)
-    if report["kind"] != "flat_markdown":
-        raise ValueError(f"Not a flat markdown skill: {source_path}")
-
-    metadata = report.get("metadata") or {}
-    skill_name = _validate_skill_name(str(metadata.get("name") or source_path.stem))
-    category = str(metadata.get("category") or "").strip()
-    _, content = _read_frontmatter_file(source_path)
-    output_root = Path(output_dir).expanduser() if output_dir is not None else SKILLS_DIR
-    target_dir, install_rel_path = _target_for_import(output_root, category, skill_name)
-    target_file = target_dir / "SKILL.md"
-
-    from tools.skills_guard import scan_skill, should_allow_install
-
-    scan_result = scan_skill(source_path, source="community")
-    allowed, reason = should_allow_install(scan_result, force=force)
-    if not allowed:
-        raise ValueError(f"Flat skill conversion blocked by security scan: {reason}")
-
-    result = {
-        "skill_name": skill_name,
-        "source_path": str(source_path),
-        "target_path": str(target_file),
-        "install_path": install_rel_path,
-        "status": "would_convert" if dry_run else "converted",
-    }
-
-    if dry_run:
-        return result
-
-    if target_file.exists():
-        existing = target_file.read_text(encoding="utf-8")
-        if existing == content:
-            result["status"] = "already_converted"
-            return result
-        if not force:
-            raise ValueError(f"Target already exists with different content: {target_file}")
-
-    target_dir.mkdir(parents=True, exist_ok=True)
-    target_file.write_text(content, encoding="utf-8")
-    if record and output_root.resolve(strict=False) == SKILLS_DIR.resolve(strict=False):
-        HubLockFile().record_install(
-            name=skill_name,
-            source="local",
-            identifier=f"local:{source_path}",
-            trust_level=scan_result.trust_level,
-            scan_verdict=scan_result.verdict,
-            skill_hash=content_hash(target_dir),
-            install_path=install_rel_path,
-            files=_relative_skill_files(target_dir),
-            metadata={"converted_from": str(source_path), **(metadata or {})},
-        )
-        append_audit_log(
-            "CONVERT", skill_name, "local", scan_result.trust_level,
-            scan_result.verdict, str(source_path),
-        )
-    return result
-
-
-def _relative_skill_files(skill_dir: Path) -> List[str]:
-    return sorted(
-        str(path.relative_to(skill_dir)).replace(os.sep, "/")
-        for path in skill_dir.rglob("*")
-        if path.is_file()
-    )
-
-
-def _reject_redirects_in_skill_tree(skill_dir: Path) -> None:
-    root = Path(skill_dir)
-    for entry in [root, *root.rglob("*")]:
-        if not _is_path_redirect(entry):
-            continue
-        try:
-            rel = entry.relative_to(root)
-        except ValueError:
-            rel = entry
-        raise ValueError(f"Skill import contains symlinks, which is not allowed: {rel}")
-
-
-def _target_for_import(output_root: Path, category: str, skill_name: str) -> Tuple[Path, str]:
-    safe_name = _validate_skill_name(skill_name)
-    safe_category = _validate_install_parent_path(category) if category else ""
-    rel_path = f"{safe_category}/{safe_name}" if safe_category else safe_name
-    target_dir = (output_root / rel_path).resolve(strict=False)
-    output_resolved = output_root.resolve(strict=False)
-    if not target_dir.is_relative_to(output_resolved):
-        raise ValueError(f"Unsafe import target: {target_dir}")
-    return target_dir, rel_path
-
-
-def import_skill_path(
-    path: Union[str, Path],
-    *,
-    output_dir: Optional[Union[str, Path]] = None,
-    dry_run: bool = False,
-    convert_flat: bool = False,
-    force: bool = False,
-) -> Dict[str, Any]:
-    """Import a local skill directory, or explicitly convert/import flat markdown."""
-    from tools.skills_guard import scan_skill, should_allow_install
-
-    raw_path = Path(path).expanduser()
-    if _is_path_redirect(raw_path):
-        raise ValueError(f"Skill import path is a symlink or redirected path: {raw_path}")
-
-    source_path = raw_path.resolve()
-    report = doctor_skill_path(source_path)
-    output_root = (Path(output_dir).expanduser() if output_dir is not None else SKILLS_DIR).resolve(strict=False)
-    provenance_source = source_path
-    provenance_kind = report["kind"]
-    converted_path: Optional[Path] = None
-
-    if report["kind"] == "flat_markdown":
-        if not convert_flat:
-            raise ValueError("flat_markdown skill pack requires --convert-flat before import")
-        converted = convert_flat_skill(source_path, output_dir=output_root, dry_run=dry_run, force=force, record=False)
-        if dry_run:
-            return {**converted, "status": "would_import", "kind": "flat_markdown"}
-        source_path = Path(converted["target_path"]).parent.resolve()
-        converted_path = source_path
-        report = doctor_skill_path(source_path)
-
-    if not report["valid"] or report["kind"] != "skill_directory":
-        issue_text = "; ".join(issue.get("message", "") for issue in report.get("issues", []))
-        raise ValueError(issue_text or f"Invalid skill pack: {source_path}")
-
-    metadata = dict(report.get("metadata") or {})
-    skill_name = _validate_skill_name(str(metadata.get("name") or source_path.name))
-    category = str(metadata.get("category") or "").strip()
-    target_dir, install_rel_path = _target_for_import(output_root, category, skill_name)
-
-    _reject_redirects_in_skill_tree(source_path)
-    files = _relative_skill_files(source_path)
-    provenance = {
-        "source_path": str(provenance_source),
-        "kind": provenance_kind,
-        "source_hash": content_hash(provenance_source),
-        "imported_at": datetime.now(timezone.utc).isoformat(),
-    }
-    if converted_path is not None:
-        provenance["converted_path"] = str(converted_path)
-    result = {
-        "status": "would_import" if dry_run else "imported",
-        "skill_name": skill_name,
-        "source_path": str(source_path),
-        "target_path": str(target_dir),
-        "install_path": install_rel_path,
-        "provenance": provenance,
-    }
-    if dry_run:
-        return result
-
-    scan_result = scan_skill(source_path, source="community")
-    allowed, reason = should_allow_install(scan_result, force=force)
-    if not allowed:
-        raise ValueError(f"Skill import blocked by security scan: {reason}")
-
-    if target_dir.exists():
-        same_tree = target_dir.resolve(strict=False) == source_path.resolve(strict=False)
-        if not same_tree and not force:
-            raise ValueError(f"Target already exists: {target_dir}")
-        if not same_tree:
-            shutil.rmtree(target_dir)
-            target_dir.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copytree(source_path, target_dir, symlinks=False)
-    else:
-        target_dir.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(source_path, target_dir, symlinks=False)
-
-    lock_metadata = dict(metadata)
-    lock_metadata["provenance"] = provenance
-    HubLockFile().record_install(
-        name=skill_name,
-        source="local",
-        identifier=f"local:{source_path}",
-        trust_level=scan_result.trust_level,
-        scan_verdict=scan_result.verdict,
-        skill_hash=content_hash(target_dir),
-        install_path=install_rel_path,
-        files=files,
-        metadata=lock_metadata,
-    )
-    append_audit_log(
-        "IMPORT", skill_name, "local", scan_result.trust_level,
-        scan_result.verdict, provenance["source_hash"],
-    )
-    return result
-
-
-def _backup_installed_skill(skill_name: str, install_path: Path, entry: dict) -> Path:
-    ensure_hub_dirs()
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
-    backup_dir = BACKUP_DIR / _validate_skill_name(skill_name) / stamp
-    backup_dir.mkdir(parents=True, exist_ok=False)
-    if install_path.exists():
-        shutil.copytree(install_path, backup_dir / "files", symlinks=False)
-    (backup_dir / "manifest.json").write_text(
-        json.dumps({"name": skill_name, "entry": entry}, indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
-    return backup_dir
-
-
-def rollback_skill(skill_name: str) -> Dict[str, Any]:
-    """Restore latest backup created by uninstall/update lifecycle actions."""
-    safe_name = _validate_skill_name(skill_name)
-    root = BACKUP_DIR / safe_name
-    if not root.exists():
-        raise FileNotFoundError(f"No rollback backup found for '{safe_name}'")
-
-    backups = sorted(p for p in root.iterdir() if p.is_dir())
-    if not backups:
-        raise FileNotFoundError(f"No rollback backup found for '{safe_name}'")
-    backup_dir = backups[-1]
-    manifest = json.loads((backup_dir / "manifest.json").read_text(encoding="utf-8"))
-    entry = manifest["entry"]
-    install_path = _resolve_lock_install_path(entry.get("install_path", ""), safe_name)
-
-    if install_path.exists():
-        shutil.rmtree(install_path)
-    files_dir = backup_dir / "files"
-    if files_dir.exists():
-        install_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(files_dir, install_path, symlinks=False)
-
-    lock = HubLockFile()
-    data = lock.load()
-    data.setdefault("installed", {})[safe_name] = entry
-    lock.save(data)
-    append_audit_log(
-        "ROLLBACK", safe_name, entry.get("source", "unknown"),
-        entry.get("trust_level", "unknown"), "restored", str(backup_dir),
-    )
-    return {"status": "restored", "skill_name": safe_name, "backup_path": str(backup_dir), "install_path": str(install_path)}
-
-
 def install_from_quarantine(
     quarantine_path: Path,
     skill_name: str,
@@ -3730,7 +3466,7 @@ def install_from_quarantine(
     safe_skill_name = _validate_skill_name(skill_name)
     safe_category = _validate_install_parent_path(category) if category else ""
     quarantine_resolved = quarantine_path.resolve()
-    quarantine_root = QUARANTINE_DIR.resolve()
+    quarantine_root = _quarantine_dir().resolve()
     if not quarantine_resolved.is_relative_to(quarantine_root):
         raise ValueError(f"Unsafe quarantine path: {quarantine_path}")
 
@@ -3790,7 +3526,7 @@ def install_from_quarantine(
         trust_level=bundle.trust_level,
         scan_verdict=scan_result.verdict,
         skill_hash=content_hash(install_dir),
-        install_path=str(install_dir.relative_to(SKILLS_DIR)),
+        install_path=str(install_dir.relative_to(_skills_dir())),
         files=list(bundle.files.keys()),
         metadata=bundle.metadata,
     )
@@ -3804,7 +3540,7 @@ def install_from_quarantine(
     return install_dir
 
 
-def uninstall_skill(skill_name: str, dry_run: bool = False) -> Tuple[bool, str]:
+def uninstall_skill(skill_name: str) -> Tuple[bool, str]:
     """Remove a hub-installed skill. Refuses to remove builtins."""
     lock = HubLockFile()
     entry = lock.get_installed(skill_name)
@@ -3825,21 +3561,13 @@ def uninstall_skill(skill_name: str, dry_run: bool = False) -> Tuple[bool, str]:
     except ValueError as exc:
         return False, f"Refusing to uninstall '{skill_name}': {exc}"
 
-    if dry_run:
-        return True, f"Would uninstall '{skill_name}' from {entry['install_path']}"
-
-    backup_path = _backup_installed_skill(skill_name, install_path, entry)
-
     if install_path.exists():
         shutil.rmtree(install_path)
 
     lock.record_uninstall(skill_name)
-    append_audit_log(
-        "UNINSTALL", skill_name, entry["source"], entry["trust_level"],
-        "n/a", f"user_request backup={backup_path}",
-    )
+    append_audit_log("UNINSTALL", skill_name, entry["source"], entry["trust_level"], "n/a", "user_request")
 
-    return True, f"Uninstalled '{skill_name}' from {entry['install_path']} (backup: {backup_path})"
+    return True, f"Uninstalled '{skill_name}' from {entry['install_path']}"
 
 
 def bundle_content_hash(bundle: SkillBundle) -> str:
@@ -3927,8 +3655,11 @@ def check_for_skill_updates(
 # ---------------------------------------------------------------------------
 
 HERMES_INDEX_URL = "https://hermes-agent.nousresearch.com/docs/api/skills-index.json"
-HERMES_INDEX_CACHE_FILE = INDEX_CACHE_DIR / "hermes-index.json"
 HERMES_INDEX_TTL = 6 * 3600  # 6 hours
+
+
+def _hermes_index_cache_file() -> Path:
+    return _index_cache_dir() / "hermes-index.json"
 
 
 def _load_hermes_index() -> Optional[dict]:
@@ -3939,23 +3670,56 @@ def _load_hermes_index() -> Optional[dict]:
     downloads within a session.
     """
     # Check local cache
-    if HERMES_INDEX_CACHE_FILE.exists():
+    hermes_index_cache_file = _hermes_index_cache_file()
+    if hermes_index_cache_file.exists():
         try:
-            age = time.time() - HERMES_INDEX_CACHE_FILE.stat().st_mtime
+            age = time.time() - hermes_index_cache_file.stat().st_mtime
             if age < HERMES_INDEX_TTL:
-                return json.loads(HERMES_INDEX_CACHE_FILE.read_text())
+                return json.loads(hermes_index_cache_file.read_text())
         except (OSError, json.JSONDecodeError):
             pass
 
-    # Fetch from docs site
-    try:
-        resp = httpx.get(HERMES_INDEX_URL, timeout=15, follow_redirects=True)
-        if resp.status_code != 200:
-            logger.debug("Hermes index fetch returned %d", resp.status_code)
+    # Fetch from docs site.
+    #
+    # We deliberately DON'T let httpx negotiate Brotli here.  The index is a
+    # large body (tens of MB); httpx's streaming Brotli decoder, backed by
+    # brotlicffi 1.2.0.1 (pinned for Discord attachment decoding), trips over
+    # its own output_buffer_limit on payloads this size and raises
+    # DecodingError("brotli: decoder process called with data when
+    # 'can_accept_more_data()' is False").  That surfaces as an empty Skills
+    # Hub (blank Browse-hub landing, index contributes 0 search hits) because
+    # the error is caught below and we silently fall back to a (often absent)
+    # stale cache.  Requesting gzip/deflate sidesteps the broken decoder while
+    # still compressing the transfer.  The identity retry is belt-and-braces
+    # for any future proxy that ignores the header and returns Brotli anyway.
+    data = None
+    for accept_encoding in ("gzip, deflate", "identity"):
+        try:
+            resp = httpx.get(
+                HERMES_INDEX_URL,
+                timeout=15,
+                follow_redirects=True,
+                headers={"Accept-Encoding": accept_encoding},
+            )
+            if resp.status_code != 200:
+                logger.debug("Hermes index fetch returned %d", resp.status_code)
+                return _load_stale_index_cache()
+            data = resp.json()
+            break
+        except httpx.DecodingError as e:
+            # Content-Encoding decode failed — retry once uncompressed before
+            # giving up on the network path entirely.
+            logger.debug(
+                "Hermes index decode failed (Accept-Encoding=%s): %s",
+                accept_encoding,
+                e,
+            )
+            continue
+        except (httpx.HTTPError, json.JSONDecodeError) as e:
+            logger.debug("Hermes index fetch failed: %s", e)
             return _load_stale_index_cache()
-        data = resp.json()
-    except (httpx.HTTPError, json.JSONDecodeError) as e:
-        logger.debug("Hermes index fetch failed: %s", e)
+
+    if data is None:
         return _load_stale_index_cache()
 
     # Validate structure
@@ -3964,8 +3728,8 @@ def _load_hermes_index() -> Optional[dict]:
 
     # Cache locally
     try:
-        HERMES_INDEX_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        HERMES_INDEX_CACHE_FILE.write_text(json.dumps(data))
+        hermes_index_cache_file.parent.mkdir(parents=True, exist_ok=True)
+        hermes_index_cache_file.write_text(json.dumps(data))
     except OSError:
         pass
 
@@ -3974,9 +3738,10 @@ def _load_hermes_index() -> Optional[dict]:
 
 def _load_stale_index_cache() -> Optional[dict]:
     """Fall back to stale cache when the network fetch fails."""
-    if HERMES_INDEX_CACHE_FILE.exists():
+    hermes_index_cache_file = _hermes_index_cache_file()
+    if hermes_index_cache_file.exists():
         try:
-            return json.loads(HERMES_INDEX_CACHE_FILE.read_text())
+            return json.loads(hermes_index_cache_file.read_text())
         except (OSError, json.JSONDecodeError):
             pass
     return None
@@ -4273,8 +4038,11 @@ def parallel_search_sources(
     # worker finishes — so a single slow source (e.g. ClawHub) keeps the
     # caller blocked for minutes and renders ``overall_timeout`` a no-op.
     # Manage the executor manually and shut it down with ``wait=False`` so
-    # the timeout is actually honoured.
-    pool = ThreadPoolExecutor(max_workers=min(len(active), 8))
+    # the timeout is actually honoured.  Daemon workers (tools.daemon_pool):
+    # an abandoned slow source must not block interpreter exit either —
+    # stdlib workers are joined unconditionally by the atexit hook.
+    from tools.daemon_pool import DaemonThreadPoolExecutor
+    pool = DaemonThreadPoolExecutor(max_workers=min(len(active), 8))
     futures = {}
     for src in active:
         lim = per_source_limits.get(src.source_id(), 50)
