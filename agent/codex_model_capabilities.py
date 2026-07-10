@@ -21,8 +21,11 @@ _GPT56_LUNA_EFFORTS: Final[tuple[str, ...]] = _GPT56_FULL_EFFORTS[:-1]
 
 _GPT56_MODEL_EFFORTS: Final[dict[str, tuple[str, ...]]] = {
     "gpt-5.6-sol": _GPT56_FULL_EFFORTS,
+    "gpt-5.6-sol-pro": _GPT56_FULL_EFFORTS,
     "gpt-5.6-terra": _GPT56_FULL_EFFORTS,
+    "gpt-5.6-terra-pro": _GPT56_FULL_EFFORTS,
     "gpt-5.6-luna": _GPT56_LUNA_EFFORTS,
+    "gpt-5.6-luna-pro": _GPT56_LUNA_EFFORTS,
 }
 
 # User-facing ``ultra`` selection maps to the Codex backend wire value ``max``.

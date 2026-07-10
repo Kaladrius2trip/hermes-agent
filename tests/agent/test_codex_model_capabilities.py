@@ -10,9 +10,12 @@ from agent.codex_model_capabilities import resolve_codex_reasoning_effort
     [
         pytest.param("gpt-5.6-sol", "low", "low", id="sol-low"),
         pytest.param("gpt-5.6-sol", "ultra", "max", id="sol-ultra-maps-to-max"),
+        pytest.param("gpt-5.6-sol-pro", "ultra", "max", id="sol-pro-ultra-maps-to-max"),
         pytest.param("gpt-5.6-terra", "ultra", "max", id="terra-ultra-maps-to-max"),
+        pytest.param("gpt-5.6-terra-pro", "ultra", "max", id="terra-pro-ultra-maps-to-max"),
         pytest.param("gpt-5.6-terra", "xhigh", "xhigh", id="terra-xhigh"),
         pytest.param("gpt-5.6-luna", "max", "max", id="luna-max"),
+        pytest.param("gpt-5.6-luna-pro", "max", "max", id="luna-pro-max"),
     ],
 )
 def test_resolve_codex_reasoning_effort_accepts_matrix_edges(
@@ -50,6 +53,7 @@ def test_resolve_codex_reasoning_effort_maps_minimal_to_low(
     "model",
     [
         pytest.param("gpt-5.6-luna", id="bare-luna"),
+        pytest.param("gpt-5.6-luna-pro", id="luna-pro"),
         pytest.param("openai/gpt-5.6-luna", id="vendor-prefixed-luna"),
         pytest.param("openai-codex/gpt-5.6-luna", id="provider-prefixed-luna"),
     ],
