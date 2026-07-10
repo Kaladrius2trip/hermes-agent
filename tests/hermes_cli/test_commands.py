@@ -84,6 +84,11 @@ class TestCommandRegistry:
             "xhigh",
         )
 
+    def test_reasoning_subcommands_include_max_and_ultra(self):
+        reasoning = next(cmd for cmd in COMMAND_REGISTRY if cmd.name == "reasoning")
+        assert "max" in reasoning.subcommands
+        assert "ultra" in reasoning.subcommands
+
     def test_cli_only_and_gateway_only_are_mutually_exclusive(self):
         for cmd in COMMAND_REGISTRY:
             assert not (cmd.cli_only and cmd.gateway_only), \

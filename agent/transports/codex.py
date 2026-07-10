@@ -162,8 +162,32 @@ class ResponsesApiTransport(ProviderTransport):
             elif reasoning_config.get("effort"):
                 reasoning_effort = reasoning_config["effort"]
 
-        _effort_clamp = {"minimal": "low"}
-        reasoning_effort = _effort_clamp.get(reasoning_effort, reasoning_effort)
+        # Reasoning-effort normalization is backend-specific.
+        if is_codex_backend:
+            # Codex backend (chatgpt.com/backend-api/codex): model-aware
+            # validation + normalization via the single shared resolver.
+            # Normalizes ``minimal`` to ``low`` (Codex rejects ``minimal``)
+            # and enforces the GPT-5.6 reasoning matrix: Sol/Terra accept
+            # ``ultra`` and send it on the wire as ``max`` (the Codex name for
+            # that tier); Luna raises ``ValueError`` on ``ultra`` before any
+            # transport/network call. ``model`` is the per-call model
+            # (``agent.model``). The Codex-only auxiliary
+            # ``_CodexCompletionsAdapter`` routes through the same resolver, so
+            # the two Codex seams cannot drift.
+            from agent.codex_model_capabilities import (
+                resolve_codex_reasoning_effort,
+            )
+
+            reasoning_effort = resolve_codex_reasoning_effort(
+                model, str(reasoning_effort)
+            )
+        else:
+            # Non-Codex Responses (xAI, GitHub/Copilot): preserve exact
+            # pre-Task-3 behavior. Only clamp literal ``minimal`` to ``low``
+            # (the Responses API rejects ``minimal``). No GPT-5.6 matrix and
+            # no ``ultra`` to ``max`` wire mapping; the resolver is Codex-only.
+            _effort_clamp = {"minimal": "low"}
+            reasoning_effort = _effort_clamp.get(reasoning_effort, reasoning_effort)
 
         response_tools = _responses_tools(tools)
 

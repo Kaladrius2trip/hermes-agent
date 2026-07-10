@@ -676,6 +676,42 @@ class TestBuildCodexClient:
         assert mock_openai.call_args.kwargs["api_key"] == "codex-auth-token"
         assert mock_openai.call_args.kwargs["base_url"] == "https://chatgpt.com/backend-api/codex"
 
+    def test_codex_client_threads_chatgpt_codex_backend_flag_true(self):
+        """_build_codex_client is the ONLY factory that marks the shared
+        adapter as the ChatGPT Codex OAuth backend, so it alone gets the
+        GPT-5.6 wire mapping (``ultra`` to ``max``, Luna rejection)."""
+        with (
+            patch("agent.auxiliary_client._select_pool_entry", return_value=(True, None)),
+            patch("agent.auxiliary_client._read_codex_access_token", return_value="codex-auth-token"),
+            patch("agent.auxiliary_client.OpenAI") as mock_openai,
+        ):
+            mock_openai.return_value = MagicMock()
+            from agent.auxiliary_client import _build_codex_client
+
+            client, _model = _build_codex_client("gpt-5.6-sol")
+
+        assert client is not None
+        assert client.chat.completions._is_chatgpt_codex_backend is True
+
+    def test_xai_oauth_client_threads_chatgpt_codex_backend_flag_false(self):
+        """The xAI OAuth factory shares the same Responses adapter but is NOT
+        the ChatGPT Codex backend, so the adapter must NOT carry the GPT-5.6
+        wire mapping (``ultra`` stays literal, Luna does not raise)."""
+        with (
+            patch(
+                "agent.auxiliary_client._resolve_xai_oauth_for_aux",
+                return_value=("xai-access-token", "https://api.x.ai/v1"),
+            ),
+            patch("agent.auxiliary_client.OpenAI") as mock_openai,
+        ):
+            mock_openai.return_value = MagicMock()
+            from agent.auxiliary_client import _build_xai_oauth_aux_client
+
+            client, _model = _build_xai_oauth_aux_client("grok-4.3")
+
+        assert client is not None
+        assert client.chat.completions._is_chatgpt_codex_backend is False
+
     def test_rejects_missing_model(self):
         """Callers must pass an explicit model; no hardcoded default."""
         from agent.auxiliary_client import _build_codex_client
@@ -1184,6 +1220,9 @@ class TestGetTextAuxiliaryClient:
         assert model == "gpt-5.3-codex"
         assert mock_openai.call_args.kwargs["base_url"] == "https://api.openai.com/v1"
         assert mock_openai.call_args.kwargs["api_key"] == "sk-test"
+        # Custom ``codex_responses`` gateway is NOT the ChatGPT Codex OAuth
+        # backend: the shared adapter must NOT carry the GPT-5.6 wire mapping.
+        assert client.chat.completions._is_chatgpt_codex_backend is False
 
 
 class TestVisionClientFallback:
@@ -3792,7 +3831,7 @@ class TestCodexAdapterReasoningTranslation:
     """
 
     @staticmethod
-    def _build_adapter():
+    def _build_adapter(*, is_chatgpt_codex_backend: bool = True):
         """Build a _CodexCompletionsAdapter with a mocked responses.create()."""
         from agent.auxiliary_client import _CodexCompletionsAdapter
         from types import SimpleNamespace
@@ -3832,7 +3871,10 @@ class TestCodexAdapterReasoningTranslation:
 
         real_client = MagicMock()
         real_client.responses.create = _create
-        adapter = _CodexCompletionsAdapter(real_client, "gpt-5.3-codex")
+        adapter = _CodexCompletionsAdapter(
+            real_client, "gpt-5.3-codex",
+            is_chatgpt_codex_backend=is_chatgpt_codex_backend,
+        )
         return adapter, captured_kwargs
 
     def test_reasoning_effort_medium_translated_to_top_level(self):
@@ -3869,6 +3911,94 @@ class TestCodexAdapterReasoningTranslation:
             extra_body={"reasoning": {"effort": "high"}},
         )
         assert captured.get("reasoning") == {"effort": "high", "summary": "auto"}
+
+    def test_reasoning_effort_ultra_maps_to_max_for_sol(self):
+        """Sol publishes ``ultra`` as a user-facing selection; the auxiliary
+        Responses seam routes it through the shared resolver, which maps it to
+        the backend wire value ``max`` (Codex exposes no ``ultra`` wire mode,
+        so the official client sends Max for an Ultra request)."""
+        adapter, captured = self._build_adapter()
+        adapter.create(
+            model="gpt-5.6-sol",
+            messages=[{"role": "user", "content": "hi"}],
+            extra_body={"reasoning": {"effort": "ultra"}},
+        )
+        assert captured.get("reasoning") == {"effort": "max", "summary": "auto"}
+        assert captured.get("include") == ["reasoning.encrypted_content"]
+
+    def test_reasoning_effort_ultra_maps_to_max_for_terra(self):
+        adapter, captured = self._build_adapter()
+        adapter.create(
+            model="gpt-5.6-terra",
+            messages=[{"role": "user", "content": "hi"}],
+            extra_body={"reasoning": {"effort": "ultra"}},
+        )
+        assert captured.get("reasoning") == {"effort": "max", "summary": "auto"}
+
+    def test_reasoning_effort_ultra_rejected_for_luna_before_network(self):
+        """Luna does NOT support ``ultra``; the auxiliary seam must raise a
+        local ValueError before the Responses stream (network) is opened."""
+        adapter, captured = self._build_adapter()
+        with pytest.raises(ValueError, match="gpt-5.6-luna"):
+            adapter.create(
+                model="gpt-5.6-luna",
+                messages=[{"role": "user", "content": "hi"}],
+                extra_body={"reasoning": {"effort": "ultra"}},
+            )
+        assert captured == {}, (
+            "Luna+ultra must be rejected before any responses.create() call — "
+            "no request may reach the Codex backend"
+        )
+
+    def test_non_codex_mode_sol_ultra_stays_literal(self):
+        """The adapter is SHARED (xAI OAuth, custom ``codex_responses``). In
+        non-Codex mode the Codex GPT-5.6 wire mapping must NOT apply:
+        ``gpt-5.6-sol`` + ``ultra`` stays literal ``ultra`` (no ``ultra`` to
+        ``max``)."""
+        adapter, captured = self._build_adapter(is_chatgpt_codex_backend=False)
+        adapter.create(
+            model="gpt-5.6-sol",
+            messages=[{"role": "user", "content": "hi"}],
+            extra_body={"reasoning": {"effort": "ultra"}},
+        )
+        assert captured.get("reasoning") == {"effort": "ultra", "summary": "auto"}
+
+    def test_non_codex_mode_luna_ultra_does_not_raise(self):
+        """Non-Codex mode must not run the Codex GPT-5.6 matrix, so
+        ``gpt-5.6-luna`` + ``ultra`` does not raise and stays literal
+        ``ultra`` (Luna rejection is a Codex-only rule)."""
+        adapter, captured = self._build_adapter(is_chatgpt_codex_backend=False)
+        adapter.create(
+            model="gpt-5.6-luna",
+            messages=[{"role": "user", "content": "hi"}],
+            extra_body={"reasoning": {"effort": "ultra"}},
+        )
+        assert captured.get("reasoning") == {"effort": "ultra", "summary": "auto"}
+
+    def test_non_codex_mode_minimal_still_clamped_to_low(self):
+        """Non-Codex mode keeps the pre-Task-3 ``minimal`` to ``low`` clamp."""
+        adapter, captured = self._build_adapter(is_chatgpt_codex_backend=False)
+        adapter.create(
+            model="gpt-5.6-sol",
+            messages=[{"role": "user", "content": "hi"}],
+            extra_body={"reasoning": {"effort": "minimal"}},
+        )
+        assert captured.get("reasoning") == {"effort": "low", "summary": "auto"}
+
+    def test_client_threads_non_codex_flag_to_shared_adapter(self):
+        """CodexAuxiliaryClient must thread ``is_chatgpt_codex_backend`` into
+        the shared adapter it builds so non-Codex seams do not inherit the
+        Codex GPT-5.6 wire mapping."""
+        from agent.auxiliary_client import CodexAuxiliaryClient
+        real_client = MagicMock()
+        non_codex = CodexAuxiliaryClient(
+            real_client, "gpt-5.6-sol", is_chatgpt_codex_backend=False,
+        )
+        codex = CodexAuxiliaryClient(
+            real_client, "gpt-5.6-sol", is_chatgpt_codex_backend=True,
+        )
+        assert non_codex.chat.completions._is_chatgpt_codex_backend is False
+        assert codex.chat.completions._is_chatgpt_codex_backend is True
 
     def test_reasoning_disabled_omits_reasoning_and_include(self):
         adapter, captured = self._build_adapter()

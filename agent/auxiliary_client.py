@@ -852,12 +852,23 @@ def _nous_min_key_ttl_seconds() -> int:
 
 
 class _CodexCompletionsAdapter:
-    """Drop-in shim that accepts chat.completions.create() kwargs and
-    routes them through the Codex Responses streaming API."""
+    """Drop-in shim that accepts chat.completions.create() kwargs and routes
+    them through the OpenAI Responses streaming API.
 
-    def __init__(self, real_client: OpenAI, model: str):
+    Shared by every Responses backend: the ChatGPT Codex OAuth endpoint, xAI
+    OAuth, and custom ``codex_responses`` gateways. ``is_chatgpt_codex_backend``
+    selects the reasoning-effort seam: ChatGPT Codex mode runs the shared
+    GPT-5.6 resolver (``ultra`` to wire ``max``, Luna rejection); every other
+    backend keeps the plain ``minimal`` to ``low`` clamp.
+    """
+
+    def __init__(
+        self, real_client: OpenAI, model: str, *,
+        is_chatgpt_codex_backend: bool = False,
+    ):
         self._client = real_client
         self._model = model
+        self._is_chatgpt_codex_backend = is_chatgpt_codex_backend
 
     def create(self, **kwargs) -> Any:
         messages = kwargs.get("messages", [])
@@ -929,11 +940,33 @@ class _CodexCompletionsAdapter:
                     # to the default rather than being forwarded to the
                     # Codex backend, which rejects e.g. {"effort": null}
                     # with a 400.
-                    effort = reasoning_cfg.get("effort") or "medium"
-                    # Codex backend rejects "minimal"; clamp to "low" to
-                    # match the main-agent Codex transport behavior.
-                    if effort == "minimal":
-                        effort = "low"
+                    if self._is_chatgpt_codex_backend:
+                        # ChatGPT Codex OAuth backend: model-aware validation +
+                        # normalization via the single shared resolver, matching
+                        # the main-agent Codex transport
+                        # (agent/transports/codex.py::build_kwargs) so the two
+                        # Codex Responses seams cannot drift: ``minimal`` to
+                        # ``low`` (Codex rejects ``minimal``), Sol/Terra accept
+                        # ``ultra`` and send it on the wire as ``max`` (the Codex
+                        # name for that tier), and Luna raises ``ValueError`` on
+                        # ``ultra`` before the Responses stream (network) opens.
+                        from agent.codex_model_capabilities import (
+                            resolve_codex_reasoning_effort,
+                        )
+
+                        effort = resolve_codex_reasoning_effort(
+                            str(model or ""),
+                            str(reasoning_cfg.get("effort") or "medium"),
+                        )
+                    else:
+                        # Non-Codex Responses seams sharing this adapter (xAI
+                        # OAuth, custom ``codex_responses`` gateways): preserve
+                        # exact pre-Task-3 behavior. Only clamp literal
+                        # ``minimal`` to ``low``; no GPT-5.6 matrix and no
+                        # ``ultra`` to ``max`` wire mapping.
+                        effort = reasoning_cfg.get("effort") or "medium"
+                        if effort == "minimal":
+                            effort = "low"
                     resp_kwargs["reasoning"] = {
                         "effort": effort,
                         "summary": "auto",
@@ -1176,15 +1209,26 @@ class _CodexChatShim:
 
 
 class CodexAuxiliaryClient:
-    """OpenAI-client-compatible wrapper that routes through Codex Responses API.
+    """OpenAI-client-compatible wrapper that routes through the shared
+    Responses adapter (ChatGPT Codex OAuth, xAI OAuth, or custom
+    ``codex_responses``).
 
     Consumers can call client.chat.completions.create(**kwargs) as normal.
     Also exposes .api_key and .base_url for introspection by async wrappers.
+    ``is_chatgpt_codex_backend`` is threaded to the adapter and gates the
+    GPT-5.6 Codex reasoning-effort seam; pass True only for the ChatGPT Codex
+    OAuth backend.
     """
 
-    def __init__(self, real_client: OpenAI, model: str):
+    def __init__(
+        self, real_client: OpenAI, model: str, *,
+        is_chatgpt_codex_backend: bool = False,
+    ):
         self._real_client = real_client
-        adapter = _CodexCompletionsAdapter(real_client, model)
+        adapter = _CodexCompletionsAdapter(
+            real_client, model,
+            is_chatgpt_codex_backend=is_chatgpt_codex_backend,
+        )
         self.chat = _CodexChatShim(adapter)
         self.api_key = real_client.api_key
         self.base_url = real_client.base_url
@@ -2392,7 +2436,11 @@ def _try_custom_endpoint() -> Tuple[Optional[Any], Optional[str]]:
         _extra["default_headers"] = _custom_headers
     if custom_mode == "codex_responses":
         real_client = _create_openai_client(api_key=custom_key, base_url=_clean_base, **_extra)
-        return CodexAuxiliaryClient(real_client, model), model
+        # Custom ``codex_responses`` gateway, NOT the ChatGPT Codex OAuth
+        # backend: no GPT-5.6 wire mapping.
+        return CodexAuxiliaryClient(
+            real_client, model, is_chatgpt_codex_backend=False
+        ), model
     if custom_mode == "anthropic_messages":
         # Third-party Anthropic-compatible gateway (MiniMax, Zhipu GLM,
         # LiteLLM proxies, etc.).  Must NEVER be treated as OAuth —
@@ -2442,7 +2490,10 @@ def _build_xai_oauth_aux_client(model: str) -> Tuple[Optional[Any], Optional[str
     api_key, base_url = resolved
     logger.debug("Auxiliary client: xAI OAuth (%s via Responses API)", model)
     real_client = _create_openai_client(api_key=api_key, base_url=base_url)
-    return CodexAuxiliaryClient(real_client, model), model
+    # xAI OAuth Responses seam, NOT the ChatGPT Codex OAuth backend.
+    return CodexAuxiliaryClient(
+        real_client, model, is_chatgpt_codex_backend=False
+    ), model
 
 
 def _build_codex_client(model: str) -> Tuple[Optional[Any], Optional[str]]:
@@ -2483,7 +2534,11 @@ def _build_codex_client(model: str) -> Tuple[Optional[Any], Optional[str]]:
         base_url=base_url,
         default_headers=_codex_cloudflare_headers(codex_token),
     )
-    return CodexAuxiliaryClient(real_client, model), model
+    # ChatGPT Codex OAuth backend: the ONLY seam that gets the GPT-5.6 wire
+    # mapping (``ultra`` to ``max``, Luna rejection).
+    return CodexAuxiliaryClient(
+        real_client, model, is_chatgpt_codex_backend=True
+    ), model
 
 
 def _try_azure_foundry(
@@ -2584,7 +2639,9 @@ def _try_azure_foundry(
         # GPT-5.x / o-series / codex models on Azure Foundry are
         # Responses-API-only — wrap so chat.completions.create() is
         # translated to /responses behind the scenes.
-        return CodexAuxiliaryClient(client, final_model), final_model
+        return CodexAuxiliaryClient(
+            client, final_model, is_chatgpt_codex_backend=False
+        ), final_model
 
     if runtime_api_mode == "anthropic_messages":
         # Forward ``api_key`` verbatim — for static keys it's a string,

@@ -4,6 +4,44 @@ from unittest.mock import patch
 from hermes_cli.codex_models import DEFAULT_CODEX_MODELS, get_codex_model_ids
 
 
+def test_gpt56_models_are_in_curated_fallback():
+    assert DEFAULT_CODEX_MODELS[:3] == [
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+    ]
+
+
+def test_fetch_from_api_keeps_visible_gpt56_models(monkeypatch):
+    import sys
+
+    from hermes_cli import codex_models
+
+    class _FakeResp:
+        status_code = 200
+
+        def json(self):
+            return {
+                "models": [
+                    {"slug": "gpt-5.6-sol", "priority": 0, "visibility": "list"},
+                    {"slug": "gpt-5.6-terra", "priority": 1, "visibility": "list"},
+                    {"slug": "gpt-5.6-luna", "priority": 2, "visibility": "list"},
+                ]
+            }
+
+    class _FakeHttpx:
+        @staticmethod
+        def get(url, headers=None, timeout=None):
+            return _FakeResp()
+
+    monkeypatch.setitem(sys.modules, "httpx", _FakeHttpx)
+    assert codex_models._fetch_models_from_api("token") == [
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+    ]
+
+
 def test_get_codex_model_ids_prioritizes_default_and_cache(tmp_path, monkeypatch):
     codex_home = tmp_path / "codex-home"
     codex_home.mkdir(parents=True, exist_ok=True)

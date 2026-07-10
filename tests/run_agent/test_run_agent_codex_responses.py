@@ -39,11 +39,11 @@ def _patch_agent_bootstrap(monkeypatch):
     monkeypatch.setattr(run_agent, "check_toolset_requirements", lambda: {})
 
 
-def _build_agent(monkeypatch):
+def _build_agent(monkeypatch, *, model="gpt-5-codex"):
     _patch_agent_bootstrap(monkeypatch)
 
     agent = run_agent.AIAgent(
-        model="gpt-5-codex",
+        model=model,
         base_url="https://chatgpt.com/backend-api/codex",
         api_key="codex-token",
         quiet_mode=True,
@@ -426,6 +426,27 @@ def test_build_api_kwargs_codex_preserves_supported_efforts(monkeypatch):
             ]
         )
         assert kwargs["reasoning"]["effort"] == effort, f"{effort} should pass through unchanged"
+
+
+@pytest.mark.parametrize("model", ["gpt-5.6-sol", "gpt-5.6-terra"])
+def test_build_api_kwargs_codex_maps_ultra_to_max_for_supported_gpt56(model, monkeypatch):
+    """Sol/Terra publish an ``ultra`` reasoning level as a user-facing
+    selection; routing through the shared resolver sends it on the wire as
+    ``max`` (the Codex backend's name for that maximum tier, since Codex exposes no
+    ``ultra`` wire mode), never clamped down to a lower effort."""
+    agent = _build_agent(monkeypatch, model=model)
+    agent.reasoning_config = {"enabled": True, "effort": "ultra"}
+    kwargs = agent._build_api_kwargs([{"role": "user", "content": "Ping"}])
+    assert kwargs["reasoning"]["effort"] == "max"
+
+
+def test_build_api_kwargs_codex_rejects_ultra_for_luna(monkeypatch):
+    """Luna does NOT support ``ultra``; the main seam must reject it with a
+    local ValueError before any transport/network call is made."""
+    agent = _build_agent(monkeypatch, model="gpt-5.6-luna")
+    agent.reasoning_config = {"enabled": True, "effort": "ultra"}
+    with pytest.raises(ValueError, match="gpt-5.6-luna"):
+        agent._build_api_kwargs([{"role": "user", "content": "Ping"}])
 
 
 def test_build_api_kwargs_copilot_responses_omits_openai_only_fields(monkeypatch):

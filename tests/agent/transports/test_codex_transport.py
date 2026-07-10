@@ -272,6 +272,53 @@ class TestCodexBuildKwargs:
         # "minimal" should be clamped to "low"
         assert kw.get("reasoning", {}).get("effort") == "low"
 
+    def test_non_codex_gpt56_sol_ultra_stays_literal(self, transport):
+        """Non-Codex Responses must NOT apply the Codex GPT-5.6 wire mapping.
+        A model literally named ``gpt-5.6-sol`` with ``ultra`` stays literal
+        ``ultra`` (no ``ultra`` to ``max``): the shared resolver is gated to
+        ``is_codex_backend``."""
+        messages = [{"role": "user", "content": "Hi"}]
+        kw = transport.build_kwargs(
+            model="gpt-5.6-sol", messages=messages, tools=[],
+            is_codex_backend=False,
+            reasoning_config={"effort": "ultra"},
+        )
+        assert kw.get("reasoning", {}).get("effort") == "ultra"
+
+    def test_non_codex_gpt56_luna_ultra_does_not_raise(self, transport):
+        """Non-Codex Responses must not run the Codex GPT-5.6 matrix, so
+        ``gpt-5.6-luna`` + ``ultra`` does not raise and stays literal
+        ``ultra`` (Luna rejection is a Codex-only rule)."""
+        messages = [{"role": "user", "content": "Hi"}]
+        kw = transport.build_kwargs(
+            model="gpt-5.6-luna", messages=messages, tools=[],
+            is_codex_backend=False,
+            reasoning_config={"effort": "ultra"},
+        )
+        assert kw.get("reasoning", {}).get("effort") == "ultra"
+
+    def test_non_codex_minimal_still_clamped_to_low(self, transport):
+        """Non-Codex Responses keeps the pre-Task-3 ``minimal`` to ``low``
+        clamp even for a GPT-5.6-named model."""
+        messages = [{"role": "user", "content": "Hi"}]
+        kw = transport.build_kwargs(
+            model="gpt-5.6-sol", messages=messages, tools=[],
+            is_codex_backend=False,
+            reasoning_config={"effort": "minimal"},
+        )
+        assert kw.get("reasoning", {}).get("effort") == "low"
+
+    def test_codex_backend_gpt56_sol_ultra_maps_to_max(self, transport):
+        """Codex backend keeps the GPT-5.6 wire mapping: ``gpt-5.6-sol`` +
+        ``ultra`` is sent on the wire as ``max``."""
+        messages = [{"role": "user", "content": "Hi"}]
+        kw = transport.build_kwargs(
+            model="gpt-5.6-sol", messages=messages, tools=[],
+            is_codex_backend=True,
+            reasoning_config={"effort": "ultra"},
+        )
+        assert kw.get("reasoning", {}).get("effort") == "max"
+
     def test_xai_reasoning_effort_passed(self, transport):
         messages = [{"role": "user", "content": "Hi"}]
         kw = transport.build_kwargs(

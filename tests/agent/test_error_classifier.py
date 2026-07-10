@@ -1064,6 +1064,16 @@ class TestClassifyApiError:
         result = classify_api_error(e)
         assert result.reason == FailoverReason.model_not_found
 
+    def test_message_only_model_not_found_stays_permanent_non_retryable(self):
+        """Regression lock (GPT-5.6 Task 5): a message-only "model not found"
+        (no HTTP status, e.g. a bad gpt-5.6-luna slug) must stay permanently
+        classified and non-retryable so the turn fails fast to fallback
+        instead of burning retries on a deterministic rejection."""
+        e = RuntimeError("Model not found gpt-5.6-luna")
+        result = classify_api_error(e)
+        assert result.reason is FailoverReason.model_not_found
+        assert result.retryable is False
+
     def test_message_context_overflow_pattern(self):
         e = Exception("maximum context length exceeded")
         result = classify_api_error(e)
