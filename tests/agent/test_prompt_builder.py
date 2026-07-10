@@ -1587,6 +1587,15 @@ class TestOpenAIModelExecutionGuidance:
         assert "missing_context" in text or "missing context" in text
         assert "hallucinate" in text or "guess" in text
 
+    def test_empty_recall_still_requires_local_repo_discovery(self):
+        text = OPENAI_MODEL_EXECUTION_GUIDANCE.lower()
+        assert "empty" in text
+        assert "session_search" in text or "memory" in text
+        assert "local" in text
+        assert "repo" in text or "repository" in text
+        assert "docs" in text or "documentation" in text
+        assert "git" in text
+
     def test_guidance_uses_xml_tags(self):
         assert "<tool_persistence>" in OPENAI_MODEL_EXECUTION_GUIDANCE
         assert "</tool_persistence>" in OPENAI_MODEL_EXECUTION_GUIDANCE
@@ -1644,5 +1653,4 @@ class TestParallelToolCallGuidance:
 # =========================================================================
 # Budget warning history stripping
 # =========================================================================
-
 

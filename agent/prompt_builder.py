@@ -373,9 +373,9 @@ PARALLEL_TOOL_CALL_GUIDANCE = (
     "in doubt and the calls are independent, batch them."
 )
 
-# OpenAI GPT/Codex-specific execution guidance.  Addresses known failure modes
-# where GPT models abandon work on partial results, skip prerequisite lookups,
-# hallucinate instead of using tools, and declare "done" without verification.
+# Model-agnostic execution guidance.  Addresses failure modes where models
+# abandon work on partial results, skip prerequisite lookups, hallucinate
+# instead of using tools, and declare "done" without verification.
 # Inspired by patterns from OpenAI's GPT-5.4 prompting guide & OpenClaw PR #38953.
 # Also applied to xAI Grok — same failure modes in practice (claims completion
 # without tool calls, suggests workarounds instead of using existing tools,
@@ -436,6 +436,10 @@ OPENAI_MODEL_EXECUTION_GUIDANCE = (
     "- If required context is missing, do NOT guess or hallucinate an answer.\n"
     "- Use the appropriate lookup tool when missing information is retrievable "
     "(search_files, web_search, read_file, etc.).\n"
+    "- If session_search or memory recall returns empty, that only means no "
+    "prior transcript or memory hit. For current repo/workspace questions, "
+    "inspect local files, docs, git status/log, and project context before saying "
+    "nothing was found or asking for the repo name.\n"
     "- Ask a clarifying question only when the information cannot be retrieved by tools.\n"
     "- If you must proceed with incomplete information, label assumptions explicitly.\n"
     "</missing_context>"
@@ -967,7 +971,7 @@ def _probe_remote_backend(env_type: str) -> str | None:
         else:
             image = ""
 
-        ssh_config = None
+        ssh_config = {}
         if env_type == "ssh":
             ssh_config = {
                 "host": config.get("ssh_host", ""),
@@ -977,7 +981,7 @@ def _probe_remote_backend(env_type: str) -> str | None:
                 "persistent": config.get("ssh_persistent", False),
             }
 
-        container_config = None
+        container_config = {}
         if env_type in {"docker", "singularity", "modal", "daytona"}:
             container_config = {
                 "container_cpu": config.get("container_cpu", 1),
@@ -1003,7 +1007,7 @@ def _probe_remote_backend(env_type: str) -> str | None:
             ssh_config=ssh_config,
             container_config=container_config,
             task_id="prompt-backend-probe",
-            host_cwd=config.get("host_cwd"),
+            host_cwd=config.get("host_cwd") or "",
         )
         # Single-line POSIX probe — works on any Unixy backend. Wrapped in
         # `2>/dev/null` so a missing binary doesn't pollute the output.

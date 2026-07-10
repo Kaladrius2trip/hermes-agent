@@ -54,7 +54,7 @@ class TestContextFileCwd:
 
     def test_configured_dir_when_terminal_cwd_set(self, monkeypatch, tmp_path):
         monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
-        assert _captured_context_cwd(_make_agent()) == tmp_path
+        assert _captured_context_cwd(_make_agent()) == str(tmp_path)
 
 
 def _stable_prompt(agent):
@@ -99,3 +99,17 @@ class TestCodingContextBlock:
         monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
         agent = _make_agent(valid_tool_names=[], platform="cli")
         assert "coding agent" not in _stable_prompt(agent)
+
+
+class TestExecutionDisciplineBlock:
+    def test_injected_for_sonnet_when_tools_available(self):
+        agent = _make_agent(
+            valid_tool_names=["session_search", "read_file", "terminal"],
+            model="claude-sonnet-5",
+            platform="cli",
+        )
+
+        stable = _stable_prompt(agent)
+
+        assert "# Execution discipline" in stable
+        assert "<tool_persistence>" in stable
