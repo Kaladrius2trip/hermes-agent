@@ -16153,15 +16153,19 @@ def main(
                         runtime_override=turn_route["runtime"],
                         request_overrides=turn_route.get("request_overrides"),
                     ):
-                        cli.agent.quiet_mode = True
-                        cli.agent.suppress_status_output = True
+                        turn_agent = cli.agent
+                        if turn_agent is None:
+                            sys.exit(1)
+                        turn_agent.quiet_mode = True
+                        turn_agent.suppress_status_output = True
                         # Suppress streaming display callbacks so stdout stays
                         # machine-readable (no styled "Hermes" box, no tool-gen
                         # status lines).  The response is printed once below.
-                        cli.agent.stream_delta_callback = None
-                        cli.agent.tool_gen_callback = None
+                        turn_agent.stream_delta_callback = None
+                        turn_agent.reasoning_callback = None
+                        turn_agent.tool_gen_callback = None
                         try:
-                            result = cli.agent.run_conversation(
+                            result = turn_agent.run_conversation(
                                 user_message=effective_query,
                                 conversation_history=cli.conversation_history,
                             )
