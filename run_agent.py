@@ -4452,6 +4452,8 @@ class AIAgent:
             else:
                 self._client_kwargs.pop("default_headers", None)
 
+        self._apply_meridian_session_header()
+
         # User-configured overrides win over URL/profile defaults — keep them
         # applied across credential swaps and client rebuilds, not just at
         # first construction.
@@ -4472,6 +4474,14 @@ class AIAgent:
                 )
             except Exception:
                 logger.debug("custom-provider extra_headers skipped", exc_info=True)
+
+    def _apply_meridian_session_header(self) -> None:
+        if self.provider != "meridian":
+            return
+        headers = dict(self._client_kwargs.get("default_headers") or {})
+        headers.setdefault("x-meridian-agent", "hermes")
+        headers["x-hermes-session"] = self._meridian_hermes_session
+        self._client_kwargs["default_headers"] = headers
 
     def _apply_user_default_headers(self) -> None:
         """Merge user-configured request headers onto the OpenAI client.

@@ -770,6 +770,49 @@ class TestGetModelContextLengthLocalFallback:
 
         assert result == CONTEXT_PROBE_TIERS[0]
 
+    def test_meridian_detail_404_uses_models_list_context_window(self):
+        from agent.model_metadata import get_model_context_length
+
+        model = "claude-sonnet-5"
+        base = "http://127.0.0.1:3456/v1"
+
+        detail_resp = MagicMock()
+        detail_resp.status_code = 404
+        detail_resp.json.return_value = {}
+        list_resp = MagicMock()
+        list_resp.status_code = 200
+        list_resp.json.return_value = {
+            "models": [
+                {"slug": model, "context_window": 1_000_000},
+                {"slug": "claude-opus-4.8", "context_window": 1_000_000},
+            ]
+        }
+
+        client_mock = MagicMock()
+        client_mock.__enter__ = lambda s: client_mock
+        client_mock.__exit__ = MagicMock(return_value=False)
+        client_mock.get.side_effect = [detail_resp, list_resp]
+
+        with patch("agent.model_metadata.get_cached_context_length", return_value=None), \
+             patch("agent.model_metadata.fetch_endpoint_model_metadata", return_value={}), \
+             patch("agent.model_metadata.fetch_model_metadata", return_value={}), \
+             patch("agent.model_metadata._query_ollama_api_show", return_value=None), \
+             patch("agent.model_metadata.detect_local_server_type", return_value=None), \
+             patch("httpx.Client", return_value=client_mock), \
+             patch("agent.model_metadata.save_context_length") as mock_save:
+            result = get_model_context_length(
+                model,
+                base_url=base,
+                provider="meridian",
+            )
+
+        assert result == 1_000_000
+        assert [call.args[0] for call in client_mock.get.call_args_list] == [
+            f"{base}/models/{model}",
+            f"{base}/models",
+        ]
+        mock_save.assert_not_called()
+
     def test_non_local_endpoint_does_not_query_local_server(self):
         """For non-local endpoints, _query_local_context_length is not called."""
         from agent.model_metadata import get_model_context_length

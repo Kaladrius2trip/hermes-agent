@@ -941,6 +941,23 @@ class TestGetModelContextLength:
 
     @patch("agent.model_metadata.fetch_model_metadata")
     @patch("agent.model_metadata.fetch_endpoint_model_metadata")
+    def test_meridian_uses_live_models_context_window(self, mock_endpoint_fetch, mock_fetch):
+        mock_fetch.return_value = {}
+        mock_endpoint_fetch.return_value = {
+            "claude-sonnet-5": {"context_length": 1_000_000}
+        }
+
+        result = get_model_context_length(
+            "claude-sonnet-5",
+            provider="meridian",
+            base_url="http://127.0.0.1:3456/v1",
+            api_key="dummy-meridian-api-key",
+        )
+
+        assert result == 1_000_000
+
+    @patch("agent.model_metadata.fetch_model_metadata")
+    @patch("agent.model_metadata.fetch_endpoint_model_metadata")
     def test_custom_endpoint_fuzzy_substring_match(self, mock_endpoint_fetch, mock_fetch):
         """Fuzzy match: configured model name is substring of endpoint model."""
         mock_fetch.return_value = {}

@@ -420,6 +420,7 @@ def init_agent(
     agent.base_url = base_url or ""
     provider_name = provider.strip().lower() if isinstance(provider, str) and provider.strip() else None
     agent.provider = provider_name or ""
+    agent._meridian_hermes_session = uuid.uuid4().hex
     agent.acp_command = acp_command or command
     agent.acp_args = list(acp_args or args or [])
     if api_mode in {"chat_completions", "codex_responses", "anthropic_messages", "bedrock_converse", "codex_app_server"}:
@@ -1043,6 +1044,7 @@ def init_agent(
                     )
         
         agent._client_kwargs = client_kwargs  # stored for rebuilding after interrupt
+        agent._apply_meridian_session_header()
 
         # Enable fine-grained tool streaming for Claude on OpenRouter.
         # Without this, Anthropic buffers the entire tool call and goes

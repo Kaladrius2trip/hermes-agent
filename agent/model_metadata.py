@@ -11,7 +11,7 @@ import os
 import re
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import requests
@@ -535,7 +535,7 @@ def _skip_persistent_context_cache(base_url: str, provider: str) -> bool:
     LM Studio excludes caching because loaded context is transient — the user
     can reload the model with a different context_length at any time.
    """
-    return provider == "lmstudio"
+    return provider in {"lmstudio", "meridian"}
 
 
 def _maybe_cache_local_context_length(
@@ -762,6 +762,26 @@ def _iter_nested_dicts(value: Any):
             yield from _iter_nested_dicts(item)
 
 
+def _iter_model_list_entries(payload: object) -> Iterator[Dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return
+    for key in ("data", "models"):
+        entries = payload.get(key)
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if isinstance(entry, dict):
+                yield entry
+
+
+def _model_entry_id(entry: Dict[str, Any]) -> str:
+    for key in ("id", "slug"):
+        value = entry.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
 def _coerce_reasonable_int(value: Any, minimum: int = 1024, maximum: int = 10_000_000) -> Optional[int]:
     try:
         if isinstance(value, bool):
@@ -986,10 +1006,8 @@ def fetch_endpoint_model_metadata(
             response.raise_for_status()
             payload = response.json()
             cache: Dict[str, Dict[str, Any]] = {}
-            for model in payload.get("data", []):
-                if not isinstance(model, dict):
-                    continue
-                model_id = model.get("id")
+            for model in _iter_model_list_entries(payload):
+                model_id = _model_entry_id(model)
                 if not model_id:
                     continue
                 entry: Dict[str, Any] = {"name": model.get("name", model_id)}
@@ -1005,10 +1023,7 @@ def fetch_endpoint_model_metadata(
                 _add_model_aliases(cache, model_id, entry)
 
             # If this is a llama.cpp server, query /props for actual allocated context
-            is_llamacpp = any(
-                m.get("owned_by") == "llamacpp"
-                for m in payload.get("data", []) if isinstance(m, dict)
-            )
+            is_llamacpp = any(m.get("owned_by") == "llamacpp" for m in _iter_model_list_entries(payload))
             if is_llamacpp:
                 try:
                     # Try /v1/props first (current llama.cpp); fall back to /props for older builds
@@ -1770,12 +1785,11 @@ def _query_local_context_length_uncached(model: str, base_url: str, api_key: str
             resp = client.get(f"{server_url}/v1/models")
             if resp.status_code == 200:
                 data = resp.json()
-                models_list = data.get("data", [])
-                for m in models_list:
-                    if _model_id_matches(m.get("id", ""), model):
-                        ctx = m.get("max_model_len") or m.get("context_length") or m.get("max_tokens")
-                        if ctx and isinstance(ctx, (int, float)):
-                            return int(ctx)
+                for m in _iter_model_list_entries(data):
+                    if _model_id_matches(_model_entry_id(m), model):
+                        ctx = _extract_context_length(m)
+                        if ctx is not None:
+                            return ctx
     except Exception:
         pass
 
@@ -2321,6 +2335,10 @@ def get_model_context_length(
         ctx = _resolve_endpoint_context_length(model, base_url, api_key=api_key)
         if ctx is not None:
             return ctx
+    if effective_provider == "meridian" and base_url:
+        ctx = _resolve_endpoint_context_length(model, base_url, api_key=api_key)
+        if ctx is not None:
+            return ctx
     # 5e. Ollama native /api/show probe — runs for providers whose base_url
     # is NOT a known non-Ollama provider.  Ollama-compatible servers expose
     # this endpoint regardless of hostname (local Ollama, Ollama Cloud,
@@ -2455,7 +2473,7 @@ async def get_model_context_length_async(
     )
 
 
-def estimate_tokens_rough(text: str) -> int:
+def estimate_tokens_rough(text: str | None) -> int:
     """Rough token estimate (~4 chars/token) for pre-flight checks.
 
     Uses ceiling division so short texts (1-3 chars) never estimate as
