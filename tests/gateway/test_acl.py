@@ -455,3 +455,94 @@ def test_acl_parser_requires_channel_context_for_this_channel(text):
 
     with pytest.raises(ValueError, match="channel"):
         parse_acl_command(text, ctx)
+
+
+def test_acl_platform_enforced_defaults_and_exemptions():
+    from gateway.acl import ACL_EXEMPT_PLATFORMS, acl_platform_enforced
+
+    assert acl_platform_enforced("discord") is True
+    for platform in ("telegram", "slack", "whatsapp", "matrix"):
+        assert acl_platform_enforced(platform) is False
+        assert acl_platform_enforced(platform, ["*"]) is True
+    for platform in ACL_EXEMPT_PLATFORMS:
+        assert acl_platform_enforced(platform) is False
+        assert acl_platform_enforced(platform, ["*"]) is False
+    assert acl_platform_enforced("") is False
+    assert acl_platform_enforced(None) is False
+
+    assert acl_platform_enforced("telegram", ["discord"]) is False
+    assert acl_platform_enforced("discord", ["discord"]) is True
+    assert acl_platform_enforced("telegram", ["*"]) is True
+    assert acl_platform_enforced("telegram", ["TELEGRAM "]) is True
+    assert acl_platform_enforced(Platform.TELEGRAM, ["telegram"]) is True
+
+
+def test_bootstrap_super_admins_collected_for_all_platforms():
+    configs = {
+        Platform.DISCORD: PlatformConfig(enabled=True, extra={"allowed_users": ["d1"]}),
+        Platform.TELEGRAM: PlatformConfig(enabled=True, extra={"allow_from": ["t1"]}),
+        Platform.SLACK: PlatformConfig(enabled=True, extra={"acl_super_admins": ["s1"]}),
+        Platform.WEBHOOK: PlatformConfig(enabled=True, extra={"allowed_users": ["w1"]}),
+    }
+    env = {
+        "TELEGRAM_ALLOWED_USERS": "t2",
+        "QQ_ALLOWED_USERS": "q1",
+        "SLACK_ACL_SUPER_ADMINS": "s2",
+    }
+    bootstrap = collect_bootstrap_super_admins(configs, env=env)
+
+    assert bootstrap.is_super_admin("discord", "d1")
+    assert bootstrap.is_super_admin("telegram", "t1")
+    assert bootstrap.is_super_admin("telegram", "t2")
+    assert bootstrap.is_super_admin("slack", "s1")
+    assert bootstrap.is_super_admin("slack", "s2")
+    assert not bootstrap.is_super_admin("webhook", "w1")
+    assert not bootstrap.is_super_admin("qqbot", "q1")
+
+
+def test_bootstrap_env_allowlist_needs_platform_config():
+    configs = {
+        Platform.QQBOT: PlatformConfig(enabled=True, extra={}),
+    }
+    env = {"QQ_ALLOWED_USERS": "q1"}
+    bootstrap = collect_bootstrap_super_admins(configs, env=env)
+
+    assert bootstrap.is_super_admin("qqbot", "q1")
+
+
+def test_dm_scope_requires_explicit_dm_membership(tmp_path):
+    store = ACLStore(tmp_path / "acl.sqlite3")
+    store.grant_membership(
+        platform="telegram",
+        subject_type="user",
+        subject_id="u1",
+        group_name="default",
+        scope="channel",
+        scope_id="c1",
+    )
+
+    dm_policy = resolve_acl(
+        store,
+        ACLRequest(platform="telegram", user_id="u1", scope="dm"),
+    )
+    assert dm_policy.can_chat is False
+    assert dm_policy.denied_reason == "no_acl_membership"
+
+    channel_policy = resolve_acl(
+        store,
+        ACLRequest(platform="telegram", user_id="u1", scope="channel", channel_id="c1"),
+    )
+    assert channel_policy.can_chat is True
+
+    store.grant_membership(
+        platform="telegram",
+        subject_type="user",
+        subject_id="u1",
+        group_name="default",
+        scope="dm",
+    )
+    dm_after_grant = resolve_acl(
+        store,
+        ACLRequest(platform="telegram", user_id="u1", scope="dm"),
+    )
+    assert dm_after_grant.can_chat is True

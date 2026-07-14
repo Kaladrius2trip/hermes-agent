@@ -135,6 +135,17 @@ def _coerce_dict(value: Any) -> Dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def _coerce_platform_name_list(value: Any) -> "Optional[List[str]]":
+    if value is None:
+        return None
+    if isinstance(value, str):
+        value = value.split(",")
+    if not isinstance(value, (list, tuple, set, frozenset)):
+        return None
+    names = [str(item).strip().lower() for item in value if str(item).strip()]
+    return names or None
+
+
 def _normalize_unauthorized_dm_behavior(value: Any, default: str = "pair") -> str:
     """Normalize unauthorized DM behavior to a supported value."""
     if isinstance(value, str):
@@ -711,6 +722,12 @@ class GatewayConfig:
     # Unauthorized DM policy
     unauthorized_dm_behavior: str = "pair"  # "pair" or "ignore"
 
+    # Gateway ACL enforcement scope: None = legacy default (Discord only);
+    # a list names the enforced platforms; "*" inside the list means every
+    # user-chat platform. System-authenticated platforms are always exempt
+    # (see gateway.acl.ACL_EXEMPT_PLATFORMS).
+    acl_enforced_platforms: Optional[list] = None
+
     # Streaming configuration
     streaming: StreamingConfig = field(default_factory=StreamingConfig)
 
@@ -825,6 +842,7 @@ class GatewayConfig:
             "max_concurrent_sessions": self.max_concurrent_sessions,
             "multiplex_profiles": self.multiplex_profiles,
             "unauthorized_dm_behavior": self.unauthorized_dm_behavior,
+            "acl_enforced_platforms": self.acl_enforced_platforms,
             "streaming": self.streaming.to_dict(),
             "session_store_max_age_days": self.session_store_max_age_days,
         }
@@ -913,6 +931,14 @@ class GatewayConfig:
             "pair",
         )
 
+        acl_enforced_platforms = data.get("acl_enforced_platforms")
+        if acl_enforced_platforms is None and isinstance(nested_gateway, dict):
+            acl_enforced_platforms = nested_gateway.get("acl_enforced_platforms")
+        env_acl_platforms = os.getenv("GATEWAY_ACL_PLATFORMS", "").strip()
+        if env_acl_platforms:
+            acl_enforced_platforms = env_acl_platforms
+        acl_enforced_platforms = _coerce_platform_name_list(acl_enforced_platforms)
+
         try:
             session_store_max_age_days = int(data.get("session_store_max_age_days", 90))
             session_store_max_age_days = max(session_store_max_age_days, 0)
@@ -939,6 +965,7 @@ class GatewayConfig:
             multiplex_profiles=_coerce_bool(multiplex_profiles, False),
             max_concurrent_sessions=max_concurrent_sessions,
             unauthorized_dm_behavior=unauthorized_dm_behavior,
+            acl_enforced_platforms=acl_enforced_platforms,
             streaming=StreamingConfig.from_dict(data.get("streaming", {})),
             session_store_max_age_days=session_store_max_age_days,
         )

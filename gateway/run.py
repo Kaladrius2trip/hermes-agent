@@ -5457,7 +5457,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     ) -> bool:
         """True when ``source`` may inject text into ``running_agent`` mid-run."""
         platform = source.platform.value if hasattr(source.platform, "value") else str(source.platform or "")
-        if platform.lower() != "discord" or getattr(self, "acl_store", None) is None:
+        if not self._acl_platform_enforced(platform) or getattr(self, "acl_store", None) is None:
             return True
         if running_agent is None or running_agent is _AGENT_PENDING_SENTINEL:
             return False
@@ -12774,6 +12774,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
 
 
+    def _acl_platform_enforced(self, platform: Any) -> bool:
+        from gateway.acl import acl_platform_enforced
+
+        enforced = getattr(getattr(self, "config", None), "acl_enforced_platforms", None)
+        return acl_platform_enforced(platform, enforced)
+
     def _acl_scope_for_source(self, source: SessionSource) -> str:
         chat_type = str(getattr(source, "chat_type", "") or "dm").lower()
         return "dm" if chat_type in {"dm", "direct", "private"} else "channel"
@@ -12839,9 +12845,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         *,
         policy=None,
     ) -> Optional[str]:
-        """Return an ACL denial message for Discord gateway access, else None."""
+        """Return an ACL denial message for gateway access, else None."""
         platform = source.platform.value if hasattr(source.platform, "value") else str(source.platform or "")
-        if platform.lower() != "discord":
+        if not self._acl_platform_enforced(platform):
             return None
         # Real GatewayRunner.__init__ sets acl_store. If a bare harness or
         # partially-initialized runner lacks it, fail closed rather than
@@ -14025,7 +14031,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # platform's full toolset (terminal, file, ...) via /background.
             # Mirrors the _run_agent gate.
             allowed_tool_names = None
-            if source.platform == Platform.DISCORD and getattr(self, "acl_store", None) is not None:
+            if self._acl_platform_enforced(source.platform) and getattr(self, "acl_store", None) is not None:
                 acl_policy = self._resolve_acl_policy_for_source(source)
                 if not getattr(acl_policy, "can_chat", False):
                     await adapter.send(
@@ -17875,7 +17881,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
 
         source_platform = source.platform.value if hasattr(source.platform, "value") else str(source.platform or "")
-        if not acl_bypass and source_platform.lower() == "discord" and getattr(self, "acl_store", None) is None:
+        if not acl_bypass and self._acl_platform_enforced(source_platform) and getattr(self, "acl_store", None) is None:
             return {
                 "final_response": self._check_acl_access(source, None) or "⛔ Chat denied by ACL.",
                 "messages": [],
@@ -18870,7 +18876,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             ) = self._discord_effective_agent_privacy(source, enabled_toolsets)
             acl_policy = None
             allowed_tool_names = None
-            if not acl_bypass and source.platform == Platform.DISCORD and getattr(self, "acl_store", None) is not None:
+            if not acl_bypass and self._acl_platform_enforced(source.platform) and getattr(self, "acl_store", None) is not None:
                 acl_policy = self._resolve_acl_policy_for_source(source)
                 if not getattr(acl_policy, "can_chat", False):
                     return {

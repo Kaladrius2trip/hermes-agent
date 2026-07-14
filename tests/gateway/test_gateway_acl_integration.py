@@ -702,3 +702,113 @@ async def test_acl_command_is_discord_only_v1(tmp_path):
     output = await runner._handle_acl_command(event)
 
     assert output == "⛔ /acl is Discord-only in ACL v1."
+
+
+def _tg_source(user_id: str = "t1", *, chat_type: str = "dm", chat_id: str = "chat1") -> SessionSource:
+    return SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id=chat_id,
+        chat_type=chat_type,
+        user_id=user_id,
+        user_name=user_id,
+    )
+
+
+def _tg_runner(tmp_path, *, enforced_platforms=None) -> GatewayRunner:
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, extra={})},
+        acl_enforced_platforms=enforced_platforms,
+    )
+    runner.acl_store = ACLStore(tmp_path / "gateway_acl.sqlite3")
+    runner._acl_bootstrap_super_admins = BootstrapSuperAdmins({})
+    runner._is_user_authorized = lambda _source: True
+    return runner
+
+
+def test_gateway_acl_telegram_not_enforced_by_default(tmp_path):
+    runner = _tg_runner(tmp_path)
+
+    assert runner._check_acl_access(_tg_source("stranger"), None) is None
+
+
+def test_gateway_acl_telegram_enforced_when_opted_in(tmp_path):
+    runner = _tg_runner(tmp_path, enforced_platforms=["*"])
+
+    denial = runner._check_acl_access(_tg_source("stranger"), None)
+    assert denial is not None
+    assert "denied by ACL" in denial
+
+
+def test_gateway_acl_telegram_channel_grant_does_not_open_dm(tmp_path):
+    runner = _tg_runner(tmp_path, enforced_platforms=["*"])
+    runner.acl_store.grant_membership(
+        platform="telegram",
+        subject_type="user",
+        subject_id="t1",
+        group_name="default",
+        scope="channel",
+        scope_id="grp1",
+    )
+
+    channel_source = _tg_source("t1", chat_type="group", chat_id="grp1")
+    assert runner._check_acl_access(channel_source, None) is None
+
+    dm_source = _tg_source("t1", chat_type="dm")
+    denial = runner._check_acl_access(dm_source, None)
+    assert denial is not None
+    assert "denied by ACL" in denial
+
+
+def test_gateway_acl_telegram_dm_grant_opens_dm(tmp_path):
+    runner = _tg_runner(tmp_path, enforced_platforms=["telegram"])
+    runner.acl_store.grant_membership(
+        platform="telegram",
+        subject_type="user",
+        subject_id="t1",
+        group_name="default",
+        scope="dm",
+    )
+
+    assert runner._check_acl_access(_tg_source("t1"), None) is None
+
+
+def test_gateway_acl_enforced_platforms_config_limits_enforcement(tmp_path):
+    runner = _tg_runner(tmp_path, enforced_platforms=["discord"])
+
+    assert runner._check_acl_access(_tg_source("stranger"), None) is None
+
+    runner_all = _tg_runner(tmp_path, enforced_platforms=["*"])
+    assert runner_all._check_acl_access(_tg_source("stranger"), None) is not None
+
+
+def test_gateway_acl_steer_cover_applies_on_telegram(tmp_path):
+    runner = _tg_runner(tmp_path, enforced_platforms=["*"])
+    runner.acl_store.grant_membership(
+        platform="telegram",
+        subject_type="user",
+        subject_id="t1",
+        group_name="default",
+        scope="channel",
+        scope_id="grp1",
+    )
+    agent = _FakeRunningAgent(valid_tool_names={"terminal", "clarify", "todo"})
+
+    source = _tg_source("t1", chat_type="group", chat_id="grp1")
+    assert runner._running_agent_acl_tools_covered_by_source(source, agent) is False
+
+    safe_agent = _FakeRunningAgent(valid_tool_names={"clarify", "todo"})
+    assert runner._running_agent_acl_tools_covered_by_source(source, safe_agent) is True
+
+
+def test_gateway_acl_never_enforced_on_system_platforms(tmp_path):
+    runner = _tg_runner(tmp_path, enforced_platforms=["*"])
+    webhook_source = SessionSource(
+        platform=Platform.WEBHOOK,
+        chat_id="hook1",
+        chat_type="dm",
+        user_id="system",
+        user_name="system",
+    )
+
+    assert runner._check_acl_access(webhook_source, None) is None

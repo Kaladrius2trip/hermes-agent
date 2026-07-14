@@ -20,6 +20,17 @@ from hermes_constants import get_hermes_home
 
 
 BUILTIN_GROUPS = frozenset({"default", "admin"})
+# Platforms whose events are authenticated by the system itself (HMAC webhooks,
+# HASS token, upstream relay auth, local CLI) — never user-chat surfaces.
+# Gateway ACL user policy does not apply to them.
+ACL_EXEMPT_PLATFORMS = frozenset({
+    "local",
+    "homeassistant",
+    "webhook",
+    "msgraph_webhook",
+    "api_server",
+    "relay",
+})
 DISCOVERY_SLASH_COMMANDS = frozenset({"help", "whoami"})
 DEFAULT_SAFE_TOOL_NAMES = frozenset({"clarify", "todo"})
 DEFAULT_SAFE_SLASH_COMMANDS = DISCOVERY_SLASH_COMMANDS
@@ -589,30 +600,45 @@ def collect_bootstrap_super_admins(
     # design.md): "Users in DISCORD_ALLOWED_USERS or platform allow_from are
     # Hermes ACL super-admins." Without this, every pre-ACL deployment whose
     # owner is only in DISCORD_ALLOWED_USERS is locked out of chat AND of the
-    # /acl command needed to fix it.
+    # /acl command needed to fix it. With platform-wide ACL enforcement the
+    # same lockout applies on every platform, so the legacy rule is applied
+    # to each configured platform's allowlist below.
     add("discord", env.get("DISCORD_ALLOWED_USERS"))
 
     for key, cfg in (platform_configs or {}).items():
         platform = _platform_key_to_name(key)
+        if platform in ACL_EXEMPT_PLATFORMS:
+            continue
         extra = _platform_extra(cfg)
-        if platform == "discord":
-            add(platform, extra.get("acl_super_admins"))
-            add(platform, extra.get("allow_admin_from"))
-            add(platform, _flatten_group_mapping(extra.get("group_allow_admin_from")))
-            # Legacy bootstrap authority (see spec note above).
-            add(platform, extra.get("allowed_users"))
-            add(platform, extra.get("allow_from"))
-        else:
-            # Other platforms can opt into the same explicit ACL admin naming.
-            # Chat allowlists and roles are intentionally ignored for bootstrap
-            # super-admins.
-            env_key = f"{platform.upper()}_ACL_SUPER_ADMINS"
-            add(platform, env.get(env_key))
-            add(platform, extra.get("acl_super_admins"))
-            add(platform, extra.get("allow_admin_from"))
-            add(platform, _flatten_group_mapping(extra.get("group_allow_admin_from")))
+        add(platform, extra.get("acl_super_admins"))
+        add(platform, extra.get("allow_admin_from"))
+        add(platform, _flatten_group_mapping(extra.get("group_allow_admin_from")))
+        add(platform, extra.get("allowed_users"))
+        add(platform, extra.get("allow_from"))
+        if platform != "discord":
+            add(platform, env.get(f"{platform.upper()}_ACL_SUPER_ADMINS"))
+            add(platform, env.get(_legacy_allowlist_env_key(platform)))
 
     return BootstrapSuperAdmins({k: frozenset(v) for k, v in platform_users.items()})
+
+
+_LEGACY_ALLOWLIST_ENV_ALIASES = {"qqbot": "QQ_ALLOWED_USERS"}
+
+
+def _legacy_allowlist_env_key(platform: str) -> str:
+    return _LEGACY_ALLOWLIST_ENV_ALIASES.get(platform, f"{platform.upper()}_ALLOWED_USERS")
+
+
+def acl_platform_enforced(platform: Any, enforced_platforms: Optional[Iterable[str]] = None) -> bool:
+    if platform is None:
+        return False
+    name = _norm_platform(platform)
+    if not name or name in ACL_EXEMPT_PLATFORMS:
+        return False
+    if enforced_platforms is None:
+        return name == "discord"
+    allowed = {str(p).strip().lower() for p in enforced_platforms if str(p).strip()}
+    return "*" in allowed or name in allowed
 
 
 def parse_acl_command(text: str, context: ACLCommandContext) -> ACLCommand:
@@ -951,6 +977,7 @@ def _format_scope(scope: Optional[str], scope_id: Optional[str]) -> str:
 
 
 __all__ = [
+    "ACL_EXEMPT_PLATFORMS",
     "ACLCommand",
     "ACLCommandContext",
     "ACLGroup",
@@ -961,6 +988,7 @@ __all__ = [
     "BootstrapSuperAdmins",
     "DISCOVERY_SLASH_COMMANDS",
     "EffectiveACLPolicy",
+    "acl_platform_enforced",
     "apply_acl_command",
     "collect_bootstrap_super_admins",
     "format_acl_policy",
