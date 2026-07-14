@@ -5360,8 +5360,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             session_id = await asyncio.to_thread(
                 self._lookup_session_id_under_store_lock, session_store, session_key
             )
-        except Exception:
+        except (AttributeError, TypeError):
             return False
+        except Exception:
+            logger.warning(
+                "Compression in-flight check failed while reading session %s; "
+                "treating compression as active to avoid interrupting a possible "
+                "parent-session rotation",
+                session_key,
+                exc_info=True,
+            )
+            return True
         if not session_id:
             return False
         session_db = getattr(self, "_session_db", None)
@@ -5373,8 +5382,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 raw_db.get_compression_lock_holder, str(session_id)
             )
             return bool(holder)
-        except Exception:
+        except (AttributeError, TypeError):
             return False
+        except Exception:
+            logger.warning(
+                "Compression in-flight check failed while reading lock holder "
+                "for session %s; treating compression as active to avoid "
+                "interrupting a possible parent-session rotation",
+                session_id,
+                exc_info=True,
+            )
+            return True
 
     @staticmethod
     def _lookup_session_id_under_store_lock(session_store, session_key: str):
@@ -17764,7 +17782,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         channel_prompt: Optional[str] = None,
         acl_bypass: bool = False,
         moa_config: Optional[dict] = None,
-        persist_user_message: Optional[str] = None,
+        persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
@@ -17828,7 +17846,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         channel_prompt: Optional[str] = None,
         acl_bypass: bool = False,
         moa_config: Optional[dict] = None,
-        persist_user_message: Optional[str] = None,
+        persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
     ) -> Dict[str, Any]:
         """
