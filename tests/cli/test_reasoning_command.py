@@ -30,7 +30,7 @@ class TestParseReasoningConfig(unittest.TestCase):
         self.assertEqual(result, {"enabled": False})
 
     def test_valid_levels(self):
-        for level in ("minimal", "low", "medium", "high", "xhigh", "max", "ultra"):
+        for level in ("low", "medium", "high", "xhigh", "max", "ultra", "minimal"):
             result = self._parse(level)
             self.assertIsNotNone(result)
             self.assertTrue(result.get("enabled"))
