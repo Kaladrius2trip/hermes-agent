@@ -2257,6 +2257,13 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             pass
         return result
 
+    # Gate B: independent raw-ACL backstop for inline tools (session_search/
+    # read_terminal/memory/...) that bypass handle_function_call's gate. Bridge exempt.
+    from model_tools import acl_dispatch_denial
+    _raw_acl_denial = acl_dispatch_denial(getattr(agent, "allowed_tool_names", None), function_name)
+    if _raw_acl_denial is not None:
+        return _raw_acl_denial
+
     # ACL applies to every tool the model calls, including agent-owned inline
     # tools. Agent-owned tools only bypass the registry dispatcher after the
     # allowlist check passes.

@@ -1097,6 +1097,16 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         except Exception:
             pass
 
+        # Gate B: independent raw-ACL backstop (sequential path). Inline tools
+        # (session_search/read_terminal/memory/...) never reach handle_function_call.
+        from model_tools import acl_dispatch_denial
+        _raw_acl_denial = acl_dispatch_denial(getattr(agent, "allowed_tool_names", None), function_name)
+        if _raw_acl_denial is not None:
+            messages.append(make_tool_result_message(function_name, _raw_acl_denial, tool_call.id))
+            _flush_session_db_after_tool_progress(agent, messages, stage=f"acl denied {function_name}")
+            agent._apply_pending_steer_to_tool_results(messages, 1)
+            continue
+
         function_args, middleware_trace = _apply_tool_request_middleware_for_agent(
             agent,
             function_name=function_name,

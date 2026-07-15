@@ -5685,11 +5685,17 @@ def refresh_agent_mcp_tools(
     # Computed OUTSIDE the lock (get_tool_definitions can be slow); the diff and
     # publish below happen together in ONE critical section so two concurrent
     # callers can't torn-publish or compute overlapping ``added`` sets.
+    # SECURITY: scope the rebuild to the agent's ACL allowlist (parity with
+    # agent_init). Do NOT drop this kwarg — without it an MCP reload re-widens
+    # valid_tool_names past the ACL policy that the dispatch and steer-coverage
+    # gates trust. None = no restriction (CLI/legacy). Always-on infra tools are
+    # restored by the post-build re-injection below.
     new_defs = list(
         get_tool_definitions(
             enabled_toolsets=enabled,
             disabled_toolsets=disabled,
             quiet_mode=quiet_mode,
+            allowed_tool_names=getattr(agent, "allowed_tool_names", None),
         )
         or []
     )
@@ -5703,7 +5709,10 @@ def refresh_agent_mcp_tools(
     # (``build_api_kwargs``) can't see a partial rebuild or a cross-attribute
     # half-swap. ``staged_engine_names`` are the context-engine routing names
     # this rebuild actually appended (matching agent_init's dedup-aware add).
-    staged_engine_names = _reinject_post_build_tools(agent, new_defs, new_names)
+    staged_engine_names = _reinject_post_build_tools(
+        agent, new_defs, new_names,
+        allowed_tool_names=getattr(agent, "allowed_tool_names", None),
+    )
 
     # Single atomic read-diff-publish so the returned ``added`` is consistent
     # with what was actually published, even under concurrent callers, and a
@@ -5738,7 +5747,7 @@ def refresh_agent_mcp_tools(
         return new_names - current
 
 
-def _reinject_post_build_tools(agent, tools_list: list, name_set: set) -> set:
+def _reinject_post_build_tools(agent, tools_list: list, name_set: set, allowed_tool_names=None) -> set:
     """Append memory-provider and context-engine tools onto staged locals.
 
     Mirrors the post-``get_tool_definitions`` injection in ``agent_init`` so a
@@ -5747,15 +5756,26 @@ def _reinject_post_build_tools(agent, tools_list: list, name_set: set) -> set:
     / ``name_set`` (never the live agent attributes) so the rebuild stays atomic.
     Idempotent (skips names already present) and fail-soft.
 
+    ``allowed_tool_names`` applies the SAME ACL gate agent_init uses on both
+    injected families (memory_manager.inject_memory_provider_tools and the
+    context-engine loop): a name outside the ACL allow-set is skipped so a
+    refresh cannot re-leak a tool the policy excludes. ``None`` = no ACL filter.
+
     Returns the set of context-engine routing names actually appended by THIS
     rebuild — matching ``agent_init``'s dedup behavior (a name already provided
     by a registry/plugin tool is NOT claimed for context-engine routing). The
     caller publishes this into ``agent._context_engine_tool_names`` atomically
     with the snapshot.
     """
+    acl_allowed = (
+        None if allowed_tool_names is None else {str(name) for name in allowed_tool_names}
+    )
+
     def _add(schema: dict) -> bool:
         name = schema.get("name", "")
         if not name or name in name_set:
+            return False
+        if acl_allowed is not None and name not in acl_allowed:
             return False
         tools_list.append({"type": "function", "function": schema})
         name_set.add(name)

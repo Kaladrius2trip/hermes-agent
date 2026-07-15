@@ -1425,6 +1425,18 @@ def _build_child_agent(
     if isinstance(child_max_tokens, int):
         child_optional_kwargs["max_tokens"] = child_max_tokens
 
+    # Gate B: narrow the child's raw ACL to its effective role so a
+    # valid_tool_names drift cannot let a leaf inline a role-blocked tool
+    # (delegate_task/execute_code/...). Orchestrator keeps delegate_task.
+    _child_acl = getattr(parent_agent, "allowed_tool_names", None)
+    if _child_acl is not None:
+        _role_blocked = (
+            DELEGATE_BLOCKED_TOOLS - {"delegate_task"}
+            if effective_role == "orchestrator"
+            else DELEGATE_BLOCKED_TOOLS
+        )
+        _child_acl = [t for t in _child_acl if t not in _role_blocked]
+
     child = AIAgent(
         base_url=effective_base_url,
         api_key=effective_api_key,
@@ -1439,6 +1451,10 @@ def _build_child_agent(
         prefill_messages=getattr(parent_agent, "prefill_messages", None),
         fallback_model=parent_fallback,
         enabled_toolsets=child_toolsets,
+        # SECURITY: bound the child to the parent's CONCRETE ACL, role-narrowed
+        # (see _child_acl above) — child_toolsets is a category upper bound that
+        # re-widens a concrete grant, and a leaf must not retain blocked tools.
+        allowed_tool_names=_child_acl,
         quiet_mode=True,
         ephemeral_system_prompt=child_prompt,
         log_prefix=f"[subagent-{task_index}]",

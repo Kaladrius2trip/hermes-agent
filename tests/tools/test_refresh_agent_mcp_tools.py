@@ -162,6 +162,99 @@ def test_refresh_respects_context_engine_toolset_gate(monkeypatch):
     assert "lcm_grep" not in agent.valid_tool_names   # gated out (#5544)
 
 
+def test_refresh_scopes_registry_tools_to_acl_allowlist(monkeypatch):
+    """Security (Phase 2): a refresh must not re-admit registry tools outside
+    the agent's ACL allowlist into valid_tool_names. agent_init builds the
+    snapshot with the same allowed_tool_names filter; if the refresh path omits
+    it, an MCP reload silently re-widens the agent past its ACL policy.
+    """
+    agent = _agent(["read_file"])
+    agent.allowed_tool_names = ["read_file"]
+
+    import model_tools
+
+    def _gtd(allowed_tool_names=None, **kw):
+        defs = [_tool("read_file"), _tool("terminal"), _tool("mcp_late")]
+        if allowed_tool_names is not None:
+            allow = set(allowed_tool_names)
+            defs = [d for d in defs if d["function"]["name"] in allow]
+        return defs
+
+    monkeypatch.setattr(model_tools, "get_tool_definitions", _gtd)
+
+    mcp_tool.refresh_agent_mcp_tools(agent)
+
+    assert "read_file" in agent.valid_tool_names
+    assert "terminal" not in agent.valid_tool_names
+    assert "mcp_late" not in agent.valid_tool_names
+
+
+def test_refresh_acl_filters_injected_memory_and_context_tools(monkeypatch):
+    """Init-refresh parity: agent_init filters BOTH injected families by ACL
+    (memory_manager.inject_memory_provider_tools and the context-engine loop in
+    agent_init). A refresh must apply the same gate through
+    _reinject_post_build_tools, or an MCP reload re-leaks an injected tool the
+    policy excludes. Only the memory tool listed in the ACL survives; the
+    unlisted memory tool and the unlisted context-engine tool are filtered.
+    """
+    agent = _agent(["read_file", "memory_search", "lcm_grep"])
+    agent.allowed_tool_names = ["read_file", "memory_search"]
+    agent._memory_manager = types.SimpleNamespace(
+        get_all_tool_schemas=lambda: [
+            {"name": "memory_search", "description": "", "parameters": {}},
+            {"name": "memory_forget", "description": "", "parameters": {}},
+        ]
+    )
+    agent.context_compressor = types.SimpleNamespace(
+        get_tool_schemas=lambda: [
+            {"name": "lcm_grep", "description": "", "parameters": {}}
+        ]
+    )
+    agent._context_engine_tool_names = set()
+
+    import model_tools
+
+    def _gtd(allowed_tool_names=None, **kw):
+        defs = [_tool("read_file"), _tool("terminal")]
+        if allowed_tool_names is not None:
+            allow = set(allowed_tool_names)
+            defs = [d for d in defs if d["function"]["name"] in allow]
+        return defs
+
+    monkeypatch.setattr(model_tools, "get_tool_definitions", _gtd)
+
+    mcp_tool.refresh_agent_mcp_tools(agent)
+
+    assert "read_file" in agent.valid_tool_names
+    assert "terminal" not in agent.valid_tool_names
+    assert "memory_search" in agent.valid_tool_names
+    assert "memory_forget" not in agent.valid_tool_names
+    assert "lcm_grep" not in agent.valid_tool_names
+
+
+def test_refresh_without_acl_allowlist_stays_unrestricted(monkeypatch):
+    """CLI/legacy agents carry allowed_tool_names=None, meaning no restriction
+    (matching agent_init + get_tool_definitions). The refresh forwards None
+    rather than omitting the kwarg, and every registry tool still lands.
+    """
+    agent = _agent(["read_file"])
+    agent.allowed_tool_names = None
+
+    import model_tools
+    captured = {}
+
+    def _gtd(allowed_tool_names="__unset__", **kw):
+        captured["allowed_tool_names"] = allowed_tool_names
+        return [_tool("read_file"), _tool("terminal")]
+
+    monkeypatch.setattr(model_tools, "get_tool_definitions", _gtd)
+
+    mcp_tool.refresh_agent_mcp_tools(agent)
+
+    assert captured["allowed_tool_names"] is None
+    assert "terminal" in agent.valid_tool_names
+
+
 def test_refreshed_tool_is_callable_through_valid_tool_names_guard(monkeypatch):
     """The whole point: a late tool, once refreshed, passes the name guard the
     run loop uses to accept/reject tool calls (agent.valid_tool_names)."""

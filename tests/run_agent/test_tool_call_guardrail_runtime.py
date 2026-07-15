@@ -379,3 +379,18 @@ def test_guardrail_halt_emits_final_response_through_stream_delta_callback():
     assert halt_text in text_deltas, (
         f"halt message was never streamed; callback only saw {deltas!r}"
     )
+
+
+def test_sequential_executor_raw_acl_denies_inline_tool_on_drift():
+    from agent.tool_executor import execute_tool_calls_sequential
+
+    agent = _make_agent("session_search")
+    agent.allowed_tool_names = []
+    messages: list = []
+    assistant_message = SimpleNamespace(
+        tool_calls=[_mock_tool_call("session_search", "{}")]
+    )
+
+    execute_tool_calls_sequential(agent, assistant_message, messages, "task-acl-drift")
+
+    assert any("denied by ACL" in json.dumps(m) for m in messages), messages

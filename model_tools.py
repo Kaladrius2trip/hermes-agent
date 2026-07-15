@@ -1045,6 +1045,33 @@ def _emit_post_tool_call_hook(
         logger.debug("post_tool_call hook error: %s", _hook_err)
 
 
+_ACL_DISPATCH_BRIDGE_EXEMPT = frozenset({"tool_search", "tool_describe", "tool_call"})
+
+
+def acl_dispatch_denial(allowed_tool_names: Optional[Iterable[str]], function_name: str) -> Optional[str]:
+    """Independent raw-ACL dispatch gate (Phase 2 gate B).
+
+    Returns a denial JSON string when ``function_name`` is outside the raw ACL
+    allowlist, else ``None``. This is defense-in-depth that does NOT rely on
+    ``valid_tool_names``: even if the schema-derived set drifts past the policy
+    (a future rebuild bug), the concrete tool is still checked against the ACL
+    ground truth here. ``None`` allowlist = unrestricted (CLI/legacy). Only the
+    synthetic tool_search bridge names are exempt — they carry no concrete
+    capability, and ``tool_call``'s underlying target is re-validated when the
+    unwrap recurses back through this function.
+    """
+    if allowed_tool_names is None:
+        return None
+    if function_name in _ACL_DISPATCH_BRIDGE_EXEMPT:
+        return None
+    if function_name in set(allowed_tool_names):
+        return None
+    return json.dumps(
+        {"error": f"Tool '{function_name}' denied by ACL: missing capability '{function_name}'."},
+        ensure_ascii=False,
+    )
+
+
 def handle_function_call(
     function_name: str,
     function_args: Dict[str, Any],
@@ -1100,6 +1127,10 @@ def handle_function_call(
                 f"Tool '{function_name}' denied by ACL: missing capability '{function_name}'."
             )
         }, ensure_ascii=False)
+
+    _acl_denial = acl_dispatch_denial(allowed_tool_names, function_name)
+    if _acl_denial is not None:
+        return _acl_denial
 
     # ── Tool Search bridge dispatch ──────────────────────────────────
     # tool_search and tool_describe are pure catalog reads — handle them
@@ -1292,6 +1323,12 @@ def handle_function_call(
                 # Prefer the caller-provided list so subagents can't overwrite
                 # the parent's tool set via the process-global.
                 sandbox_enabled = enabled_tools if enabled_tools is not None else _last_resolved_tool_names
+                # Gate B: the sandbox tool set rides on driftable valid_tool_names;
+                # bound it to the raw ACL so a drift can't leak an ungranted tool
+                # (e.g. terminal) into the code-execution sandbox.
+                if allowed_tool_names is not None and sandbox_enabled is not None:
+                    _acl_set = set(allowed_tool_names)
+                    sandbox_enabled = [t for t in sandbox_enabled if t in _acl_set]
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
                     return registry.dispatch(
                         function_name, next_args,
