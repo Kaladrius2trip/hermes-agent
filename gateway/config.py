@@ -727,6 +727,7 @@ class GatewayConfig:
     # user-chat platform. System-authenticated platforms are always exempt
     # (see gateway.acl.ACL_EXEMPT_PLATFORMS).
     acl_enforced_platforms: Optional[list] = None
+    acl_bootstrap_from_allowlist: bool = True
 
     # Streaming configuration
     streaming: StreamingConfig = field(default_factory=StreamingConfig)
@@ -843,6 +844,7 @@ class GatewayConfig:
             "multiplex_profiles": self.multiplex_profiles,
             "unauthorized_dm_behavior": self.unauthorized_dm_behavior,
             "acl_enforced_platforms": self.acl_enforced_platforms,
+            "acl_bootstrap_from_allowlist": self.acl_bootstrap_from_allowlist,
             "streaming": self.streaming.to_dict(),
             "session_store_max_age_days": self.session_store_max_age_days,
         }
@@ -938,6 +940,9 @@ class GatewayConfig:
         if env_acl_platforms:
             acl_enforced_platforms = env_acl_platforms
         acl_enforced_platforms = _coerce_platform_name_list(acl_enforced_platforms)
+        acl_bootstrap_from_allowlist = data.get("acl_bootstrap_from_allowlist")
+        if acl_bootstrap_from_allowlist is None and isinstance(nested_gateway, dict):
+            acl_bootstrap_from_allowlist = nested_gateway.get("acl_bootstrap_from_allowlist")
 
         try:
             session_store_max_age_days = int(data.get("session_store_max_age_days", 90))
@@ -966,6 +971,7 @@ class GatewayConfig:
             max_concurrent_sessions=max_concurrent_sessions,
             unauthorized_dm_behavior=unauthorized_dm_behavior,
             acl_enforced_platforms=acl_enforced_platforms,
+            acl_bootstrap_from_allowlist=_coerce_bool(acl_bootstrap_from_allowlist, True),
             streaming=StreamingConfig.from_dict(data.get("streaming", {})),
             session_store_max_age_days=session_store_max_age_days,
         )
@@ -1082,6 +1088,12 @@ def load_gateway_config() -> GatewayConfig:
 
             gateway_section = yaml_cfg.get("gateway")
             if isinstance(gateway_section, dict):
+                for acl_key in (
+                    "acl_enforced_platforms",
+                    "acl_bootstrap_from_allowlist",
+                ):
+                    if acl_key in gateway_section:
+                        gw_data[acl_key] = gateway_section[acl_key]
                 if "multiplex_profiles" in gateway_section and "multiplex_profiles" not in gw_data:
                     # gateway.multiplex_profiles written by `hermes config set gateway.multiplex_profiles true`
                     gw_data["multiplex_profiles"] = gateway_section["multiplex_profiles"]

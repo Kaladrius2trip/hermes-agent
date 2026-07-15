@@ -685,7 +685,7 @@ async def test_handle_message_allows_bootstrap_acl_when_legacy_slash_gate_enable
 
 
 @pytest.mark.asyncio
-async def test_acl_command_is_discord_only_v1(tmp_path):
+async def test_acl_command_reports_platform_not_enabled(tmp_path):
     runner = _runner(tmp_path, bootstrap_users={"owner"})
     event = MessageEvent(
         text="/acl show",
@@ -701,7 +701,7 @@ async def test_acl_command_is_discord_only_v1(tmp_path):
 
     output = await runner._handle_acl_command(event)
 
-    assert output == "⛔ /acl is Discord-only in ACL v1."
+    assert output == "⛔ /acl is not enabled for slack."
 
 
 def _tg_source(user_id: str = "t1", *, chat_type: str = "dm", chat_id: str = "chat1") -> SessionSource:
@@ -812,3 +812,83 @@ def test_gateway_acl_never_enforced_on_system_platforms(tmp_path):
     )
 
     assert runner._check_acl_access(webhook_source, None) is None
+
+
+@pytest.mark.asyncio
+async def test_gateway_acl_management_actions_work_on_enforced_telegram(tmp_path):
+    runner = _tg_runner(tmp_path, enforced_platforms=["*"])
+    runner._acl_bootstrap_super_admins = BootstrapSuperAdmins(
+        {"telegram": frozenset({"owner"})}
+    )
+    runner.acl_store.grant_membership(
+        platform="telegram",
+        subject_type="user",
+        subject_id="t1",
+        group_name="researcher",
+        scope="channel",
+        scope_id="grp1",
+        actor_platform="telegram",
+        actor_user_id="owner",
+    )
+    source = _tg_source("owner", chat_type="group", chat_id="grp1")
+
+    groups = await runner._handle_acl_command(
+        MessageEvent(text="/acl groups", message_type=MessageType.TEXT, source=source)
+    )
+    assert "researcher:" in groups
+
+    shown = await runner._handle_acl_command(
+        MessageEvent(text="/acl show group researcher", message_type=MessageType.TEXT, source=source)
+    )
+    assert "ACL group: researcher" in shown
+    assert "memberships: 1" in shown
+
+    audit = await runner._handle_acl_command(
+        MessageEvent(text="/acl audit @t1", message_type=MessageType.TEXT, source=source)
+    )
+    assert "membership.grant" in audit
+
+
+@pytest.mark.asyncio
+async def test_gateway_acl_telegram_mutation_flows_through_dispatch_and_requester_confirmation(tmp_path):
+    runner = _runner(tmp_path)
+    runner.config.acl_enforced_platforms = ["*"]
+    runner.config.platforms[Platform.TELEGRAM] = PlatformConfig(enabled=True, extra={})
+    runner._acl_bootstrap_super_admins = BootstrapSuperAdmins(
+        {"telegram": frozenset({"owner"})}
+    )
+    runner.adapters[Platform.TELEGRAM] = _NoButtonAdapter()
+    source = _tg_source("owner", chat_type="group", chat_id="grp1")
+
+    prompt = await runner._handle_message(
+        MessageEvent(
+            text="/acl grant @t1 researcher in this channel",
+            message_type=MessageType.TEXT,
+            source=source,
+        )
+    )
+    assert isinstance(prompt, str)
+    assert "Confirm /acl" in prompt
+    pending = slash_confirm.get_pending(runner._session_key_for_source(source))
+    assert pending is not None
+
+    approved = await runner._handle_message(
+        MessageEvent(text="/approve", message_type=MessageType.TEXT, source=source)
+    )
+    assert isinstance(approved, str)
+    assert "membership granted" in approved
+
+    memberships = runner.acl_store.list_memberships(
+        platform="telegram",
+        subject_type="user",
+        subject_id="t1",
+    )
+    assert [(m.group_name, m.scope, m.scope_id) for m in memberships] == [
+        ("researcher", "channel", "grp1")
+    ]
+    audit_rows = runner.acl_store.audit(
+        platform="telegram",
+        subject_type="user",
+        subject_id="t1",
+    )
+    assert any(row.action == "membership.grant" for row in audit_rows)

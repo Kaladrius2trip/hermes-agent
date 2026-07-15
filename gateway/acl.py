@@ -36,6 +36,22 @@ DEFAULT_SAFE_TOOL_NAMES = frozenset({"clarify", "todo"})
 DEFAULT_SAFE_SLASH_COMMANDS = DISCOVERY_SLASH_COMMANDS
 # ``admin`` ACL group gets broad agent/tool use but, by v1 design, does not by
 # itself grant `/acl` management. Bootstrap super-admin status adds `/acl`.
+# Seeded team-role presets (created once when missing; admin edits persist).
+# Runtime tiers (sandbox/WSL/host) arrive in Phase 5; until then ``operator``
+# is the only preset holding terminal/code execution and must be treated as
+# highly trusted (see docs/superpowers/specs/2026-05-13-gateway-acl-design.md §6).
+TEAM_PRESET_GROUPS: "dict[str, tuple[str, ...]]" = {
+    "informer": ("chat", "web"),
+    "researcher": ("chat", "web", "file_read"),
+    "developer": ("chat", "web", "file_read", "file_write"),
+    "operator": ("chat", "web", "file_read", "file_write", "terminal", "code_execution"),
+}
+
+BUILTIN_ACCESS_CAPABILITIES: "dict[str, frozenset[str]]" = {
+    "file_read": frozenset({"read_file", "search_files"}),
+    "file_write": frozenset({"write_file", "patch"}),
+}
+
 ADMIN_EXTRA_SLASH_COMMANDS = frozenset({
     "help",
     "whoami",
@@ -171,60 +187,121 @@ class ACLStore:
         conn.execute("PRAGMA foreign_keys=ON")
         return conn
 
+    _TABLE_DDL: "dict[str, str]" = {
+        "groups": """
+            CREATE TABLE groups (
+                name TEXT PRIMARY KEY CHECK (name <> ''),
+                builtin INTEGER NOT NULL DEFAULT 0 CHECK (builtin IN (0, 1)),
+                created_at REAL NOT NULL
+            ) STRICT
+        """,
+        "group_grants": """
+            CREATE TABLE group_grants (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                group_name TEXT NOT NULL CHECK (group_name <> ''),
+                access_name TEXT NOT NULL CHECK (access_name <> ''),
+                created_at REAL NOT NULL,
+                UNIQUE(group_name, access_name),
+                FOREIGN KEY(group_name) REFERENCES groups(name) ON DELETE CASCADE
+            ) STRICT
+        """,
+        "memberships": """
+            CREATE TABLE memberships (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                platform TEXT NOT NULL CHECK (platform <> ''),
+                subject_type TEXT NOT NULL CHECK (subject_type IN ('user', 'role')),
+                subject_id TEXT NOT NULL CHECK (subject_id <> ''),
+                group_name TEXT NOT NULL CHECK (group_name <> ''),
+                scope TEXT NOT NULL CHECK (scope IN ('dm', 'channel')),
+                scope_id TEXT NOT NULL DEFAULT '',
+                created_at REAL NOT NULL,
+                UNIQUE(platform, subject_type, subject_id, group_name, scope, scope_id),
+                FOREIGN KEY(group_name) REFERENCES groups(name) ON DELETE CASCADE
+            ) STRICT
+        """,
+        "audit_log": """
+            CREATE TABLE audit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts REAL NOT NULL,
+                action TEXT NOT NULL CHECK (action <> ''),
+                platform TEXT NOT NULL DEFAULT '',
+                actor_platform TEXT NOT NULL DEFAULT '',
+                actor_user_id TEXT NOT NULL DEFAULT '',
+                subject_type TEXT NOT NULL DEFAULT '',
+                subject_id TEXT NOT NULL DEFAULT '',
+                group_name TEXT NOT NULL DEFAULT '',
+                scope TEXT NOT NULL DEFAULT '',
+                scope_id TEXT,
+                access_name TEXT NOT NULL DEFAULT '',
+                allowed INTEGER CHECK (allowed IS NULL OR allowed IN (0, 1)),
+                reason TEXT NOT NULL DEFAULT '',
+                details TEXT NOT NULL DEFAULT ''
+            ) STRICT
+        """,
+    }
+
     def _init_db(self) -> None:
-        with self._connect() as conn:
-            conn.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS groups (
-                    name TEXT PRIMARY KEY,
-                    builtin INTEGER NOT NULL DEFAULT 0,
-                    created_at REAL NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS group_grants (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    group_name TEXT NOT NULL,
-                    access_name TEXT NOT NULL,
-                    created_at REAL NOT NULL,
-                    UNIQUE(group_name, access_name),
-                    FOREIGN KEY(group_name) REFERENCES groups(name) ON DELETE CASCADE
-                );
-                CREATE TABLE IF NOT EXISTS memberships (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    platform TEXT NOT NULL,
-                    subject_type TEXT NOT NULL,
-                    subject_id TEXT NOT NULL,
-                    group_name TEXT NOT NULL,
-                    scope TEXT NOT NULL,
-                    scope_id TEXT NOT NULL DEFAULT '',
-                    created_at REAL NOT NULL,
-                    UNIQUE(platform, subject_type, subject_id, group_name, scope, scope_id),
-                    FOREIGN KEY(group_name) REFERENCES groups(name) ON DELETE CASCADE
-                );
-                CREATE TABLE IF NOT EXISTS audit_log (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    ts REAL NOT NULL,
-                    action TEXT NOT NULL,
-                    platform TEXT NOT NULL DEFAULT '',
-                    actor_platform TEXT NOT NULL DEFAULT '',
-                    actor_user_id TEXT NOT NULL DEFAULT '',
-                    subject_type TEXT NOT NULL DEFAULT '',
-                    subject_id TEXT NOT NULL DEFAULT '',
-                    group_name TEXT NOT NULL DEFAULT '',
-                    scope TEXT NOT NULL DEFAULT '',
-                    scope_id TEXT,
-                    access_name TEXT NOT NULL DEFAULT '',
-                    allowed INTEGER,
-                    reason TEXT NOT NULL DEFAULT '',
-                    details TEXT NOT NULL DEFAULT ''
-                );
-                """
-            )
+        conn = self._connect()
+        try:
+            conn.execute("PRAGMA foreign_keys=OFF")
+            conn.execute("BEGIN IMMEDIATE")
+            for table, ddl in self._TABLE_DDL.items():
+                row = conn.execute(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+                    (table,),
+                ).fetchone()
+                if row is None:
+                    conn.execute(ddl)
+                elif "STRICT" not in str(row["sql"]):
+                    self._rebuild_table_strict(conn, table, ddl)
             now = time.time()
             for name in sorted(BUILTIN_GROUPS):
                 conn.execute(
                     "INSERT OR IGNORE INTO groups(name, builtin, created_at) VALUES (?, 1, ?)",
                     (name, now),
                 )
+            self._seed_preset_groups(conn, now)
+            violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+            if violations:
+                raise sqlite3.IntegrityError(f"ACL migration foreign-key violations: {violations}")
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.execute("PRAGMA foreign_keys=ON")
+            conn.close()
+
+    def _rebuild_table_strict(self, conn: sqlite3.Connection, table: str, ddl: str) -> None:
+        """Migrate a pre-STRICT table in place: rename, recreate, copy, drop.
+
+        Runs inside the caller's transaction; legacy rows already satisfy the
+        CHECK constraints because the same values were produced by this module's
+        validated writers.
+        """
+        old = f"{table}_legacy_migration"
+        conn.execute(f"ALTER TABLE {table} RENAME TO {old}")
+        conn.execute(ddl)
+        cols = [str(r["name"]) for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+        col_list = ", ".join(cols)
+        conn.execute(f"INSERT INTO {table}({col_list}) SELECT {col_list} FROM {old}")
+        conn.execute(f"DROP TABLE {old}")
+
+    def _seed_preset_groups(self, conn: sqlite3.Connection, now: float) -> None:
+        for group_name, grants in TEAM_PRESET_GROUPS.items():
+            row = conn.execute("SELECT 1 FROM groups WHERE name=?", (group_name,)).fetchone()
+            if row is not None:
+                continue
+            conn.execute(
+                "INSERT INTO groups(name, builtin, created_at) VALUES (?, 0, ?)",
+                (group_name, now),
+            )
+            for access_name in grants:
+                conn.execute(
+                    "INSERT OR IGNORE INTO group_grants(group_name, access_name, created_at) VALUES (?, ?, ?)",
+                    (group_name, access_name, now),
+                )
+            self._audit_conn(conn, "group.seed_preset", group_name=group_name, details=",".join(grants))
 
     def create_group(self, name: str, *, actor_platform: str = "", actor_user_id: str = "") -> None:
         name = _validate_name(name, "group")
@@ -464,17 +541,46 @@ class ACLStore:
         with self._connect() as conn:
             self._audit_conn(conn, action, **kwargs)
 
-    def audit(self, *, limit: int = 50) -> list[ACLAuditRow]:
+    def audit(
+        self,
+        *,
+        limit: int = 50,
+        platform: Optional[str] = None,
+        subject_type: Optional[str] = None,
+        subject_id: Optional[str] = None,
+    ) -> list[ACLAuditRow]:
         limit = max(1, min(int(limit), 500))
+        where = ""
+        params: list[Any] = []
+        if subject_id:
+            target_clauses = ["subject_id=?"]
+            target_params: list[Any] = [str(subject_id)]
+            if subject_type:
+                target_clauses.append("subject_type=?")
+                target_params.append(_norm_subject_type(subject_type))
+            if platform:
+                target_clauses.append("platform=?")
+                target_params.append(_norm_platform(platform))
+            branches = [f"({' AND '.join(target_clauses)})"]
+            params.extend(target_params)
+            if subject_type in {None, "user"}:
+                actor_clauses = ["actor_user_id=?"]
+                actor_params: list[Any] = [str(subject_id)]
+                if platform:
+                    actor_clauses.append("actor_platform=?")
+                    actor_params.append(_norm_platform(platform))
+                branches.append(f"({' AND '.join(actor_clauses)})")
+                params.extend(actor_params)
+            where = f"WHERE {' OR '.join(branches)}"
         with self._connect() as conn:
             rows = conn.execute(
-                """
+                f"""
                 SELECT id, ts, action, platform, actor_platform, actor_user_id,
                        subject_type, subject_id, group_name, scope, scope_id,
                        access_name, allowed, reason, details
-                FROM audit_log ORDER BY id DESC LIMIT ?
+                FROM audit_log {where} ORDER BY id DESC LIMIT ?
                 """,
-                (limit,),
+                (*params, limit),
             ).fetchall()
         return [_audit_row_from_sql(row) for row in rows]
 
@@ -584,6 +690,7 @@ def collect_bootstrap_super_admins(
     platform_configs: Mapping[Any, Any] | None,
     *,
     env: Mapping[str, str] | None = None,
+    include_allowlists: bool = True,
 ) -> BootstrapSuperAdmins:
     env = env or os.environ
     platform_users: dict[str, set[str]] = {}
@@ -602,8 +709,13 @@ def collect_bootstrap_super_admins(
     # owner is only in DISCORD_ALLOWED_USERS is locked out of chat AND of the
     # /acl command needed to fix it. With platform-wide ACL enforcement the
     # same lockout applies on every platform, so the legacy rule is applied
-    # to each configured platform's allowlist below.
-    add("discord", env.get("DISCORD_ALLOWED_USERS"))
+    # to each configured platform's allowlist below. Team deployments where
+    # the allowlist is broader than the admin set opt out via
+    # ``acl_bootstrap_from_allowlist: false`` (include_allowlists=False);
+    # explicit *_ACL_SUPER_ADMINS / acl_super_admins / allow_admin_from
+    # sources always count.
+    if include_allowlists:
+        add("discord", env.get("DISCORD_ALLOWED_USERS"))
 
     for key, cfg in (platform_configs or {}).items():
         platform = _platform_key_to_name(key)
@@ -613,11 +725,13 @@ def collect_bootstrap_super_admins(
         add(platform, extra.get("acl_super_admins"))
         add(platform, extra.get("allow_admin_from"))
         add(platform, _flatten_group_mapping(extra.get("group_allow_admin_from")))
-        add(platform, extra.get("allowed_users"))
-        add(platform, extra.get("allow_from"))
+        if include_allowlists:
+            add(platform, extra.get("allowed_users"))
+            add(platform, extra.get("allow_from"))
         if platform != "discord":
             add(platform, env.get(f"{platform.upper()}_ACL_SUPER_ADMINS"))
-            add(platform, env.get(_legacy_allowlist_env_key(platform)))
+            if include_allowlists:
+                add(platform, env.get(_legacy_allowlist_env_key(platform)))
 
     return BootstrapSuperAdmins({k: frozenset(v) for k, v in platform_users.items()})
 
@@ -653,13 +767,34 @@ def parse_acl_command(text: str, context: ACLCommandContext) -> ACLCommand:
         return ACLCommand(action="show", requires_confirmation=False, raw=raw)
 
     head = parts[0].lower()
+    if head == "groups":
+        return ACLCommand(action="list_groups", requires_confirmation=False, raw=raw)
+
     if head == "show":
         if len(parts) == 1:
             return ACLCommand(action="show", requires_confirmation=False, raw=raw)
+        if parts[1].lower() == "group":
+            if len(parts) < 3:
+                raise ValueError("usage: /acl show group <name>")
+            return ACLCommand(
+                action="show_group",
+                group_name=_validate_name(parts[2], "group"),
+                requires_confirmation=False,
+                raw=raw,
+            )
         subject_type, subject_id = _parse_subject(parts[1])
         return ACLCommand(action="show", subject_type=subject_type, subject_id=subject_id, requires_confirmation=False, raw=raw)
 
     if head == "audit":
+        if len(parts) >= 2:
+            subject_type, subject_id = _parse_subject(parts[1])
+            return ACLCommand(
+                action="audit",
+                subject_type=subject_type,
+                subject_id=subject_id,
+                requires_confirmation=False,
+                raw=raw,
+            )
         return ACLCommand(action="audit", requires_confirmation=False, raw=raw)
 
     if head in {"grant", "revoke"}:
@@ -692,11 +827,11 @@ def parse_acl_command(text: str, context: ACLCommandContext) -> ACLCommand:
                 requires_confirmation=True,
                 raw=raw,
             )
-        if sub == "grant":
+        if sub in {"grant", "revoke"}:
             if len(parts) < 4:
-                raise ValueError("usage: /acl group grant <name> <access>")
+                raise ValueError(f"usage: /acl group {sub} <name> <access>")
             return ACLCommand(
-                action="grant_group_access",
+                action="grant_group_access" if sub == "grant" else "revoke_group_access",
                 group_name=_validate_name(parts[2], "group"),
                 access_name=_validate_access_name(parts[3]),
                 requires_confirmation=True,
@@ -727,6 +862,14 @@ def apply_acl_command(
             actor_user_id=actor_user_id,
         )
         return f"ACL group grant added: {command.group_name} -> {command.access_name}"
+    if command.action == "revoke_group_access":
+        store.revoke_group_access(
+            command.group_name or "",
+            command.access_name or "",
+            actor_platform=actor_platform,
+            actor_user_id=actor_user_id,
+        )
+        return f"ACL group grant revoked: {command.group_name} -> {command.access_name}"
     if command.action == "grant_membership":
         store.grant_membership(
             platform=platform or actor_platform,
@@ -907,6 +1050,8 @@ def _resolve_access_name(access_name: str) -> set[str]:
     lower = access.lower()
     if lower in {"chat", "safe_chat"}:
         return set(DEFAULT_SAFE_TOOL_NAMES)
+    if lower in BUILTIN_ACCESS_CAPABILITIES:
+        return set(BUILTIN_ACCESS_CAPABILITIES[lower])
     if lower.startswith("tool:"):
         return {access.split(":", 1)[1]}
     if lower.startswith("toolset:"):

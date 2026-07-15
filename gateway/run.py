@@ -2932,7 +2932,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             from gateway.acl import ACLStore, collect_bootstrap_super_admins
             self.acl_store = ACLStore()
             self._acl_bootstrap_super_admins = collect_bootstrap_super_admins(
-                getattr(self.config, "platforms", {}) or {}
+                getattr(self.config, "platforms", {}) or {},
+                include_allowlists=bool(
+                    getattr(self.config, "acl_bootstrap_from_allowlist", True)
+                ),
             )
         except Exception as exc:
             logger.warning("Gateway ACL initialization failed; ACL will deny Discord non-discovery access: %s", exc)
@@ -12872,7 +12875,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         bootstrap = getattr(self, "_acl_bootstrap_super_admins", None)
         if bootstrap is None:
             from gateway.acl import collect_bootstrap_super_admins
-            bootstrap = collect_bootstrap_super_admins(getattr(self.config, "platforms", {}) or {})
+            bootstrap = collect_bootstrap_super_admins(
+                getattr(self.config, "platforms", {}) or {},
+                include_allowlists=bool(
+                    getattr(self.config, "acl_bootstrap_from_allowlist", True)
+                ),
+            )
             self._acl_bootstrap_super_admins = bootstrap
         request = ACLRequest(
             platform=platform,
@@ -13062,8 +13070,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         if action == "create_group":
             return f"create group {getattr(command, 'group_name', '')}"
-        if action == "grant_group_access":
-            return f"grant group {getattr(command, 'group_name', '')} access {getattr(command, 'access_name', '')}"
+        if action in {"grant_group_access", "revoke_group_access"}:
+            verb = "grant" if action == "grant_group_access" else "revoke"
+            return f"{verb} group {getattr(command, 'group_name', '')} access {getattr(command, 'access_name', '')}"
         return str(getattr(command, "raw", "") or action)
 
     def _format_acl_show_subject(self, command, *, platform: str = "discord") -> str:
@@ -13085,8 +13094,42 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             lines.append(f"- {row.group_name} in {scope}")
         return "\n".join(lines)
 
-    def _format_acl_audit(self, *, limit: int = 20) -> str:
-        rows = self.acl_store.audit(limit=limit)
+    def _format_acl_show_group(self, group_name: str) -> str:
+        groups = {group.name: group for group in self.acl_store.list_groups()}
+        group = groups.get(group_name)
+        if group is None:
+            return f"ACL group not found: {group_name}"
+        grants = self.acl_store.list_group_grants(group_name)
+        lines = [
+            f"ACL group: {group.name}",
+            f"builtin: {str(group.builtin).lower()}",
+            f"grants: {', '.join(grants) if grants else 'none'}",
+        ]
+        memberships = [m for m in self.acl_store.list_memberships() if m.group_name == group_name]
+        lines.append(f"memberships: {len(memberships)}")
+        return "\n".join(lines)
+
+    def _format_acl_groups(self) -> str:
+        lines = ["ACL groups:"]
+        for group in self.acl_store.list_groups():
+            grants = self.acl_store.list_group_grants(group.name)
+            lines.append(f"- {group.name}: {', '.join(grants) if grants else 'none'}")
+        return "\n".join(lines)
+
+    def _format_acl_audit(
+        self,
+        *,
+        limit: int = 20,
+        platform: Optional[str] = None,
+        subject_type: Optional[str] = None,
+        subject_id: Optional[str] = None,
+    ) -> str:
+        rows = self.acl_store.audit(
+            limit=limit,
+            platform=platform,
+            subject_type=subject_type,
+            subject_id=subject_id,
+        )
         if not rows:
             return "ACL audit: empty"
         lines = ["ACL audit (newest first):"]
@@ -13109,8 +13152,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         source = event.source
         platform = source.platform.value if hasattr(source.platform, "value") else str(source.platform or "")
-        if platform.lower() != "discord":
-            return "⛔ /acl is Discord-only in ACL v1."
+        if not self._acl_platform_enforced(platform):
+            return f"⛔ /acl is not enabled for {platform or 'this platform'}."
 
         policy = self._resolve_acl_policy_for_source(source)
         if not getattr(policy, "bootstrap_super_admin", False):
@@ -13137,8 +13180,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return self._format_acl_show_subject(command, platform=platform)
             return "ACL effective policy:\n" + format_acl_policy(policy)
 
+        if command.action == "show_group":
+            return self._format_acl_show_group(command.group_name or "")
+
+        if command.action == "list_groups":
+            return self._format_acl_groups()
+
         if command.action == "audit":
-            return self._format_acl_audit()
+            return self._format_acl_audit(
+                platform=platform,
+                subject_type=getattr(command, "subject_type", None),
+                subject_id=getattr(command, "subject_id", None),
+            )
 
         if not getattr(command, "requires_confirmation", False):
             return "Unsupported /acl command."

@@ -2950,6 +2950,14 @@ DEFAULT_CONFIG = {
     # Gateway settings — control how messaging platforms (Telegram, Discord,
     # Slack, etc.) deliver agent-produced files as native attachments.
     "gateway": {
+        # ACL v1 keeps its legacy Discord-only enforcement until an operator
+        # explicitly widens this list (use ["*"] for all user-chat platforms).
+        "acl_enforced_platforms": ["discord"],
+        # Backward-compatible bootstrap: platform allowlists imply ACL admin.
+        # Team deployments should set false and configure explicit
+        # *_ACL_SUPER_ADMINS / platform acl_super_admins identities.
+        "acl_bootstrap_from_allowlist": True,
+
         # Seconds the gateway waits for a single messaging platform to finish
         # connecting during startup (and on reconnect). Discord in particular
         # can blow past the old fixed 30s when an account has many slash

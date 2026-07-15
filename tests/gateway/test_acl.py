@@ -1,19 +1,192 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 
 import pytest
 
-from gateway.config import Platform, PlatformConfig
+from gateway.config import GatewayConfig, Platform, PlatformConfig, load_gateway_config
 from gateway.acl import (
     ACLCommandContext,
     ACLRequest,
     ACLStore,
     BootstrapSuperAdmins,
+    apply_acl_command,
     collect_bootstrap_super_admins,
     parse_acl_command,
     resolve_acl,
 )
+
+
+def test_store_migrates_legacy_tables_to_strict_and_preserves_rows(tmp_path):
+    db_path = tmp_path / "legacy.sqlite3"
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE groups (name TEXT PRIMARY KEY, builtin INTEGER NOT NULL DEFAULT 0, created_at REAL NOT NULL);
+            CREATE TABLE group_grants (id INTEGER PRIMARY KEY AUTOINCREMENT, group_name TEXT NOT NULL, access_name TEXT NOT NULL, created_at REAL NOT NULL, UNIQUE(group_name, access_name), FOREIGN KEY(group_name) REFERENCES groups(name) ON DELETE CASCADE);
+            CREATE TABLE memberships (id INTEGER PRIMARY KEY AUTOINCREMENT, platform TEXT NOT NULL, subject_type TEXT NOT NULL, subject_id TEXT NOT NULL, group_name TEXT NOT NULL, scope TEXT NOT NULL, scope_id TEXT NOT NULL DEFAULT '', created_at REAL NOT NULL, UNIQUE(platform, subject_type, subject_id, group_name, scope, scope_id), FOREIGN KEY(group_name) REFERENCES groups(name) ON DELETE CASCADE);
+            CREATE TABLE audit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, action TEXT NOT NULL, platform TEXT NOT NULL DEFAULT '', actor_platform TEXT NOT NULL DEFAULT '', actor_user_id TEXT NOT NULL DEFAULT '', subject_type TEXT NOT NULL DEFAULT '', subject_id TEXT NOT NULL DEFAULT '', group_name TEXT NOT NULL DEFAULT '', scope TEXT NOT NULL DEFAULT '', scope_id TEXT, access_name TEXT NOT NULL DEFAULT '', allowed INTEGER, reason TEXT NOT NULL DEFAULT '', details TEXT NOT NULL DEFAULT '');
+            INSERT INTO groups(name, builtin, created_at) VALUES ('legacy', 0, 1.0);
+            INSERT INTO group_grants(group_name, access_name, created_at) VALUES ('legacy', 'web', 1.0);
+            INSERT INTO memberships(platform, subject_type, subject_id, group_name, scope, scope_id, created_at) VALUES ('discord', 'user', 'u1', 'legacy', 'channel', 'c1', 1.0);
+            """
+        )
+
+    store = ACLStore(db_path)
+
+    assert "legacy" in {group.name for group in store.list_groups()}
+    assert store.list_group_grants("legacy") == ["web"]
+    assert store.list_memberships(subject_id="u1")[0].group_name == "legacy"
+    with sqlite3.connect(db_path) as conn:
+        strict_by_table = {row[1]: row[5] for row in conn.execute("PRAGMA table_list")}
+        assert all(strict_by_table[name] == 1 for name in ("groups", "group_grants", "memberships", "audit_log"))
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO memberships(platform, subject_type, subject_id, group_name, scope, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                ("discord", "invalid", "u2", "legacy", "dm", 1.0),
+            )
+        conn.rollback()
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("DELETE FROM groups WHERE name='legacy'")
+        assert conn.execute("SELECT COUNT(*) FROM group_grants WHERE group_name='legacy'").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM memberships WHERE group_name='legacy'").fetchone()[0] == 0
+
+
+def test_store_rolls_back_failed_strict_migration(tmp_path):
+    db_path = tmp_path / "legacy.sqlite3"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "CREATE TABLE groups (name TEXT PRIMARY KEY, builtin INTEGER NOT NULL DEFAULT 0, created_at REAL NOT NULL)"
+        )
+        conn.execute("INSERT INTO groups VALUES ('legacy', 0, 1.0)")
+
+    class FailingMigrationStore(ACLStore):
+        def _rebuild_table_strict(self, conn, table, ddl):
+            conn.execute(f"ALTER TABLE {table} RENAME TO {table}_legacy_migration")
+            raise RuntimeError("injected migration failure")
+
+    with pytest.raises(RuntimeError, match="injected migration failure"):
+        FailingMigrationStore(db_path)
+
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("SELECT name FROM groups").fetchone()[0] == "legacy"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='groups_legacy_migration'"
+        ).fetchone()[0] == 0
+
+
+def test_store_seeds_team_presets_once_and_resolves_concrete_tools(tmp_path):
+    store = ACLStore(tmp_path / "acl.sqlite3")
+    groups = {group.name for group in store.list_groups()}
+    assert {"informer", "researcher", "developer", "operator"} <= groups
+
+    store.grant_membership(
+        platform="discord",
+        subject_type="user",
+        subject_id="researcher-user",
+        group_name="researcher",
+        scope="channel",
+        scope_id="c1",
+    )
+    policy = resolve_acl(
+        store,
+        ACLRequest(platform="discord", user_id="researcher-user", scope="channel", channel_id="c1"),
+    )
+    assert {"read_file", "search_files"} <= policy.allowed_tool_names
+    assert {"write_file", "patch"}.isdisjoint(policy.allowed_tool_names)
+
+    store.revoke_group_access("researcher", "web")
+    ACLStore(store.db_path)
+    assert "web" not in store.list_group_grants("researcher")
+
+
+def test_acl_parser_and_apply_support_group_revoke_show_groups_and_filtered_audit(tmp_path):
+    ctx = ACLCommandContext(platform="discord", channel_id="c1", scope="channel")
+    store = ACLStore(tmp_path / "acl.sqlite3")
+
+    assert parse_acl_command("/acl groups", ctx).action == "list_groups"
+    show = parse_acl_command("/acl show group researcher", ctx)
+    assert (show.action, show.group_name) == ("show_group", "researcher")
+    audit = parse_acl_command("/acl audit @u1", ctx)
+    assert (audit.action, audit.subject_id) == ("audit", "u1")
+
+    revoke = parse_acl_command("/acl group revoke researcher web", ctx)
+    assert revoke.action == "revoke_group_access"
+    assert revoke.requires_confirmation is True
+    result = apply_acl_command(store, revoke, actor_platform="discord", actor_user_id="owner")
+    assert "revoked" in result
+    assert "web" not in store.list_group_grants("researcher")
+    rows = store.audit(subject_id="owner")
+    assert any(row.action == "group.revoke_access" for row in rows)
+
+
+def test_audit_subject_filter_is_platform_and_type_scoped(tmp_path):
+    store = ACLStore(tmp_path / "acl.sqlite3")
+    for platform, subject_type in (("discord", "user"), ("telegram", "user"), ("discord", "role")):
+        store.audit_event(
+            "membership.probe",
+            platform=platform,
+            subject_type=subject_type,
+            subject_id="same-id",
+        )
+
+    rows = store.audit(platform="discord", subject_type="role", subject_id="same-id")
+    assert len(rows) == 1
+    assert (rows[0].platform, rows[0].subject_type) == ("discord", "role")
+
+
+def test_bootstrap_allowlist_split_keeps_explicit_admin_sources():
+    configs = {
+        Platform.DISCORD: PlatformConfig(
+            enabled=True,
+            extra={"allowed_users": ["member"], "acl_super_admins": ["admin"]},
+        ),
+        Platform.TELEGRAM: PlatformConfig(enabled=True, extra={"allow_from": ["tm-member"]}),
+    }
+    env = {
+        "DISCORD_ALLOWED_USERS": "legacy-owner",
+        "TELEGRAM_ALLOWED_USERS": "tm-legacy",
+        "TELEGRAM_ACL_SUPER_ADMINS": "tm-admin",
+    }
+    bootstrap = collect_bootstrap_super_admins(configs, env=env, include_allowlists=False)
+
+    assert bootstrap.is_super_admin("discord", "admin")
+    assert bootstrap.is_super_admin("telegram", "tm-admin")
+    for platform, user_id in (
+        ("discord", "member"),
+        ("discord", "legacy-owner"),
+        ("telegram", "tm-member"),
+        ("telegram", "tm-legacy"),
+    ):
+        assert not bootstrap.is_super_admin(platform, user_id)
+
+
+def test_gateway_config_parses_acl_bootstrap_split_from_gateway_section():
+    config = GatewayConfig.from_dict(
+        {
+            "gateway": {
+                "acl_enforced_platforms": ["*"],
+                "acl_bootstrap_from_allowlist": False,
+            }
+        }
+    )
+
+    assert config.acl_enforced_platforms == ["*"]
+    assert config.acl_bootstrap_from_allowlist is False
+
+
+def test_load_gateway_config_preserves_nested_acl_settings(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        "gateway:\n  acl_enforced_platforms: ['*']\n  acl_bootstrap_from_allowlist: false\n",
+        encoding="utf-8",
+    )
+
+    config = load_gateway_config()
+
+    assert config.acl_enforced_platforms == ["*"]
+    assert config.acl_bootstrap_from_allowlist is False
 
 
 def test_store_initializes_builtin_groups_and_persists_custom_state(tmp_path):
