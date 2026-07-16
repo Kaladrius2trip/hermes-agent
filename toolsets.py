@@ -79,6 +79,12 @@ _HERMES_CORE_TOOLS = [
     "computer_use",
 ]
 
+# Messaging platforms additionally track the current chat participant via the
+# `identity` toolset. identify resolves the speaker from gateway session
+# context, so it no-ops on CLI/cron; keeping it OFF the universal core avoids
+# taxing every non-gateway API call's tool schema (narrow waist).
+_HERMES_MESSAGING_TOOLS = _HERMES_CORE_TOOLS + ["identify"]
+
 # Webhook events may originate from untrusted third-party content (for example,
 # public PR titles/comments). Keep the default webhook toolset intentionally
 # constrained to avoid local file/system execution by prompt injection.
@@ -233,6 +239,12 @@ TOOLSETS = {
     "clarify": {
         "description": "Ask the user clarifying questions (multiple-choice or open-ended)",
         "tools": ["clarify"],
+        "includes": []
+    },
+
+    "identity": {
+        "description": "Track who chat participants are — read/update a per-person profile + one-line note",
+        "tools": ["identify"],
         "includes": []
     },
     
@@ -446,13 +458,13 @@ TOOLSETS = {
 
     "hermes-telegram": {
         "description": "Telegram bot toolset - full access for personal use (terminal has safety checks)",
-        "tools": _HERMES_CORE_TOOLS,
+        "tools": _HERMES_MESSAGING_TOOLS,
         "includes": []
     },
     
     "hermes-discord": {
         "description": "Discord bot toolset - full access (terminal has safety checks via dangerous command approval)",
-        "tools": _HERMES_CORE_TOOLS + [
+        "tools": _HERMES_MESSAGING_TOOLS + [
             "discord",
             "discord_admin",
         ],
@@ -461,61 +473,61 @@ TOOLSETS = {
     
     "hermes-whatsapp": {
         "description": "WhatsApp bot toolset - similar to Telegram (personal messaging, more trusted)",
-        "tools": _HERMES_CORE_TOOLS,
+        "tools": _HERMES_MESSAGING_TOOLS,
         "includes": []
     },
     
     "hermes-slack": {
         "description": "Slack bot toolset - full access for workspace use (terminal has safety checks)",
-        "tools": _HERMES_CORE_TOOLS,
+        "tools": _HERMES_MESSAGING_TOOLS,
         "includes": []
     },
     
     "hermes-signal": {
         "description": "Signal bot toolset - encrypted messaging platform (full access)",
-        "tools": _HERMES_CORE_TOOLS,
+        "tools": _HERMES_MESSAGING_TOOLS,
         "includes": []
     },
 
     "hermes-bluebubbles": {
         "description": "BlueBubbles iMessage bot toolset - Apple iMessage via local BlueBubbles server",
-        "tools": _HERMES_CORE_TOOLS,
+        "tools": _HERMES_MESSAGING_TOOLS,
         "includes": []
     },
 
     "hermes-homeassistant": {
         "description": "Home Assistant bot toolset - smart home event monitoring and control",
-        "tools": _HERMES_CORE_TOOLS,
+        "tools": _HERMES_MESSAGING_TOOLS,
         "includes": []
     },
 
     "hermes-email": {
         "description": "Email bot toolset - interact with Hermes via email (IMAP/SMTP)",
-        "tools": _HERMES_CORE_TOOLS,
+        "tools": _HERMES_MESSAGING_TOOLS,
         "includes": []
     },
 
     "hermes-mattermost": {
         "description": "Mattermost bot toolset - self-hosted team messaging (full access)",
-        "tools": _HERMES_CORE_TOOLS,
+        "tools": _HERMES_MESSAGING_TOOLS,
         "includes": []
     },
 
     "hermes-matrix": {
         "description": "Matrix bot toolset - decentralized encrypted messaging (full access)",
-        "tools": _HERMES_CORE_TOOLS,
+        "tools": _HERMES_MESSAGING_TOOLS,
         "includes": []
     },
 
     "hermes-dingtalk": {
         "description": "DingTalk bot toolset - enterprise messaging platform (full access)",
-        "tools": _HERMES_CORE_TOOLS,
+        "tools": _HERMES_MESSAGING_TOOLS,
         "includes": []
     },
 
     "hermes-feishu": {
         "description": "Feishu/Lark bot toolset - enterprise messaging via Feishu/Lark (full access)",
-        "tools": _HERMES_CORE_TOOLS + [
+        "tools": _HERMES_MESSAGING_TOOLS + [
             "feishu_doc_read",
             "feishu_drive_list_comments",
             "feishu_drive_list_comment_replies",
@@ -527,31 +539,31 @@ TOOLSETS = {
 
     "hermes-weixin": {
         "description": "Weixin bot toolset - personal WeChat messaging via iLink (full access)",
-        "tools": _HERMES_CORE_TOOLS,
+        "tools": _HERMES_MESSAGING_TOOLS,
         "includes": []
     },
 
     "hermes-qqbot": {
         "description": "QQBot toolset - QQ messaging via Official Bot API v2 (full access)",
-        "tools": _HERMES_CORE_TOOLS,
+        "tools": _HERMES_MESSAGING_TOOLS,
         "includes": []
     },
 
     "hermes-wecom": {
         "description": "WeCom bot toolset - enterprise WeChat messaging (full access)",
-        "tools": _HERMES_CORE_TOOLS,
+        "tools": _HERMES_MESSAGING_TOOLS,
         "includes": []
     },
 
     "hermes-wecom-callback": {
         "description": "WeCom callback toolset - enterprise self-built app messaging (full access)",
-        "tools": _HERMES_CORE_TOOLS,
+        "tools": _HERMES_MESSAGING_TOOLS,
         "includes": []
     },
 
     "hermes-yuanbao": {
         "description": "Yuanbao Bot 元宝消息平台工具集 - 群信息、成员查询、私聊、贴纸表情",
-        "tools": _HERMES_CORE_TOOLS + [
+        "tools": _HERMES_MESSAGING_TOOLS + [
             "yb_query_group_info",
             "yb_query_group_members",
             "yb_send_dm",
@@ -564,7 +576,7 @@ TOOLSETS = {
 
     "hermes-sms": {
         "description": "SMS bot toolset - interact with Hermes via SMS (Twilio)",
-        "tools": _HERMES_CORE_TOOLS,
+        "tools": _HERMES_MESSAGING_TOOLS,
         "includes": []
     },
 
@@ -738,7 +750,7 @@ def resolve_toolset(name: str, visited: Set[str] = None, *, include_registry: bo
             try:
                 from gateway.platform_registry import platform_registry
                 if platform_registry.is_registered(platform_name):
-                    plugin_tools = set(_HERMES_CORE_TOOLS)
+                    plugin_tools = set(_HERMES_MESSAGING_TOOLS)
                     try:
                         from tools.registry import registry
                         plugin_tools.update(

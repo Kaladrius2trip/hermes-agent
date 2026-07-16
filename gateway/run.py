@@ -5494,6 +5494,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return False
         return True
 
+    def _is_shared_multi_user_source(self, source: SessionSource) -> bool:
+        """True for a shared multi-user session (group/thread not split per user).
+
+        Mid-run steer splices a foreign sender's text into whichever turn is
+        running, which stays bound to the ORIGINAL sender's identity contextvars
+        (Oracle steer B). In such sessions we queue instead of steering so each
+        sender's message runs as its own identity-bound turn.
+        """
+        from gateway.session import is_shared_multi_user_session
+        return is_shared_multi_user_session(
+            source,
+            group_sessions_per_user=getattr(self.config, "group_sessions_per_user", True),
+            thread_sessions_per_user=getattr(self.config, "thread_sessions_per_user", False),
+        )
+
     async def _send_busy_acl_denial(self, event: MessageEvent, message: str) -> None:
         adapter = self.adapters.get(event.source.platform)
         if not adapter:
@@ -5712,6 +5727,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key,
             )
             effective_mode = "queue"
+        demoted_for_shared_multi_user = (
+            effective_mode == "interrupt"
+            and self._is_shared_multi_user_source(event.source)
+        )
+        if demoted_for_shared_multi_user:
+            logger.info(
+                "Demoting busy_input_mode 'interrupt' to 'queue' for shared "
+                "multi-user session %s: a co-member's message queues instead of "
+                "aborting and discarding another member's in-progress turn",
+                session_key,
+            )
+            effective_mode = "queue"
         steered = False
         if effective_mode == "steer":
             steer_text = (event.text or "").strip()
@@ -5721,6 +5748,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 and running_agent is not _AGENT_PENDING_SENTINEL
                 and hasattr(running_agent, "steer")
                 and self._running_agent_acl_tools_covered_by_source(event.source, running_agent)
+                and not self._is_shared_multi_user_source(event.source)
             )
             if can_steer:
                 try:
@@ -9659,6 +9687,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if not steer_text:
                     return "Usage: /steer <prompt>"
                 running_agent = self._running_agents.get(_quick_key)
+                if self._is_shared_multi_user_source(source):
+                    # Shared multi-user session: queue as its own identity-bound
+                    # turn instead of splicing into another user's run (Oracle
+                    # steer B). Carries the stripped payload + this sender's source.
+                    queued_event = MessageEvent(
+                        text=steer_text,
+                        message_type=MessageType.TEXT,
+                        source=event.source,
+                        message_id=event.message_id,
+                        channel_prompt=event.channel_prompt,
+                    )
+                    self._queue_or_replace_pending_event(_quick_key, queued_event)
+                    depth = self._queue_depth(_quick_key, adapter=self._adapter_for_source(source))
+                    return (
+                        "Queued for the next turn."
+                        if depth <= 1
+                        else f"Queued for the next turn. ({depth} queued)"
+                    )
                 if running_agent is _AGENT_PENDING_SENTINEL:
                     # Agent hasn't started yet — queue as turn-boundary fallback.
                     adapter = self._adapter_for_source(source)
@@ -9894,7 +9940,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # is empty, the agent lacks steer(), or steer() rejects.
                 steer_text = (event.text or "").strip()
                 steered = False
-                if steer_text and hasattr(running_agent, "steer"):
+                # Shared multi-user session: queue instead of splicing a foreign
+                # sender's text into another user's identity-bound turn (Oracle
+                # steer B); the fallback below routes it through the FIFO queue.
+                if (
+                    steer_text
+                    and hasattr(running_agent, "steer")
+                    and not self._is_shared_multi_user_source(source)
+                ):
                     try:
                         steered = bool(running_agent.steer(steer_text))
                     except Exception as exc:
@@ -9934,6 +9987,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.info(
                     "PRIORITY interrupt demoted to queue for session %s "
                     "because context compression is in flight (#56391)",
+                    _quick_key,
+                )
+                self._queue_or_replace_pending_event(_quick_key, event)
+                return None
+            if (
+                self._busy_input_mode == "interrupt"
+                and self._is_shared_multi_user_source(event.source)
+            ):
+                logger.info(
+                    "PRIORITY interrupt demoted to queue for shared multi-user "
+                    "session %s: co-member message queues instead of aborting "
+                    "another member's in-progress turn",
                     _quick_key,
                 )
                 self._queue_or_replace_pending_event(_quick_key, event)
@@ -10701,6 +10766,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             pass
 
+    def _shared_sender_prefix(self, source: SessionSource) -> str:
+        """Blocking identity lookup for a shared-thread message (runs off-loop).
+
+        SECURITY: the IdentityStore is cached per PROFILE home, never
+        process-wide, so a multi-profile host cannot serve one profile's
+        identity DB to another. Keyed on user_id (not user_id_alt) to match the
+        identify tool, which resolves the speaker from HERMES_SESSION_USER_ID;
+        Signal/Feishu user_id_alt precision is a later step.
+        """
+        from hermes_constants import get_hermes_home
+
+        from gateway.identity import IdentityStore, message_prefix_for
+
+        idkey = str(get_hermes_home())
+        cache = getattr(self, "_identity_stores", None)
+        if cache is None:
+            cache = {}
+            self._identity_stores = cache
+        store = cache.get(idkey)
+        if store is None:
+            store = IdentityStore()
+            cache[idkey] = store
+        platform = source.platform.value if hasattr(source.platform, "value") else str(source.platform or "")
+        return message_prefix_for(store, platform, str(source.user_id or ""), source.user_name or "")
+
     async def _prepare_inbound_message_text(
         self,
         *,
@@ -10739,8 +10829,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             group_sessions_per_user=_group_sessions_per_user,
             thread_sessions_per_user=_thread_sessions_per_user,
         )
-        if _is_shared_multi_user and source.user_name:
-            message_text = f"[{source.user_name}] {message_text}"
+        if _is_shared_multi_user:
+            try:
+                _prefix = await asyncio.to_thread(self._shared_sender_prefix, source)
+            except Exception:
+                logger.debug("identity sender prefix skipped", exc_info=True)
+                _prefix = f"[{source.user_name}]" if source.user_name else ""
+            if _prefix:
+                message_text = f"{_prefix} {message_text}"
 
         # Prepend channel context from history backfill (if any).  This
         # happens after sender-prefix so the prefix only applies to the
@@ -15806,6 +15902,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Restore session context variables to their pre-handler values."""
         from gateway.session_context import clear_session_vars
         clear_session_vars(tokens)
+
+    def _bind_session_env_for_source(self, source: SessionSource, session_key: str) -> list:
+        """Bind session contextvars to a raw source, not a built SessionContext.
+
+        Used for a queued follow-up whose sender may DIFFER from the turn that
+        is currently bound: session-scoped tools (notably ``identify``) resolve
+        the speaker from these vars, so the follow-up must run under its own
+        sender or it reads/writes the previous sender's profile (Oracle #2).
+        Mirrors the ``set_session_vars`` shape of ``_set_session_env``.
+        """
+        from gateway.session_context import set_session_vars
+        _adapters = getattr(self, "adapters", None) or {}
+        _adapter = _adapters.get(source.platform)
+        _async_delivery = getattr(_adapter, "supports_async_delivery", True)
+        _platform = source.platform.value if hasattr(source.platform, "value") else str(source.platform or "")
+        return set_session_vars(
+            platform=_platform,
+            chat_id=source.chat_id or "",
+            chat_name=getattr(source, "chat_name", "") or "",
+            thread_id=str(source.thread_id) if source.thread_id else "",
+            user_id=str(source.user_id) if source.user_id else "",
+            user_name=str(source.user_name) if source.user_name else "",
+            session_key=session_key or "",
+            message_id=str(source.message_id) if getattr(source, "message_id", None) else "",
+            profile=getattr(source, "profile", "") or "",
+            async_delivery=_async_delivery,
+        )
 
     async def _run_in_executor_with_context(self, func, *args):
         """Run blocking work in the thread pool while preserving session contextvars."""
@@ -20974,18 +21097,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # what the follow-up's guard will consult.  Fail-safe in helper.
                 await self._refresh_agent_cache_message_count(session_key, session_id)
 
-                followup_result = await self._run_agent(
-                    message=next_message,
-                    context_prompt=context_prompt,
-                    history=updated_history,
-                    source=next_source,
-                    session_id=session_id,
-                    session_key=next_session_key,
-                    run_generation=run_generation,
-                    _interrupt_depth=_interrupt_depth + 1,
-                    event_message_id=next_message_id,
-                    channel_prompt=next_channel_prompt,
-                )
+                # Rebind session contextvars to the follow-up's sender for the
+                # duration of the recursive turn so session-scoped tools attribute
+                # to the ACTUAL queued speaker, then restore this turn's binding
+                # (Oracle #2). Skip when the sender is unchanged. Fail-soft.
+                _fu_env_tokens = None
+                if pending_event is not None and next_source is not source:
+                    try:
+                        _fu_env_tokens = self._bind_session_env_for_source(next_source, next_session_key)
+                    except Exception:
+                        logger.debug("Queued follow-up session-env rebind failed", exc_info=True)
+                        _fu_env_tokens = None
+                try:
+                    followup_result = await self._run_agent(
+                        message=next_message,
+                        context_prompt=context_prompt,
+                        history=updated_history,
+                        source=next_source,
+                        session_id=session_id,
+                        session_key=next_session_key,
+                        run_generation=run_generation,
+                        _interrupt_depth=_interrupt_depth + 1,
+                        event_message_id=next_message_id,
+                        channel_prompt=next_channel_prompt,
+                    )
+                finally:
+                    if _fu_env_tokens is not None:
+                        try:
+                            self._bind_session_env_for_source(source, session_key)
+                        except Exception:
+                            logger.debug("Queued follow-up session-env restore failed", exc_info=True)
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:
             # Stop progress sender, interrupt monitor, and notification task

@@ -267,11 +267,16 @@ or each get their own private session.
 
 ```python
 def is_shared_multi_user_session(source, *, group_sessions_per_user, thread_sessions_per_user):
+    # Mirrors build_session_key exactly: the session is per-user isolated only
+    # when isolate_user AND a participant id are both present; anything else is a
+    # chat-level shared key (multiple users map to one session).
     if source.chat_type == "dm":
         return False  # DMs are always private
-    if source.thread_id:
-        return not thread_sessions_per_user  # Threads: shared unless per-user
-    return not group_sessions_per_user       # Groups: isolated unless shared
+    isolate_user = group_sessions_per_user
+    if source.thread_id and not thread_sessions_per_user:
+        isolate_user = False  # threads share unless per-user is on
+    participant_id = source.user_id_alt or source.user_id
+    return not (isolate_user and participant_id)  # no participant -> shared
 ```
 
 ### Summary

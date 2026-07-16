@@ -291,3 +291,22 @@ class TestResolveToolsetIncludeRegistry:
 
     def test_registry_only_toolset_static_view_is_empty(self):
         assert resolve_toolset("__definitely_not_a_real_toolset__", include_registry=False) == []
+
+
+def test_identify_is_gateway_scoped_not_core():
+    from toolsets import _HERMES_CORE_TOOLS
+
+    assert "identify" not in _HERMES_CORE_TOOLS
+    assert "identify" in resolve_toolset("hermes-telegram")
+    assert "identify" in resolve_toolset("hermes-discord")
+    assert "identify" not in resolve_toolset("hermes-cli")
+    assert "identify" not in resolve_toolset("hermes-cron")
+
+
+def test_dynamic_plugin_platform_bundle_includes_identify(monkeypatch):
+    import gateway.platform_registry as pr
+
+    monkeypatch.setattr(pr.platform_registry, "is_registered", lambda name: name == "acmechat")
+    resolved = set(resolve_toolset("hermes-acmechat"))
+    assert "identify" in resolved
+    assert "terminal" in resolved

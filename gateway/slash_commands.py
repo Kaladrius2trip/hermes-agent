@@ -775,7 +775,12 @@ class GatewaySlashCommandsMixin:
             thread_sessions_per_user=getattr(self.config, "thread_sessions_per_user", False),
         )
         if shared:
-            return True
+            # A no-participant caller now reads as "shared" (its key is
+            # chat-level), so a bare allow would let it match a per-user origin in
+            # the same chat (Case 1 IDOR / CWE-639). Grant the identity-less
+            # shortcut only when caller and origin compute the SAME session key,
+            # i.e. both genuinely address one chat-level shared session.
+            return self._session_key_for_source(current) == self._session_key_for_source(origin)
         # Per-user key: compare the participant id the key is actually built
         # from (user_id_alt or user_id — Signal/Feishu key on user_id_alt).
         cur_pid = current.user_id_alt or current.user_id

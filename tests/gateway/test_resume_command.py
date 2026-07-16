@@ -865,6 +865,27 @@ class TestSameOriginChatGroupScoping:
             self._src("alice"), "bobs_live_sid", allow_override=False
         ) is False
 
+    def test_blocks_identityless_caller_vs_per_user_live_group(self):
+        # Case 1 (Oracle rev.6): a caller with NO participant id computes a
+        # chat-level key, so the corrected shared predicate reads it as "shared".
+        # The session-key equality guard must still block it from matching a
+        # participant-bearing per-user origin in the same chat (CWE-639 IDOR).
+        runner = _make_runner()
+        caller = self._src(None)
+        origin = self._src("bob")
+        assert runner._same_origin_chat(caller, origin) is False
+
+    @pytest.mark.asyncio
+    async def test_resume_target_allowed_blocks_identityless_caller_live_group(self):
+        """End-to-end: an identity-less caller cannot resume a per-user member's
+        active group session in the same chat via the live-origin branch."""
+        runner = _make_runner()
+        bob = self._src("bob")
+        runner._gateway_session_origin_for_id = lambda sid: bob
+        assert await runner._resume_target_allowed(
+            self._src(None), "bobs_live_sid", allow_override=False
+        ) is False
+
     # --- thread scoping: thread_id is part of the session key, so a session in
     # one thread must never match a caller in another thread of the same chat,
     # even when threads are shared among participants by default. ---

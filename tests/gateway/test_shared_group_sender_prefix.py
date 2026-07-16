@@ -30,6 +30,7 @@ async def test_preprocess_prefixes_sender_for_shared_non_thread_group_session():
         chat_id="-1002285219667",
         chat_name="Test Group",
         chat_type="group",
+        user_id="u_alice",
         user_name="Alice",
     )
     event = MessageEvent(text="hello", source=source)
@@ -57,6 +58,7 @@ async def test_preprocess_keeps_plain_text_for_default_group_sessions():
         chat_id="-1002285219667",
         chat_name="Test Group",
         chat_type="group",
+        user_id="u_alice",
         user_name="Alice",
     )
     event = MessageEvent(text="hello", source=source)
