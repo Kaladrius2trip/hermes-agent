@@ -268,7 +268,7 @@ async def test_acl_command_requires_bootstrap_admin_and_requester_bound_confirma
     runner = _runner(tmp_path, bootstrap_users={"owner"})
     owner = _source("owner")
     stranger_event = MessageEvent(
-        text="/acl grant <@u1> default in this channel",
+        text="/acl grant <@u1> default in global",
         message_type=MessageType.TEXT,
         source=_source("stranger"),
     )
@@ -277,7 +277,7 @@ async def test_acl_command_requires_bootstrap_admin_and_requester_bound_confirma
     assert "bootstrap super-admin" in denied
 
     event = MessageEvent(
-        text="/acl grant <@u1> default in this channel",
+        text="/acl grant <@u1> default in global",
         message_type=MessageType.TEXT,
         source=owner,
     )
@@ -314,7 +314,7 @@ async def test_acl_command_requires_bootstrap_admin_and_requester_bound_confirma
         platform="discord", subject_type="user", subject_id="u1"
     )
     assert [(m.group_name, m.scope, m.scope_id) for m in memberships] == [
-        ("default", "channel", "c1")
+        ("default", "global", None)
     ]
 
 
@@ -646,7 +646,7 @@ async def test_gateway_text_approve_for_acl_confirm_is_requester_bound(tmp_path)
 
     prompt = await runner._handle_acl_command(
         MessageEvent(
-            text="/acl grant <@u1> default in this channel",
+            text="/acl grant <@u1> default in global",
             message_type=MessageType.TEXT,
             source=owner_source,
         )
@@ -903,7 +903,8 @@ def test_dynamic_matrix_end_to_end(tmp_path):
 
     from gateway.acl import ACLRequest, ACLStore, BootstrapSuperAdmins, resolve_acl
     from gateway.acl_planner import (
-        ACLProposal, ACLProposalStep, apply_proposal, proposal_digest,
+        ACLProposal, ACLProposalStep, apply_proposal, bind_proposal_catalog,
+        proposal_digest,
     )
     from gateway.acl_recommender import recommend_grant_paths
 
@@ -933,9 +934,12 @@ def test_dynamic_matrix_end_to_end(tmp_path):
         session_key="s", created_at=now, expires_at=now + 300,
         policy_epoch=store.policy_epoch,
     )
+    bootstrap_proposal = bind_proposal_catalog(
+        store, bootstrap_proposal, catalog=catalog)
     apply_proposal(store, bootstrap_proposal,
                    digest=proposal_digest(bootstrap_proposal),
-                   actor_platform="discord", actor_user_id="owner", now=now,
+                   actor_platform="discord", actor_user_id="owner",
+                   actor_session_key="s", now=now,
                    catalog=catalog, actor_is_bootstrap=True)
 
     delegated = ACLProposal(
@@ -948,8 +952,9 @@ def test_dynamic_matrix_end_to_end(tmp_path):
         policy_epoch=store.policy_epoch,
     )
     apply_proposal(store, delegated, digest=proposal_digest(delegated),
-                   actor_platform="discord", actor_user_id="lead", now=now,
-                   actor_is_bootstrap=False)
+                   actor_platform="discord", actor_user_id="lead",
+                   actor_session_key="s2", now=now,
+                   actor_is_bootstrap=False, actor_can_delegate=True)
 
     req = ACLRequest(platform="discord", user_id="boss", scope="channel",
                      channel_id="c1", guild_id="g1")
@@ -973,7 +978,7 @@ def test_dynamic_matrix_end_to_end(tmp_path):
 
     options = recommend_grant_paths(
         store, {"platform": "discord", "user_id": "someone", "role_ids": ()},
-        "web", {"scope": "channel", "channel_id": "c1", "guild_id": "g1"},
+        "web_search", {"scope": "channel", "channel_id": "c1", "guild_id": "g1"},
         catalog=catalog,
     )
     assert options[0]["kind"] in {"join_group", "direct_user_grant"}

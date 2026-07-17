@@ -20,6 +20,7 @@ from gateway.acl_planner import (
     ACLProposalStep,
     PlannerError,
     apply_proposal,
+    bind_proposal_catalog,
     proposal_digest,
     render_proposal,
     validate_proposal,
@@ -133,7 +134,7 @@ def test_apply_happy_path(tmp_path):
     digest = proposal_digest(proposal)
     report = apply_proposal(
         store, proposal, digest=digest,
-        actor_platform="discord", actor_user_id="owner", now=NOW, actor_is_bootstrap=True,
+        actor_platform="discord", actor_user_id="owner", actor_session_key=proposal.session_key, now=NOW, actor_is_bootstrap=True,
     )
     assert report["applied"] == 2
     assert store.policy_epoch > e0
@@ -150,7 +151,7 @@ def test_apply_rejects_expired(tmp_path):
     proposal = _proposal(store=store, expires_at=NOW - 1)
     with pytest.raises(PlannerError):
         apply_proposal(store, proposal, digest=proposal_digest(proposal),
-                       actor_platform="discord", actor_user_id="owner", now=NOW, actor_is_bootstrap=True)
+                       actor_platform="discord", actor_user_id="owner", actor_session_key=proposal.session_key, now=NOW, actor_is_bootstrap=True)
 
 
 def test_apply_rejects_digest_mismatch(tmp_path):
@@ -158,7 +159,7 @@ def test_apply_rejects_digest_mismatch(tmp_path):
     proposal = _proposal(store=store)
     with pytest.raises(PlannerError):
         apply_proposal(store, proposal, digest="0" * 64,
-                       actor_platform="discord", actor_user_id="owner", now=NOW, actor_is_bootstrap=True)
+                       actor_platform="discord", actor_user_id="owner", actor_session_key=proposal.session_key, now=NOW, actor_is_bootstrap=True)
 
 
 def test_apply_rejects_foreign_actor(tmp_path):
@@ -166,10 +167,10 @@ def test_apply_rejects_foreign_actor(tmp_path):
     proposal = _proposal(store=store)
     with pytest.raises(PlannerError):
         apply_proposal(store, proposal, digest=proposal_digest(proposal),
-                       actor_platform="discord", actor_user_id="mallory", now=NOW, actor_is_bootstrap=True)
+                       actor_platform="discord", actor_user_id="mallory", actor_session_key=proposal.session_key, now=NOW, actor_is_bootstrap=True)
     with pytest.raises(PlannerError):
         apply_proposal(store, proposal, digest=proposal_digest(proposal),
-                       actor_platform="telegram", actor_user_id="owner", now=NOW, actor_is_bootstrap=True)
+                       actor_platform="telegram", actor_user_id="owner", actor_session_key=proposal.session_key, now=NOW, actor_is_bootstrap=True)
 
 
 def test_apply_is_transactional(tmp_path):
@@ -183,7 +184,7 @@ def test_apply_is_transactional(tmp_path):
     # second step targets a group that does not exist -> whole proposal rolls back
     with pytest.raises(PlannerError):
         apply_proposal(store, proposal, digest=proposal_digest(proposal),
-                       actor_platform="discord", actor_user_id="owner", now=NOW, actor_is_bootstrap=True)
+                       actor_platform="discord", actor_user_id="owner", actor_session_key=proposal.session_key, now=NOW, actor_is_bootstrap=True)
     assert store.list_memberships(platform="discord") == []
 
 
@@ -193,7 +194,7 @@ def test_apply_audits_before_and_after(tmp_path):
     store = _store(tmp_path)
     proposal = _proposal(store=store)
     apply_proposal(store, proposal, digest=proposal_digest(proposal),
-                   actor_platform="discord", actor_user_id="owner", now=NOW, actor_is_bootstrap=True)
+                   actor_platform="discord", actor_user_id="owner", actor_session_key=proposal.session_key, now=NOW, actor_is_bootstrap=True)
     con = sqlite3.connect(store.db_path)
     actions = [r[0] for r in con.execute(
         "select action from audit_log order by id desc limit 4"
@@ -213,10 +214,12 @@ def test_definition_ops_validate_render_apply(tmp_path):
         ACLProposalStep(op="create_access_definition", access_name="jenkins-pc",
                         spec="jenkins_*"),
     ])
+    proposal = bind_proposal_catalog(store, proposal, catalog=CATALOG)
     text = render_proposal(proposal)
+    assert 'tools=["jenkins_build_pc","jenkins_status"]' in text
     assert "jenkins-pc" in text and "jenkins_*" in text
     apply_proposal(store, proposal, digest=proposal_digest(proposal),
-                   actor_platform="discord", actor_user_id="owner", now=NOW, actor_is_bootstrap=True,
+                   actor_platform="discord", actor_user_id="owner", actor_session_key=proposal.session_key, now=NOW, actor_is_bootstrap=True,
                    catalog=CATALOG)
     assert store.resolve_definition("jenkins-pc") == {"jenkins_build_pc", "jenkins_status"}
 
@@ -230,8 +233,9 @@ def test_definition_expansion_op(tmp_path):
     proposal = _proposal(store=store, steps=[
         ACLProposalStep(op="approve_definition_expansion", access_name="jenkins-pc"),
     ])
+    proposal = bind_proposal_catalog(store, proposal, catalog=CATALOG)
     apply_proposal(store, proposal, digest=proposal_digest(proposal),
-                   actor_platform="discord", actor_user_id="owner", now=NOW, actor_is_bootstrap=True,
+                   actor_platform="discord", actor_user_id="owner", actor_session_key=proposal.session_key, now=NOW, actor_is_bootstrap=True,
                    catalog=CATALOG)
     assert store.resolve_definition("jenkins-pc") == {"jenkins_build_pc", "jenkins_status"}
 
@@ -244,7 +248,7 @@ def test_definition_op_requires_catalog(tmp_path):
     ])
     with pytest.raises(PlannerError):
         apply_proposal(store, proposal, digest=proposal_digest(proposal),
-                       actor_platform="discord", actor_user_id="owner", now=NOW, actor_is_bootstrap=True)
+                       actor_platform="discord", actor_user_id="owner", actor_session_key=proposal.session_key, now=NOW, actor_is_bootstrap=True)
 
 
 def test_planner_refuses_reserved_all(tmp_path):
@@ -274,7 +278,7 @@ def test_user_access_ops_apply(tmp_path):
                         access_name="tool:special_tool", scope="global"),
     ])
     apply_proposal(store, grant, digest=proposal_digest(grant),
-                   actor_platform="discord", actor_user_id="owner", now=NOW, actor_is_bootstrap=True)
+                   actor_platform="discord", actor_user_id="owner", actor_session_key=grant.session_key, now=NOW, actor_is_bootstrap=True)
     req = ACLRequest(platform="discord", user_id="solo", scope="dm")
     assert store.resolve_subject_access(req) == {"tool:special_tool"}
     revoke = _proposal(store=store, steps=[
@@ -283,7 +287,7 @@ def test_user_access_ops_apply(tmp_path):
                         access_name="tool:special_tool", scope="global"),
     ])
     apply_proposal(store, revoke, digest=proposal_digest(revoke),
-                   actor_platform="discord", actor_user_id="owner", now=NOW, actor_is_bootstrap=True)
+                   actor_platform="discord", actor_user_id="owner", actor_session_key=revoke.session_key, now=NOW, actor_is_bootstrap=True)
     assert store.resolve_subject_access(req) == set()
 
 

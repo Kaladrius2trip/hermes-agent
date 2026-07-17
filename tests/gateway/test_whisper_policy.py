@@ -87,6 +87,16 @@ def test_denies_stale_role_snapshot():
     assert recipient is None and reason == "stale_role_membership"
 
 
+def test_denies_future_role_snapshot():
+    recipient, reason = _resolve([_cand(roles_verified_at=NOW + 1)])
+    assert recipient is None and reason == "stale_role_membership"
+
+
+def test_denies_non_finite_role_snapshot():
+    recipient, reason = _resolve([_cand(roles_verified_at=float("nan"))])
+    assert recipient is None and reason == "stale_role_membership"
+
+
 def test_denies_unconfigured_policy():
     recipient, reason = _resolve([_cand()], approved_role_names=())
     assert recipient is None and reason == "whisper_not_configured"
@@ -94,7 +104,7 @@ def test_denies_unconfigured_policy():
     assert recipient is None and reason == "whisper_not_configured"
 
 
-def test_whisper_access_capability_registered():
+def test_whisper_access_capability_is_dormant_until_dispatch_wiring():
     from gateway.acl import _resolve_access_name
 
-    assert _resolve_access_name("whisper") == {"whisper"}
+    assert _resolve_access_name("whisper") == set()

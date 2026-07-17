@@ -46,7 +46,7 @@ def test_record_and_fetch_decision(tmp_path):
     store = _store(tmp_path)
     event_id = _record(store)
     assert event_id
-    event = store.get_decision(event_id)
+    event = store._get_decision_unchecked(event_id)
     assert event is not None
     assert event.capability_type == "slash"
     assert event.capability_name == "background"
@@ -66,7 +66,7 @@ def test_record_and_fetch_decision(tmp_path):
 
 
 def test_unknown_event_returns_none(tmp_path):
-    assert _store(tmp_path).get_decision("nope") is None
+    assert _store(tmp_path)._get_decision_unchecked("nope") is None
 
 
 def test_list_decisions_filters(tmp_path):
@@ -75,11 +75,11 @@ def test_list_decisions_filters(tmp_path):
     _record(store, user_id="bob")
     _record(store, user_id="bob", capability_type="tool", capability_name="terminal",
             reason_code="tool_not_in_policy")
-    assert len(store.list_decisions()) == 3
-    assert len(store.list_decisions(user_id="bob")) == 2
-    assert len(store.list_decisions(allowed=False)) == 2
-    assert len(store.list_decisions(capability_type="tool")) == 1
-    assert len(store.list_decisions(limit=1)) == 1
+    assert len(store._list_decisions_unchecked()) == 3
+    assert len(store._list_decisions_unchecked(user_id="bob")) == 2
+    assert len(store._list_decisions_unchecked(allowed=False)) == 2
+    assert len(store._list_decisions_unchecked(capability_type="tool")) == 1
+    assert len(store._list_decisions_unchecked(limit=1)) == 1
 
 
 def test_capability_type_validated(tmp_path):
@@ -99,7 +99,7 @@ def test_retention_prunes_oldest(tmp_path):
     for i in range(30):
         _record(store, message_id=f"m{i}")
     store.prune_decisions(max_rows=10)
-    remaining = store.list_decisions(limit=100)
+    remaining = store._list_decisions_unchecked(limit=100)
     assert len(remaining) == 10
     assert remaining[0].message_id == "m29"
 
@@ -133,7 +133,7 @@ def test_mandatory_fields_enforced(tmp_path):
 def test_request_id_and_passed_epoch_roundtrip(tmp_path):
     store = _store(tmp_path)
     event_id = _record(store, request_id="req-9", policy_epoch=41)
-    event = store.get_decision(event_id)
+    event = store._get_decision_unchecked(event_id)
     assert event.request_id == "req-9"
     assert event.policy_epoch == 41
 
@@ -156,12 +156,12 @@ def test_emission_autocaps_rows(tmp_path):
     store.decision_max_rows = 10
     for i in range(205):
         _record(store, message_id=f"m{i}")
-    assert len(store.list_decisions(limit=500)) <= 110
+    assert len(store._list_decisions_unchecked(limit=500)) <= 110
 
 
 def test_list_limit_clamped(tmp_path):
     store = _store(tmp_path)
-    assert store.list_decisions(limit=999999) == []
+    assert store._list_decisions_unchecked(limit=999999) == []
 
 
 def test_audit_degraded_flag(tmp_path):
@@ -171,6 +171,10 @@ def test_audit_degraded_flag(tmp_path):
     assert _record(store) == ""
     assert store.audit_degraded is True
 
+    store.db_path = tmp_path / "acl.sqlite3"
+    assert _record(store)
+    assert store.audit_degraded is True
+
 
 def test_audited_read_records_trace(tmp_path):
     import sqlite3 as _sq
@@ -178,7 +182,10 @@ def test_audited_read_records_trace(tmp_path):
     store = _store(tmp_path)
     event_id = _record(store)
     event = store.get_decision_audited(
-        event_id, actor_platform="discord", actor_user_id="owner"
+        event_id,
+        actor_platform="discord",
+        actor_user_id="owner",
+        visible_session_key="agent:main:discord:channel:c1",
     )
     assert event is not None and event.event_id == event_id
     con = _sq.connect(store.db_path)
@@ -193,8 +200,30 @@ def test_audited_read_withholds_on_broken_store(tmp_path):
     event_id = _record(store)
     store.db_path = tmp_path / "missing" / "nope.sqlite3"
     assert store.get_decision_audited(
-        event_id, actor_platform="discord", actor_user_id="owner"
+        event_id,
+        actor_platform="discord",
+        actor_user_id="owner",
+        visible_session_key="agent:main:discord:channel:c1",
     ) is None
+    assert store.audit_degraded is True
+
+
+def test_audited_read_withholds_cross_session_and_audits_denial(tmp_path):
+    import sqlite3 as _sq
+
+    store = _store(tmp_path)
+    event_id = _record(store)
+    assert store.get_decision_audited(
+        event_id,
+        actor_platform="discord",
+        actor_user_id="owner",
+        visible_session_key="agent:main:discord:channel:other",
+    ) is None
+    with _sq.connect(store.db_path) as con:
+        row = con.execute(
+            "select action, allowed from audit_log order by id desc limit 1"
+        ).fetchone()
+    assert row == ("decision.trace", 0)
 
 
 def test_parse_acl_trace_command(tmp_path):
@@ -220,7 +249,7 @@ def test_matched_sources_recorded(tmp_path):
         matched_groups=("informer",),
         matched_sources=("group:informer", "direct_grant:tool:x", "definition:jenkins-pc"),
     )
-    event = store.get_decision(event_id)
+    event = store._get_decision_unchecked(event_id)
     assert tuple(event.matched_sources) == (
         "group:informer", "direct_grant:tool:x", "definition:jenkins-pc",
     )
@@ -228,7 +257,7 @@ def test_matched_sources_recorded(tmp_path):
 
 def test_matched_sources_default_empty(tmp_path):
     store = _store(tmp_path)
-    event = store.get_decision(_record(store))
+    event = store._get_decision_unchecked(_record(store))
     assert tuple(event.matched_sources) == ()
 
 
@@ -237,5 +266,7 @@ def test_matched_sources_survives_existing_store(tmp_path):
     path = tmp_path / "acl.sqlite3"
     ACLStore(path)
     store = ACLStore(path)
-    event = store.get_decision(_record(store, matched_sources=("group:default",)))
+    event = store._get_decision_unchecked(
+        _record(store, matched_sources=("group:default",))
+    )
     assert tuple(event.matched_sources) == ("group:default",)

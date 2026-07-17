@@ -9,6 +9,7 @@ decision log (capability_type='dm_recipient').
 """
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass, field
 from typing import Iterable, Optional, Sequence
@@ -54,7 +55,16 @@ def resolve_whisper_recipient(
         return None, "untrusted_guild"
     moment = time.time() if now is None else float(now)
     verified_at = float(candidate.roles_verified_at or 0.0)
-    if verified_at <= 0.0 or (moment - verified_at) > max_role_age_s:
+    max_age = float(max_role_age_s)
+    if (
+        not math.isfinite(moment)
+        or not math.isfinite(verified_at)
+        or not math.isfinite(max_age)
+        or max_age < 0
+        or verified_at <= 0
+        or verified_at > moment
+        or (moment - verified_at) > max_age
+    ):
         return None, "stale_role_membership"
     managed = {str(r) for r in (candidate.roles_are_managed or ())}
     human_roles = {str(r) for r in (candidate.role_names or ())} - managed

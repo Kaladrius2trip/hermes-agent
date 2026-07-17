@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import sqlite3
@@ -17,7 +18,7 @@ import uuid
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Optional
+from typing import Any, Iterable, Literal, Mapping, Optional
 
 from hermes_constants import get_hermes_home
 
@@ -53,13 +54,11 @@ TEAM_PRESET_GROUPS: "dict[str, tuple[str, ...]]" = {
 BUILTIN_ACCESS_CAPABILITIES: "dict[str, frozenset[str]]" = {
     "file_read": frozenset({"read_file", "search_files"}),
     "file_write": frozenset({"write_file", "patch"}),
-    # Recipient-scoped outbound DM. A dedicated capability by contract:
-    # never granted via generic messaging/communication/delegation names.
-    "whisper": frozenset({"whisper"}),
-    # Restricted user-owned scheduler: the cronjob tool gated by the
-    # dispatch-time argument/ownership checks in gateway/scheduler_policy.py.
-    "scheduler_user": frozenset({"cronjob"}),
 }
+
+# Policy cores exist for these names, but their dispatch adapters are not wired.
+# Existing rows resolve closed; all new grants are rejected until wiring lands.
+UNWIRED_ACCESS_NAMES = frozenset({"whisper", "scheduler_user"})
 
 ADMIN_EXTRA_SLASH_COMMANDS = frozenset({
     "help",
@@ -75,7 +74,6 @@ ADMIN_EXTRA_SLASH_COMMANDS = frozenset({
     "stop",
     "resume",
     "clear",
-    "model",
 })
 
 _VALID_NAME_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,80}$")
@@ -145,6 +143,7 @@ class EffectiveACLPolicy:
     bootstrap_super_admin: bool = False
     denied_reason: Optional[str] = None
     policy_epoch: int = 0
+    matched_sources: tuple[str, ...] = ()
 
     @property
     def allowed_concrete_tool_names(self) -> set[str]:
@@ -200,6 +199,7 @@ class ACLCommandContext:
     channel_id: Optional[str] = None
     scope: str = "dm"
     thread_id: Optional[str] = None
+    guild_id: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -216,6 +216,17 @@ class ACLCommand:
     raw: str = ""
 
 
+class _ClosingSQLiteConnection(sqlite3.Connection):
+    """Commit/rollback like sqlite3's CM, then release the underlying FD."""
+
+    def __exit__(self, exc_type, exc_value, traceback) -> Literal[False]:
+        try:
+            super().__exit__(exc_type, exc_value, traceback)
+            return False
+        finally:
+            self.close()
+
+
 class ACLStore:
     """Profile-aware SQLite ACL store under Hermes home by default."""
 
@@ -228,7 +239,7 @@ class ACLStore:
         self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, factory=_ClosingSQLiteConnection)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys=ON")
         return conn
@@ -278,6 +289,25 @@ class ACLStore:
                 UNIQUE(platform, subject_type, subject_id, group_name, scope, scope_id),
                 CHECK (scope <> 'global' OR (subject_type = 'user' AND scope_id = '')),
                 CHECK (scope <> 'guild' OR (scope_id <> '' AND scope_id <> '*')),
+                FOREIGN KEY(group_name) REFERENCES groups(name) ON DELETE CASCADE
+            ) STRICT
+        """,
+        "scoped_membership_legacy_links": """
+            CREATE TABLE scoped_membership_legacy_links (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                platform TEXT NOT NULL CHECK (platform <> ''),
+                subject_type TEXT NOT NULL CHECK (subject_type IN ('user', 'role')),
+                subject_id TEXT NOT NULL CHECK (subject_id <> ''),
+                group_name TEXT NOT NULL CHECK (group_name <> ''),
+                scoped_scope TEXT NOT NULL CHECK (scoped_scope IN ('global', 'guild')),
+                scoped_scope_id TEXT NOT NULL DEFAULT '',
+                legacy_scope TEXT NOT NULL CHECK (legacy_scope IN ('dm', 'channel')),
+                legacy_scope_id TEXT NOT NULL DEFAULT '',
+                created_at REAL NOT NULL,
+                UNIQUE(
+                    platform, subject_type, subject_id, group_name,
+                    scoped_scope, scoped_scope_id, legacy_scope, legacy_scope_id
+                ),
                 FOREIGN KEY(group_name) REFERENCES groups(name) ON DELETE CASCADE
             ) STRICT
         """,
@@ -434,6 +464,22 @@ class ACLStore:
                     "ALTER TABLE acl_decisions"
                     " ADD COLUMN matched_sources TEXT NOT NULL DEFAULT '[]'"
                 )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_subject_grants_resolve"
+                " ON subject_grants(platform, subject_type, subject_id, scope, scope_id, expires_at)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_group_grants_access"
+                " ON group_grants(access_name, group_name)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memberships_group"
+                " ON memberships(group_name, subject_type, subject_id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_scoped_memberships_group"
+                " ON scoped_memberships(group_name, subject_type, subject_id)"
+            )
             violations = conn.execute("PRAGMA foreign_key_check").fetchall()
             if violations:
                 raise sqlite3.IntegrityError(f"ACL migration foreign-key violations: {violations}")
@@ -455,8 +501,18 @@ class ACLStore:
         old = f"{table}_legacy_migration"
         conn.execute(f"ALTER TABLE {table} RENAME TO {old}")
         conn.execute(ddl)
-        cols = [str(r["name"]) for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
-        col_list = ", ".join(cols)
+        new_cols = [
+            str(r["name"])
+            for r in conn.execute(f"PRAGMA table_info({table})").fetchall()
+        ]
+        old_cols = {
+            str(r["name"])
+            for r in conn.execute(f"PRAGMA table_info({old})").fetchall()
+        }
+        copy_cols = [col for col in new_cols if col in old_cols]
+        if not copy_cols:
+            raise sqlite3.IntegrityError(f"no compatible columns rebuilding {table}")
+        col_list = ", ".join(copy_cols)
         conn.execute(f"INSERT INTO {table}({col_list}) SELECT {col_list} FROM {old}")
         conn.execute(f"DROP TABLE {old}")
 
@@ -494,7 +550,7 @@ class ACLStore:
 
     def grant_group_access(self, group_name: str, access_name: str, *, actor_platform: str = "", actor_user_id: str = "") -> None:
         group_name = _validate_name(group_name, "group")
-        access_name = _validate_access_name(access_name)
+        access_name = _reject_unwired_access_name(_validate_access_name(access_name))
         with self._connect() as conn:
             self._ensure_group_conn(conn, group_name)
             conn.execute(
@@ -655,6 +711,7 @@ class ACLStore:
         group_name: str,
         scope: str,
         scope_id: Optional[str] = None,
+        legacy_rows: Optional[Iterable[Mapping[str, Any]]] = None,
         actor_platform: str = "",
         actor_user_id: str = "",
     ) -> None:
@@ -666,6 +723,25 @@ class ACLStore:
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             self._ensure_group_conn(conn, group_name)
+            normalized_legacy = self._normalize_legacy_rows(legacy_rows)
+            actual_legacy_rows = conn.execute(
+                """
+                SELECT scope, scope_id FROM memberships
+                WHERE platform=? AND subject_type=? AND subject_id=? AND group_name=?
+                """,
+                (platform, subject_type, subject_id, group_name),
+            ).fetchall()
+            actual_legacy = {
+                (str(row["scope"]), str(row["scope_id"])) for row in actual_legacy_rows
+            }
+            declared_legacy = {
+                (row["scope"], row["scope_id"]) for row in normalized_legacy
+            }
+            if actual_legacy != declared_legacy:
+                raise ValueError(
+                    "exact legacy_rows are required for durable revoke lineage; "
+                    f"actual={sorted(actual_legacy)} declared={sorted(declared_legacy)}"
+                )
             conn.execute(
                 """
                 INSERT OR IGNORE INTO scoped_memberships(
@@ -674,6 +750,16 @@ class ACLStore:
                 """,
                 (platform, subject_type, subject_id, group_name, scope, db_scope_id, time.time()),
             )
+            for row in normalized_legacy:
+                if self._select_legacy_conn(
+                    conn, platform, subject_type, subject_id, group_name,
+                    row["scope"], row["scope_id"],
+                ) is None:
+                    raise ValueError(f"legacy ACL evidence row missing: {row}")
+                self._insert_legacy_link_conn(
+                    conn, platform, subject_type, subject_id, group_name,
+                    scope, db_scope_id, row["scope"], row["scope_id"],
+                )
             self._bump_policy_epoch_conn(conn)
             self._audit_conn(
                 conn,
@@ -708,6 +794,37 @@ class ACLStore:
         scope, db_scope_id = _validate_scoped_scope(scope, scope_id, subject_type)
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            linked = conn.execute(
+                """
+                SELECT legacy_scope AS scope, legacy_scope_id AS scope_id
+                FROM scoped_membership_legacy_links
+                WHERE platform=? AND subject_type=? AND subject_id=? AND group_name=?
+                  AND scoped_scope=? AND scoped_scope_id=?
+                """,
+                (platform, subject_type, subject_id, group_name, scope, db_scope_id),
+            ).fetchall()
+            rows_to_remove = {
+                (str(row["scope"]), str(row["scope_id"])) for row in linked
+            }
+            rows_to_remove.update(
+                (row["scope"], row["scope_id"])
+                for row in self._normalize_legacy_rows(legacy_rows)
+            )
+            existing_legacy = conn.execute(
+                """
+                SELECT scope, scope_id FROM memberships
+                WHERE platform=? AND subject_type=? AND subject_id=? AND group_name=?
+                """,
+                (platform, subject_type, subject_id, group_name),
+            ).fetchall()
+            unlinked = {
+                (str(row["scope"]), str(row["scope_id"])) for row in existing_legacy
+            } - rows_to_remove
+            if unlinked:
+                raise ValueError(
+                    "refusing partial scoped revoke: unlinked legacy ACL rows remain: "
+                    f"{sorted(unlinked)}"
+                )
             conn.execute(
                 """
                 DELETE FROM scoped_memberships
@@ -716,12 +833,7 @@ class ACLStore:
                 """,
                 (platform, subject_type, subject_id, group_name, scope, db_scope_id),
             )
-            for row in legacy_rows or ():
-                legacy_scope = _norm_scope(str(row.get("scope") or ""))
-                if legacy_scope == "channel":
-                    legacy_scope_id = _norm_scope_id(legacy_scope, row.get("scope_id")) or ""
-                else:
-                    legacy_scope_id = ""
+            for legacy_scope, legacy_scope_id in sorted(rows_to_remove):
                 conn.execute(
                     """
                     DELETE FROM memberships
@@ -730,6 +842,14 @@ class ACLStore:
                     """,
                     (platform, subject_type, subject_id, group_name, legacy_scope, legacy_scope_id),
                 )
+            conn.execute(
+                """
+                DELETE FROM scoped_membership_legacy_links
+                WHERE platform=? AND subject_type=? AND subject_id=? AND group_name=?
+                  AND scoped_scope=? AND scoped_scope_id=?
+                """,
+                (platform, subject_type, subject_id, group_name, scope, db_scope_id),
+            )
             self._bump_policy_epoch_conn(conn)
             self._audit_conn(
                 conn,
@@ -750,6 +870,15 @@ class ACLStore:
     _DECISION_NAME_MAX = 120
     _DECISION_PRUNE_INTERVAL = 100
     _DECISION_LIST_MAX = 500
+
+    def _mark_audit_degraded(self) -> None:
+        self._audit_degraded = True
+        now = time.time()
+        if now - self._audit_degraded_logged_at > 60.0:
+            self._audit_degraded_logged_at = now
+            logging.getLogger(__name__).error(
+                "ACL decision audit write failed; decision log is degraded"
+            )
 
     def record_decision(
         self,
@@ -828,20 +957,13 @@ class ACLStore:
                 )
                 if cur.lastrowid and cur.lastrowid % self._DECISION_PRUNE_INTERVAL == 0:
                     self._prune_decisions_conn(conn, self.decision_max_rows)
-            self._audit_degraded = False
             return event_id
         except (sqlite3.Error, OSError):
             # Fail-soft by contract: an audit write failure must never break
             # the message turn; the authorization decision itself already
             # happened and fail-closed rules live in the resolver. The sticky
             # degraded flag + rate-limited log make the evidence gap visible.
-            self._audit_degraded = True
-            now = time.time()
-            if now - self._audit_degraded_logged_at > 60.0:
-                self._audit_degraded_logged_at = now
-                logging.getLogger(__name__).error(
-                    "ACL decision audit write failed; decision log is degraded"
-                )
+            self._mark_audit_degraded()
             return ""
 
     @staticmethod
@@ -876,14 +998,15 @@ class ACLStore:
             matched_sources=_ids(row["matched_sources"]) if "matched_sources" in row.keys() else (),
         )
 
-    def get_decision(self, event_id: str) -> Optional["ACLDecisionEvent"]:
+    def _get_decision_unchecked(self, event_id: str) -> Optional["ACLDecisionEvent"]:
+        """Internal maintenance/test read. Runtime disclosures must use audited reads."""
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT * FROM acl_decisions WHERE event_id=?", (str(event_id),)
             ).fetchone()
         return self._decision_from_row(row) if row is not None else None
 
-    def list_decisions(
+    def _list_decisions_unchecked(
         self,
         *,
         user_id: Optional[str] = None,
@@ -937,6 +1060,7 @@ class ACLStore:
         *,
         actor_platform: str,
         actor_user_id: str,
+        visible_session_key: str,
     ) -> Optional["ACLDecisionEvent"]:
         """Fetch a decision event, recording the read in the same transaction.
 
@@ -949,17 +1073,24 @@ class ACLStore:
                 row = conn.execute(
                     "SELECT * FROM acl_decisions WHERE event_id=?", (str(event_id),)
                 ).fetchone()
+                visible = bool(
+                    row is not None
+                    and str(row["platform"]) == _norm_platform(actor_platform)
+                    and str(row["session_key"]) == str(visible_session_key)
+                )
                 self._audit_conn(
                     conn,
                     "decision.trace",
                     actor_platform=actor_platform,
                     actor_user_id=actor_user_id,
                     access_name=str(event_id),
-                    allowed=row is not None,
+                    allowed=visible,
+                    reason="visible_session_match" if visible else "not_found_or_not_visible",
                 )
         except (sqlite3.Error, OSError):
+            self._mark_audit_degraded()
             return None
-        return self._decision_from_row(row) if row is not None else None
+        return self._decision_from_row(row) if visible and row is not None else None
 
     def grant_subject_access(
         self,
@@ -977,21 +1108,30 @@ class ACLStore:
         platform = _norm_platform(platform)
         subject_type = _norm_subject_type(subject_type)
         subject_id = _validate_subject_id(subject_id)
-        access_name = _validate_access_name(access_name)
+        access_name = _reject_unwired_access_name(_validate_access_name(access_name))
         scope, db_scope_id = _validate_selector_scope(scope, scope_id, subject_type)
+        normalized_expiry = None
+        if expires_at is not None:
+            normalized_expiry = float(expires_at)
+            if not math.isfinite(normalized_expiry):
+                raise ValueError("expires_at must be finite")
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             conn.execute(
                 """
-                INSERT OR IGNORE INTO subject_grants(
+                INSERT INTO subject_grants(
                     platform, subject_type, subject_id, access_name, scope,
                     scope_id, created_at, expires_at, actor_platform, actor_user_id
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(platform, subject_type, subject_id, access_name, scope, scope_id)
+                DO UPDATE SET
+                    expires_at=excluded.expires_at,
+                    actor_platform=excluded.actor_platform,
+                    actor_user_id=excluded.actor_user_id
                 """,
                 (
                     platform, subject_type, subject_id, access_name, scope,
-                    db_scope_id, time.time(),
-                    float(expires_at) if expires_at is not None else None,
+                    db_scope_id, time.time(), normalized_expiry,
                     actor_platform, actor_user_id,
                 ),
             )
@@ -1243,8 +1383,9 @@ class ACLStore:
 
         return {
             str(tool)
-            for tool in (catalog or {})
-            if fnmatch.fnmatchcase(str(tool), spec)
+            for tool, capability_class in (catalog or {}).items()
+            if str(capability_class) == "runtime_safe"
+            and fnmatch.fnmatchcase(str(tool), spec)
         }
 
     def set_group_safe_delegable(
@@ -1259,9 +1400,29 @@ class ACLStore:
                 " VALUES (?, 'safe_delegable', ?)",
                 (group_name, time.time()),
             )
+            self._bump_policy_epoch_conn(conn)
             self._audit_conn(
                 conn,
                 "group.flag.safe_delegable",
+                actor_platform=actor_platform,
+                actor_user_id=actor_user_id,
+                group_name=group_name,
+            )
+
+    def clear_group_safe_delegable(
+        self, group_name: str, *, actor_platform: str = "", actor_user_id: str = ""
+    ) -> None:
+        group_name = _validate_name(group_name, "group")
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "DELETE FROM group_flags WHERE group_name=? AND flag_name='safe_delegable'",
+                (group_name,),
+            )
+            self._bump_policy_epoch_conn(conn)
+            self._audit_conn(
+                conn,
+                "group.flag.clear_safe_delegable",
                 actor_platform=actor_platform,
                 actor_user_id=actor_user_id,
                 group_name=group_name,
@@ -1303,9 +1464,12 @@ class ACLStore:
                 f"""
                 SELECT platform, subject_type, subject_id, group_name, scope, scope_id, created_at
                 FROM memberships {where}
+                UNION ALL
+                SELECT platform, subject_type, subject_id, group_name, scope, scope_id, created_at
+                FROM scoped_memberships {where}
                 ORDER BY platform, subject_type, subject_id, scope, scope_id, group_name
                 """,
-                params,
+                (*params, *params),
             ).fetchall()
         return [
             ACLMembership(
@@ -1319,6 +1483,86 @@ class ACLStore:
             )
             for row in rows
         ]
+
+    @staticmethod
+    def _normalize_legacy_rows(
+        rows: Optional[Iterable[Mapping[str, Any]]],
+    ) -> list[dict[str, str]]:
+        normalized: list[dict[str, str]] = []
+        for row in rows or ():
+            legacy_scope = _norm_scope(str(row.get("scope") or ""))
+            legacy_scope_id = (
+                _norm_scope_id(legacy_scope, row.get("scope_id")) or ""
+                if legacy_scope == "channel" else ""
+            )
+            normalized.append({"scope": legacy_scope, "scope_id": legacy_scope_id})
+        return normalized
+
+    @staticmethod
+    def _select_legacy_conn(
+        conn: sqlite3.Connection,
+        platform: str,
+        subject_type: str,
+        subject_id: str,
+        group_name: str,
+        scope: str,
+        scope_id: str,
+    ) -> Optional[sqlite3.Row]:
+        return conn.execute(
+            """
+            SELECT id FROM memberships
+            WHERE platform=? AND subject_type=? AND subject_id=? AND group_name=?
+              AND scope=? AND scope_id=?
+            """,
+            (platform, subject_type, subject_id, group_name, scope, scope_id),
+        ).fetchone()
+
+    @staticmethod
+    def _insert_legacy_link_conn(
+        conn: sqlite3.Connection,
+        platform: str,
+        subject_type: str,
+        subject_id: str,
+        group_name: str,
+        scoped_scope: str,
+        scoped_scope_id: str,
+        legacy_scope: str,
+        legacy_scope_id: str,
+    ) -> None:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO scoped_membership_legacy_links(
+                platform, subject_type, subject_id, group_name,
+                scoped_scope, scoped_scope_id, legacy_scope, legacy_scope_id, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                platform, subject_type, subject_id, group_name,
+                scoped_scope, scoped_scope_id, legacy_scope, legacy_scope_id,
+                time.time(),
+            ),
+        )
+
+    def matching_memberships(self, request: ACLRequest) -> list[ACLMembership]:
+        platform = _norm_platform(request.platform)
+        scope = _norm_scope(request.scope or request.chat_type or "dm")
+        channel_id = _scope_id_from_request(scope, request) or ""
+        guild_id = str(getattr(request, "guild_id", None) or "").strip()
+        subjects = {("user", str(request.user_id or "").strip())}
+        subjects.update(("role", str(role).strip()) for role in request.role_ids or ())
+        result: list[ACLMembership] = []
+        for membership in self.list_memberships(platform=platform):
+            if (membership.subject_type, membership.subject_id) not in subjects:
+                continue
+            if membership.scope == "global" and membership.subject_type == "user":
+                result.append(membership)
+            elif membership.scope == "guild" and scope == "channel" and membership.scope_id == guild_id:
+                result.append(membership)
+            elif membership.scope == "channel" and scope == "channel" and membership.scope_id == channel_id:
+                result.append(membership)
+            elif membership.scope == "dm" and scope == "dm":
+                result.append(membership)
+        return result
 
     _GUILD_PLATFORMS = frozenset({"discord"})
 
@@ -1500,8 +1744,10 @@ def resolve_acl(
     is_bootstrap_admin = bootstrap.is_super_admin(platform, user_id)
 
     groups, policy_epoch = store.resolve_memberships_with_epoch(request)
+    matched_sources = {f"group:{group}" for group in groups}
     if is_bootstrap_admin:
         groups.add("admin")
+        matched_sources.update({"bootstrap:super_admin", "group:admin"})
 
     allowed_tools: set[str] = set()
     allowed_slash: set[str] = set(DISCOVERY_SLASH_COMMANDS)
@@ -1546,6 +1792,9 @@ def resolve_acl(
             elif _is_reserved_access(access_name):
                 allowed_tools.update(_catalog_all_runtime(catalog))
             elif str(access_name).lower().startswith("def:"):
+                matched_sources.add(
+                    f"definition:{str(access_name).split(':', 1)[1]}"
+                )
                 allowed_tools.update(
                     store.resolve_definition(str(access_name).split(":", 1)[1])
                 )
@@ -1553,11 +1802,15 @@ def resolve_acl(
                 allowed_tools.update(_resolve_access_name(access_name))
 
     for access_name in sorted(subject_access):
+        matched_sources.add(f"direct_grant:{access_name}")
         if _is_slash_access(access_name):
             allowed_slash.add(_slash_name(access_name))
         elif _is_reserved_access(access_name):
             allowed_tools.update(_catalog_all_runtime(catalog))
         elif str(access_name).lower().startswith("def:"):
+            matched_sources.add(
+                f"definition:{str(access_name).split(':', 1)[1]}"
+            )
             allowed_tools.update(
                 store.resolve_definition(str(access_name).split(":", 1)[1])
             )
@@ -1565,7 +1818,7 @@ def resolve_acl(
             allowed_tools.update(_resolve_access_name(access_name))
 
     if is_bootstrap_admin:
-        allowed_slash.add("acl")
+        allowed_slash.update({"acl", "steer"})
 
     return EffectiveACLPolicy(
         platform=platform,
@@ -1579,6 +1832,7 @@ def resolve_acl(
         bootstrap_super_admin=is_bootstrap_admin,
         denied_reason=None,
         policy_epoch=policy_epoch,
+        matched_sources=tuple(sorted(matched_sources)),
     )
 
 
@@ -1708,7 +1962,9 @@ def parse_acl_command(text: str, context: ACLCommandContext) -> ACLCommand:
 
     if head in {"grant", "revoke"}:
         if len(parts) < 5:
-            raise ValueError("usage: /acl grant @user <group> in dm|this channel")
+            raise ValueError(
+                "usage: /acl grant @user <group> in global|guild <id>|dm|this channel"
+            )
         subject_type, subject_id = _parse_subject(parts[1])
         group_name = _validate_name(parts[2], "group")
         if parts[3].lower() != "in":
@@ -1780,7 +2036,17 @@ def apply_acl_command(
         )
         return f"ACL group grant revoked: {command.group_name} -> {command.access_name}"
     if command.action == "grant_membership":
-        store.grant_membership(
+        target_platform = _norm_platform(platform or actor_platform)
+        if target_platform == "discord" and command.scope not in {"global", "guild"}:
+            raise ValueError(
+                "Discord ACL writes require global user or guild user/role scope"
+            )
+        grant = (
+            store.grant_scoped_membership
+            if command.scope in {"global", "guild"}
+            else store.grant_membership
+        )
+        grant(
             platform=platform or actor_platform,
             subject_type=command.subject_type or "user",
             subject_id=command.subject_id or "",
@@ -1792,7 +2058,17 @@ def apply_acl_command(
         )
         return f"ACL membership granted: {command.subject_id} -> {command.group_name} in {_format_scope(command.scope, command.scope_id)}"
     if command.action == "revoke_membership":
-        store.revoke_membership(
+        target_platform = _norm_platform(platform or actor_platform)
+        if target_platform == "discord" and command.scope not in {"global", "guild"}:
+            raise ValueError(
+                "Discord ACL writes require global user or guild user/role scope"
+            )
+        revoke = (
+            store.revoke_scoped_membership
+            if command.scope in {"global", "guild"}
+            else store.revoke_membership
+        )
+        revoke(
             platform=platform or actor_platform,
             subject_type=command.subject_type or "user",
             subject_id=command.subject_id or "",
@@ -1915,6 +2191,10 @@ def _validate_selector_scope(
     norm = _norm_scope(value)
     if norm == "channel":
         return "channel", _norm_scope_id(norm, scope_id) or ""
+    if subject_type != "user":
+        raise ValueError("dm ACL scope is user-only; role IDs are platform-local")
+    if scope_id not in (None, ""):
+        raise ValueError("dm ACL scope takes no scope_id")
     return "dm", ""
 
 
@@ -1949,6 +2229,12 @@ def _validate_access_name(access_name: str) -> str:
     if not value or not _VALID_NAME_RE.match(value):
         raise ValueError("invalid ACL access name")
     return value
+
+
+def _reject_unwired_access_name(access_name: str) -> str:
+    if access_name in UNWIRED_ACCESS_NAMES:
+        raise ValueError(f"ACL access {access_name!r} is unavailable until dispatch wiring exists")
+    return access_name
 
 
 def _validate_subject_id(subject_id: str) -> str:
@@ -2003,6 +2289,8 @@ def _resolve_access_name(access_name: str) -> set[str]:
         # Reserved computed names: never live-expand outside the
         # catalog-aware resolver path (fail closed everywhere else).
         return set()
+    if lower in UNWIRED_ACCESS_NAMES:
+        return set()
     if lower in {"chat", "safe_chat"}:
         return set(DEFAULT_SAFE_TOOL_NAMES)
     if lower in BUILTIN_ACCESS_CAPABILITIES:
@@ -2033,7 +2321,16 @@ def _is_slash_access(access_name: str) -> bool:
 
 
 def _slash_name(access_name: str) -> str:
-    return str(access_name).split(":", 1)[1].strip().lstrip("/").replace("_", "-").lower()
+    name = str(access_name).split(":", 1)[1].strip().lstrip("/").replace("_", "-").lower()
+    try:
+        from hermes_cli.commands import resolve_command
+
+        command_def = resolve_command(name)
+        if command_def is not None:
+            return command_def.name
+    except Exception:
+        pass
+    return name
 
 
 def _parse_subject(token: str) -> tuple[str, str]:
@@ -2055,6 +2352,17 @@ def _parse_scope(parts: list[str], context: ACLCommandContext) -> tuple[str, Opt
     if not parts:
         raise ValueError("missing ACL scope")
     first = parts[0].lower()
+    if first == "global":
+        return "global", None
+    if first == "guild":
+        guild_id = str(parts[1]).strip() if len(parts) >= 2 else str(context.guild_id or "").strip()
+        if not guild_id:
+            raise ValueError("guild scope requires an explicit guild id or guild context")
+        return "guild", guild_id
+    if first == "this" and len(parts) >= 2 and parts[1].lower() == "guild":
+        if not context.guild_id:
+            raise ValueError("this guild scope requires guild context")
+        return "guild", str(context.guild_id)
     if first in {"dm", "dms", "direct"}:
         return "dm", None
     if first == "this" and len(parts) >= 2 and parts[1].lower() == "channel":
@@ -2067,12 +2375,14 @@ def _parse_scope(parts: list[str], context: ACLCommandContext) -> tuple[str, Opt
         if not context.channel_id:
             raise ValueError("channel scope requires channel id")
         return "channel", str(context.channel_id)
-    raise ValueError("scope must be 'dm' or 'this channel'")
+    raise ValueError("scope must be 'global', 'guild', 'dm', or 'this channel'")
 
 
 def _format_scope(scope: Optional[str], scope_id: Optional[str]) -> str:
-    if scope == "channel":
-        return f"channel:{scope_id}" if scope_id else "channel"
+    if scope in {"channel", "guild"}:
+        return f"{scope}:{scope_id}" if scope_id else scope
+    if scope == "global":
+        return "global"
     return "dm"
 
 

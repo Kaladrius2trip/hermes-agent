@@ -109,7 +109,7 @@ def test_unknown_action_fails_closed():
     assert allowed is False and reason == "unknown_scheduler_action"
 
 
-def test_scheduler_capability_registered():
+def test_scheduler_capability_is_dormant_until_dispatch_wiring():
     from gateway.acl import _resolve_access_name
 
-    assert _resolve_access_name("scheduler_user") == {"cronjob"}
+    assert _resolve_access_name("scheduler_user") == set()

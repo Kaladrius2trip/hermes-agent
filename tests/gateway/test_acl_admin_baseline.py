@@ -1,6 +1,8 @@
 """S1 driver: catalog-classified admin baseline (owner decision 1+2)."""
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 from gateway.acl import ACLRequest, ACLStore, BootstrapSuperAdmins, resolve_acl
 
 CATALOG = {

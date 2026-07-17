@@ -130,3 +130,18 @@ def test_definition_via_subject_grant(tmp_path):
         bootstrap=BootstrapSuperAdmins.empty(),
     )
     assert {"jenkins_build_pc", "jenkins_status"} <= policy.allowed_tool_names
+
+
+def test_definition_snapshots_only_reviewed_runtime_safe_tools(tmp_path):
+    store = _store(tmp_path)
+    catalog = {
+        "web_search": "runtime_safe",
+        "terminal": "operator",
+        "cronjob": "control_plane",
+        "mystery": "unclassified",
+    }
+    snapshot = store.create_access_definition(
+        name="safe-only", spec="*", catalog=catalog,
+        actor_platform="discord", actor_user_id="owner",
+    )
+    assert snapshot == {"web_search"}

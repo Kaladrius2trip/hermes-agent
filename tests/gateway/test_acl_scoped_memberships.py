@@ -50,7 +50,10 @@ def test_schema_is_additive_on_existing_store(tmp_path):
     second = ACLStore(path)
     con = sqlite3.connect(path)
     tables = {r[0] for r in con.execute("select name from sqlite_master where type='table'")}
-    assert {"memberships", "scoped_memberships", "acl_meta", "migration_ledger"} <= tables
+    assert {
+        "memberships", "scoped_memberships", "scoped_membership_legacy_links",
+        "acl_meta", "migration_ledger",
+    } <= tables
     rows = con.execute("select subject_id from memberships").fetchall()
     assert rows == [("legacy",)]
     assert second.resolve_memberships(
@@ -224,23 +227,50 @@ def test_revoke_scoped_also_removes_exact_legacy_rows(tmp_path):
     store.grant_scoped_membership(
         platform="discord", subject_type="role", subject_id="team",
         group_name="informer", scope="guild", scope_id="g1",
-    )
-    store.revoke_scoped_membership(
-        platform="discord", subject_type="role", subject_id="team",
-        group_name="informer", scope="guild", scope_id="g1",
         legacy_rows=[
             {"scope": "channel", "scope_id": "c1"},
             {"scope": "channel", "scope_id": "c2"},
         ],
     )
+    store.revoke_scoped_membership(
+        platform="discord", subject_type="role", subject_id="team",
+        group_name="informer", scope="guild", scope_id="g1",
+    )
     assert store.resolve_memberships(_req(user_id="x", roles=("team",))) == set()
     assert store.resolve_memberships(
         _req(user_id="x", roles=("team",), guild_id=None, scope="channel")
     ) == set()
-    assert store.resolve_memberships(_req(user_id="keeper", platform="discord")) == set() or True
+    assert store.resolve_memberships(
+        _req(user_id="keeper", platform="discord")
+    ) == {"informer"}
     rows = store.list_memberships(platform="discord")
     kept = [m for m in rows if m.subject_id == "keeper"]
     assert len(kept) == 1
+
+
+def test_revoke_scoped_refuses_unlinked_legacy_rows(tmp_path):
+    store = _store(tmp_path)
+    store.grant_membership(
+        platform="discord", subject_type="role", subject_id="team",
+        group_name="informer", scope="channel", scope_id="c1",
+    )
+    store.grant_scoped_membership(
+        platform="discord", subject_type="role", subject_id="team",
+        group_name="informer", scope="guild", scope_id="g1",
+        legacy_rows=[{"scope": "channel", "scope_id": "c1"}],
+    )
+    store.grant_membership(
+        platform="discord", subject_type="role", subject_id="team",
+        group_name="informer", scope="channel", scope_id="c2",
+    )
+    with pytest.raises(ValueError, match="partial scoped revoke"):
+        store.revoke_scoped_membership(
+            platform="discord", subject_type="role", subject_id="team",
+            group_name="informer", scope="guild", scope_id="g1",
+        )
+    assert store.resolve_memberships(
+        _req(user_id="x", roles=("team",))
+    ) == {"informer"}
 
 
 def test_resolver_epoch_snapshot_in_policy(tmp_path):

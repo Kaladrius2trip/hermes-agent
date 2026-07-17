@@ -47,22 +47,45 @@ def _add_step(group="informer", **kw) -> ACLProposalStep:
 def _apply(store, proposal, *, bootstrap: bool):
     return apply_proposal(
         store, proposal, digest=proposal_digest(proposal),
-        actor_platform="discord", actor_user_id="lead", now=NOW,
+        actor_platform="discord", actor_user_id="lead", actor_session_key=proposal.session_key, now=NOW,
         actor_is_bootstrap=bootstrap,
+        actor_can_delegate=not bootstrap,
     )
 
 
 def test_flag_helpers(tmp_path):
     store = ACLStore(tmp_path / "acl.sqlite3")
     assert store.is_safe_delegable("informer") is False
+    before = store.policy_epoch
     store.set_group_safe_delegable("informer")
     assert store.is_safe_delegable("informer") is True
+    assert store.policy_epoch > before
+    flagged = store.policy_epoch
+    store.clear_group_safe_delegable("informer")
+    assert store.is_safe_delegable("informer") is False
+    assert store.policy_epoch > flagged
 
 
 def test_delegated_add_to_safe_group_allowed(tmp_path):
     store = _store(tmp_path)
     report = _apply(store, _proposal(store, [_add_step()]), bootstrap=False)
     assert report["applied"] == 1
+
+
+def test_non_bootstrap_without_current_delegate_authority_rejected(tmp_path):
+    store = _store(tmp_path)
+    proposal = _proposal(store, [_add_step()])
+    with pytest.raises(PlannerError, match="delegation authority"):
+        apply_proposal(
+            store,
+            proposal,
+            digest=proposal_digest(proposal),
+            actor_platform="discord",
+            actor_user_id="lead",
+            actor_session_key=proposal.session_key,
+            now=NOW,
+            actor_is_bootstrap=False,
+        )
 
 
 def test_delegated_scoped_add_to_safe_group_allowed(tmp_path):

@@ -11,6 +11,7 @@ from __future__ import annotations
 from typing import Any, Callable, Mapping, Optional
 
 from gateway.acl import ACLRequest, ACLStore
+from gateway.acl_catalog import RESERVED_ACCESS_NAMES
 
 RosterProvider = Callable[[str], int]
 
@@ -43,22 +44,33 @@ def _groups_carrying(store: ACLStore, access_name: str) -> dict[str, set[str]]:
     return carrying
 
 
-def _member_counts(store: ACLStore, group: str) -> tuple[int, list[str]]:
-    """(distinct user member rows, role subject ids) across generations."""
-    users: set[str] = set()
-    roles: set[str] = set()
+def _member_counts(
+    store: ACLStore, groups: set[str]
+) -> dict[str, tuple[int, list[str]]]:
+    """Bulk member counts across generations; two queries regardless of N."""
+    if not groups:
+        return {}
+    users: dict[str, set[str]] = {group: set() for group in groups}
+    roles: dict[str, set[str]] = {group: set() for group in groups}
+    placeholders = ",".join("?" for _ in groups)
+    params = tuple(sorted(groups))
     with store._connect() as conn:
         for table in ("memberships", "scoped_memberships"):
             rows = conn.execute(
-                f"SELECT subject_type, subject_id FROM {table} WHERE group_name=?",
-                (group,),
+                f"SELECT group_name, subject_type, subject_id FROM {table} "
+                f"WHERE group_name IN ({placeholders})",
+                params,
             ).fetchall()
             for row in rows:
+                group = str(row["group_name"])
                 if str(row["subject_type"]) == "user":
-                    users.add(str(row["subject_id"]))
+                    users[group].add(str(row["subject_id"]))
                 else:
-                    roles.add(str(row["subject_id"]))
-    return len(users), sorted(roles)
+                    roles[group].add(str(row["subject_id"]))
+    return {
+        group: (len(users[group]), sorted(roles[group]))
+        for group in groups
+    }
 
 
 def recommend_grant_paths(
@@ -71,6 +83,18 @@ def recommend_grant_paths(
     roster_provider: Optional[RosterProvider] = None,
 ) -> list[dict[str, Any]]:
     access_name = str(access_name or "").strip()
+    if not access_name or access_name.lower() in RESERVED_ACCESS_NAMES:
+        raise ValueError("reserved or empty access cannot be recommended")
+    concrete_name = (
+        access_name.split(":", 1)[1]
+        if access_name.lower().startswith("tool:")
+        else access_name
+    )
+    capability_class = str((catalog or {}).get(concrete_name) or "unclassified")
+    if capability_class != "runtime_safe":
+        raise ValueError(
+            f"access {access_name!r} is not a reviewed runtime_safe capability"
+        )
     request = _request_for(subject, scope_ctx)
     subject_groups = store.resolve_memberships(request)
     direct_access = store.resolve_subject_access(request)
@@ -95,6 +119,15 @@ def recommend_grant_paths(
         })
         rank += 1
 
+    options.append({
+        "kind": "direct_user_grant",
+        "rank": rank,
+        "subject_id": str(subject.get("user_id") or ""),
+        "blast_radius": 1,
+        "warnings": [],
+    })
+    rank += 1
+
     for group in sorted(set(carrying) - subject_groups):
         options.append({
             "kind": "join_group",
@@ -110,15 +143,6 @@ def recommend_grant_paths(
         rank += 1
 
     options.append({
-        "kind": "direct_user_grant",
-        "rank": rank,
-        "subject_id": str(subject.get("user_id") or ""),
-        "blast_radius": 1,
-        "warnings": [],
-    })
-    rank += 1
-
-    options.append({
         "kind": "create_group",
         "rank": rank,
         "blast_radius": 1,
@@ -126,10 +150,12 @@ def recommend_grant_paths(
     })
     rank += 1
 
+    candidate_groups = set(subject_groups) - set(carrying)
+    member_counts = _member_counts(store, candidate_groups)
     for group in sorted(subject_groups):
         if group in carrying:
             continue
-        user_count, role_ids = _member_counts(store, group)
+        user_count, role_ids = member_counts[group]
         blast: Any
         warnings = ["changes ALL effective members of this group"]
         if role_ids:

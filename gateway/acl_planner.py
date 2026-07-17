@@ -13,13 +13,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import sqlite3
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import Any, Mapping, Optional
 
 from gateway.acl import (
     ACLStore,
+    UNWIRED_ACCESS_NAMES,
     _norm_platform,
     _norm_scope,
     _norm_scope_id,
@@ -50,6 +52,8 @@ def _reject_reserved(access_name: str) -> str:
 
     if str(access_name).strip().lower() in RESERVED_ACCESS_NAMES:
         raise PlannerError("reserved access names cannot be granted by proposals")
+    if str(access_name).strip().lower() in UNWIRED_ACCESS_NAMES:
+        raise PlannerError("unwired access names cannot be granted by proposals")
     return access_name
 
 
@@ -76,6 +80,8 @@ class ACLProposal:
     created_at: float
     expires_at: float
     policy_epoch: Optional[int] = None
+    catalog_digest: Optional[str] = None
+    definition_snapshots: tuple[tuple[str, str, tuple[str, ...]], ...] = ()
 
 
 def _normalized_step(step: ACLProposalStep) -> dict[str, Any]:
@@ -110,10 +116,20 @@ def _normalized_step(step: ACLProposalStep) -> dict[str, Any]:
                 raise PlannerError(f"{scope} subject grants require an explicit scope_id")
             out["scope"], out["scope_id"] = scope, sid
         elif scope == "dm":
+            if out["subject_type"] != "user":
+                raise PlannerError("dm subject grants are user-only")
+            if step.scope_id not in (None, ""):
+                raise PlannerError("dm subject grants take no scope_id")
             out["scope"], out["scope_id"] = "dm", ""
         else:
             raise PlannerError(f"unsupported subject grant scope: {step.scope!r}")
-        out["expires_at"] = float(step.expires_at) if step.expires_at else None
+        if step.expires_at is None:
+            out["expires_at"] = None
+        else:
+            expires_at = float(step.expires_at)
+            if not math.isfinite(expires_at):
+                raise ValueError("subject grant expiry must be finite")
+            out["expires_at"] = expires_at
         return out
     out["group_name"] = _validate_name(step.group_name or "", "group")
     if op in _GRANT_OPS:
@@ -146,18 +162,90 @@ def _normalized_steps(proposal: ACLProposal) -> list[dict[str, Any]]:
     return steps
 
 
+def _definition_snapshots(
+    store: ACLStore,
+    proposal: ACLProposal,
+    catalog: Mapping[str, str],
+) -> tuple[tuple[str, str, tuple[str, ...]], ...]:
+    """Ordered concrete snapshots for every definition operation."""
+    specs: dict[str, str] = {}
+    with store._connect() as conn:
+        specs.update(
+            (str(row["name"]), str(row["spec"]))
+            for row in conn.execute("SELECT name, spec FROM access_definitions").fetchall()
+        )
+    snapshots: list[tuple[str, str, tuple[str, ...]]] = []
+    for step in _normalized_steps(proposal):
+        if step["op"] not in _DEFINITION_OPS:
+            continue
+        name = step["access_name"]
+        if step["op"] == "create_access_definition":
+            specs[name] = step["spec"]
+        spec = specs.get(name)
+        if spec is None:
+            raise PlannerError(f"unknown access definition: {name}")
+        matched = tuple(sorted(ACLStore._match_definition_spec(spec, catalog)))
+        snapshots.append((step["op"], name, matched))
+    return tuple(snapshots)
+
+
+def _normalized_bound_snapshots(
+    proposal: ACLProposal,
+) -> tuple[tuple[str, str, tuple[str, ...]], ...]:
+    try:
+        return tuple(
+            (
+                str(item[0]),
+                str(item[1]),
+                tuple(sorted(str(tool) for tool in item[2])),
+            )
+            for item in (proposal.definition_snapshots or ())
+        )
+    except (IndexError, TypeError) as exc:
+        raise PlannerError("invalid definition snapshot envelope") from exc
+
+
+def bind_proposal_catalog(
+    store: ACLStore,
+    proposal: ACLProposal,
+    *,
+    catalog: Mapping[str, str],
+) -> ACLProposal:
+    """Freeze the catalog inputs shown to and confirmed by the requester."""
+    from gateway.acl_catalog import catalog_digest
+
+    if not catalog:
+        raise PlannerError("definition operations require the capability catalog")
+    return replace(
+        proposal,
+        catalog_digest=catalog_digest(catalog),
+        definition_snapshots=_definition_snapshots(store, proposal, catalog),
+    )
+
+
 def proposal_digest(proposal: ACLProposal) -> str:
+    try:
+        created_at = float(proposal.created_at)
+        expires_at = float(proposal.expires_at)
+    except (TypeError, ValueError) as exc:
+        raise PlannerError("proposal timestamps must be finite") from exc
+    if not math.isfinite(created_at) or not math.isfinite(expires_at):
+        raise PlannerError("proposal timestamps must be finite")
     canon = json.dumps(
         {
             "steps": _normalized_steps(proposal),
             "requester_platform": str(proposal.requester_platform or ""),
             "requester_user_id": str(proposal.requester_user_id or ""),
             "session_key": str(proposal.session_key or ""),
-            "expires_at": float(proposal.expires_at or 0),
+            "created_at": created_at,
+            "expires_at": expires_at,
             "policy_epoch": proposal.policy_epoch,
+            "catalog_digest": proposal.catalog_digest,
+            "definition_snapshots": _normalized_bound_snapshots(proposal),
         },
         sort_keys=True,
         separators=(",", ":"),
+        allow_nan=False,
     )
     return hashlib.sha256(canon.encode("utf-8")).hexdigest()
 
@@ -168,10 +256,11 @@ def validate_proposal(store: ACLStore, proposal: ACLProposal) -> list[dict[str, 
     # SECURITY: the rendered diff must equal the applied diff - membership
     # grants may only target groups that exist or are created by an earlier
     # step of this same proposal (no implicit creation at apply time).
-    known_groups = {
-        str(row["name"])
-        for row in store._connect().execute("SELECT name FROM groups").fetchall()
-    }
+    with store._connect() as conn:
+        known_groups = {
+            str(row["name"])
+            for row in conn.execute("SELECT name FROM groups").fetchall()
+        }
     for step in steps:
         if step["op"] == "create_group":
             known_groups.add(step["group_name"])
@@ -193,6 +282,7 @@ def validate_proposal(store: ACLStore, proposal: ACLProposal) -> list[dict[str, 
 def render_proposal(proposal: ACLProposal) -> str:
     """Exact grants/revokes/subjects/scope diff for owner confirmation."""
     lines: list[str] = []
+    snapshot_iter = iter(_normalized_bound_snapshots(proposal))
     for step in _normalized_steps(proposal):
         op = step["op"]
         verb = "grant" if op.startswith(("grant", "create")) else "revoke"
@@ -201,7 +291,16 @@ def render_proposal(proposal: ACLProposal) -> str:
             continue
         if op in _DEFINITION_OPS:
             spec_txt = f" spec '{step.get('spec')}'" if step.get("spec") else ""
-            lines.append(f"+ {op} '{step['access_name']}'{spec_txt}")
+            try:
+                snapshot_op, snapshot_name, snapshot = next(snapshot_iter)
+            except StopIteration as exc:
+                raise PlannerError("definition proposal is not bound to a catalog snapshot") from exc
+            if (snapshot_op, snapshot_name) != (op, step["access_name"]):
+                raise PlannerError("definition snapshot does not match proposal order")
+            lines.append(
+                f"+ {op} '{step['access_name']}'{spec_txt}"
+                f" tools={json.dumps(list(snapshot), separators=(',', ':'))}"
+            )
             continue
         if op in _USER_ACCESS_OPS:
             sign = "+" if op.startswith("grant") else "-"
@@ -285,10 +384,12 @@ def _apply_step_conn(
         if op == "grant_user_access":
             conn.execute(
                 """
-                INSERT OR IGNORE INTO subject_grants(
+                INSERT INTO subject_grants(
                     platform, subject_type, subject_id, access_name, scope,
                     scope_id, created_at, expires_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(platform, subject_type, subject_id, access_name, scope, scope_id)
+                DO UPDATE SET expires_at=excluded.expires_at
                 """,
                 (
                     step["platform"], step["subject_type"], step["subject_id"],
@@ -360,21 +461,31 @@ def _apply_step_conn(
         )
 
 
-def apply_proposal(
+def _apply_proposal_checked(
     store: ACLStore,
     proposal: ACLProposal,
     *,
     digest: str,
     actor_platform: str,
     actor_user_id: str,
+    actor_session_key: str,
     now: Optional[float] = None,
     catalog: Optional[Mapping[str, str]] = None,
     actor_is_bootstrap: bool = False,
+    actor_can_delegate: bool = False,
 ) -> dict[str, Any]:
     """Apply a confirmed proposal transactionally after revalidating gates."""
     moment = time.time() if now is None else float(now)
+    created_at = float(proposal.created_at)
+    expires_at = float(proposal.expires_at)
+    if not all(math.isfinite(value) for value in (moment, created_at, expires_at)):
+        raise PlannerError("proposal timestamps must be finite")
+    if expires_at <= created_at:
+        raise PlannerError("proposal expiry must be after creation")
     steps = validate_proposal(store, proposal)
     if not actor_is_bootstrap:
+        if not actor_can_delegate:
+            raise PlannerError("current delegation authority is required")
         # SECURITY (owner decision 6B): a non-bootstrap actor may apply a
         # proposal ONLY when every step is a membership ADD to a group
         # explicitly flagged safe_delegable. Positive enumeration - any
@@ -387,7 +498,7 @@ def apply_proposal(
                     f"group '{step['group_name']}' is not delegable; "
                     "bootstrap authority required"
                 )
-    if moment >= float(proposal.expires_at or 0):
+    if moment >= expires_at:
         raise PlannerError("proposal confirmation expired")
     # SECURITY: the confirming actor must be the requester the proposal was
     # bound to; a confirmation can never be replayed by another principal.
@@ -396,14 +507,33 @@ def apply_proposal(
         or str(actor_user_id or "") != str(proposal.requester_user_id or "")
     ):
         raise PlannerError("confirmation actor does not match the proposal requester")
+    if str(actor_session_key or "") != str(proposal.session_key or ""):
+        raise PlannerError("confirmation session does not match the proposal session")
+    if any(step["op"] in _DEFINITION_OPS for step in steps):
+        from gateway.acl_catalog import catalog_digest
+
+        if not catalog or proposal.catalog_digest is None:
+            raise PlannerError("definition proposal is not bound to a catalog snapshot")
+        if catalog_digest(catalog) != proposal.catalog_digest:
+            raise PlannerError("capability catalog changed; re-render and re-confirm")
+        if _definition_snapshots(store, proposal, catalog) != _normalized_bound_snapshots(proposal):
+            raise PlannerError("definition snapshot changed; re-render and re-confirm")
     if proposal_digest(proposal) != str(digest or ""):
         raise PlannerError("proposal digest mismatch; re-render and re-confirm")
-    if proposal.policy_epoch is None or int(proposal.policy_epoch) != store.policy_epoch:
+    if proposal.policy_epoch is None:
         raise PlannerError("policy changed since this proposal was rendered; re-render")
+    try:
+        expected_policy_epoch = int(proposal.policy_epoch)
+    except (TypeError, ValueError) as exc:
+        raise PlannerError(
+            "policy changed since this proposal was rendered; re-render"
+        ) from exc
 
     conn = store._connect()
     try:
         conn.execute("BEGIN IMMEDIATE")
+        if ACLStore._policy_epoch_conn(conn) != expected_policy_epoch:
+            raise PlannerError("policy changed since this proposal was rendered; re-render")
         try:
             conn.execute(
                 "INSERT INTO applied_proposals(digest, applied_at, actor_platform, actor_user_id)"
@@ -449,3 +579,75 @@ def apply_proposal(
     finally:
         conn.close()
     return {"applied": len(steps), "digest": digest}
+
+
+def _apply_failure_reason(exc: Exception) -> str:
+    text = str(exc).lower()
+    checks = (
+        ("already used", "replay"),
+        ("expired", "expired"),
+        ("timestamp", "invalid_timestamp"),
+        ("actor does not match", "actor_mismatch"),
+        ("session does not match", "session_mismatch"),
+        ("digest mismatch", "digest_mismatch"),
+        ("policy changed", "policy_epoch_changed"),
+        ("catalog changed", "catalog_changed"),
+        ("snapshot", "snapshot_changed"),
+        ("delegation authority", "delegation_authority_missing"),
+        ("bootstrap authority", "bootstrap_authority_required"),
+        ("not delegable", "group_not_delegable"),
+    )
+    for marker, code in checks:
+        if marker in text:
+            return code
+    return "validation_failed" if isinstance(exc, PlannerError) else "transaction_failed"
+
+
+def apply_proposal(
+    store: ACLStore,
+    proposal: ACLProposal,
+    *,
+    digest: str,
+    actor_platform: str,
+    actor_user_id: str,
+    actor_session_key: str,
+    now: Optional[float] = None,
+    catalog: Optional[Mapping[str, str]] = None,
+    actor_is_bootstrap: bool = False,
+    actor_can_delegate: bool = False,
+) -> dict[str, Any]:
+    """Apply and durably audit every denied or rolled-back attempt."""
+    try:
+        return _apply_proposal_checked(
+            store,
+            proposal,
+            digest=digest,
+            actor_platform=actor_platform,
+            actor_user_id=actor_user_id,
+            actor_session_key=actor_session_key,
+            now=now,
+            catalog=catalog,
+            actor_is_bootstrap=actor_is_bootstrap,
+            actor_can_delegate=actor_can_delegate,
+        )
+    except Exception as exc:
+        action = "proposal.apply.denied" if isinstance(exc, PlannerError) else "proposal.apply.rollback"
+        try:
+            store.audit_event(
+                action,
+                actor_platform=actor_platform,
+                actor_user_id=actor_user_id,
+                allowed=False,
+                reason=_apply_failure_reason(exc),
+                details=json.dumps(
+                    {
+                        "digest": str(digest or "")[:64],
+                        "policy_epoch": proposal.policy_epoch,
+                        "session_key": str(actor_session_key or ""),
+                    },
+                    sort_keys=True,
+                ),
+            )
+        except Exception:
+            store._mark_audit_degraded()
+        raise

@@ -1,6 +1,8 @@
 """S6 driver: deterministic grant-path recommendation engine."""
 from __future__ import annotations
 
+import pytest
+
 from gateway.acl import ACLStore
 from gateway.acl_recommender import recommend_grant_paths
 
@@ -45,8 +47,8 @@ def test_ranked_options_deterministic(tmp_path):
     )
     kinds = [o["kind"] for o in options]
     assert kinds == [
-        "join_group",
         "direct_user_grant",
+        "join_group",
         "create_group",
         "grant_to_existing_group",
     ]
@@ -59,7 +61,7 @@ def test_join_group_option_details(tmp_path):
         _store(tmp_path), _subject(), "tool:jenkins_build_pc", _ctx(),
         catalog=CATALOG,
     )
-    join = options[0]
+    join = [o for o in options if o["kind"] == "join_group"][0]
     assert join["group_name"] == "builders"
     assert join["blast_radius"] == 1
     assert join["excess_privileges"] == 1
@@ -105,3 +107,20 @@ def test_already_effective_short_circuits(tmp_path):
     )
     assert options[0]["kind"] == "already_effective"
     assert options[0]["source"] == {"type": "group", "name": "builders"}
+
+
+@pytest.mark.parametrize(
+    ("access_name", "catalog"),
+    [
+        ("all_runtime", CATALOG),
+        ("tool:missing", CATALOG),
+        ("tool:terminal", {**CATALOG, "terminal": "operator"}),
+    ],
+)
+def test_rejects_unknown_reserved_and_privileged_access(
+    tmp_path, access_name, catalog
+):
+    with pytest.raises(ValueError):
+        recommend_grant_paths(
+            _store(tmp_path), _subject(), access_name, _ctx(), catalog=catalog,
+        )

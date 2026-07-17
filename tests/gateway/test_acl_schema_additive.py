@@ -48,3 +48,32 @@ def test_subject_grants_constraints(tmp_path):
             "INSERT INTO subject_grants(platform, subject_type, subject_id, access_name,"
             " scope, scope_id, created_at) VALUES ('discord','role','r1','web','global','',1.0)"
         )
+
+
+def test_pre_strict_acl_decisions_rebuild_copies_column_intersection(tmp_path):
+    path = tmp_path / "acl.sqlite3"
+    store = ACLStore(path)
+    store.record_decision(
+        capability_type="chat", capability_name="message", allowed=True,
+        reason_code="allowed", platform="discord", user_id="legacy-user",
+    )
+    con = sqlite3.connect(path)
+    columns = [
+        row[1] for row in con.execute("PRAGMA table_info(acl_decisions)").fetchall()
+        if row[1] != "matched_sources"
+    ]
+    column_list = ", ".join(columns)
+    con.execute(
+        f"CREATE TABLE acl_decisions_old AS"
+        f" SELECT {column_list} FROM acl_decisions"
+    )
+    con.execute("DROP TABLE acl_decisions")
+    con.execute("ALTER TABLE acl_decisions_old RENAME TO acl_decisions")
+    con.commit()
+    con.close()
+
+    rebuilt = ACLStore(path)
+    events = rebuilt._list_decisions_unchecked(limit=5)
+    assert len(events) == 1
+    assert events[0].user_id == "legacy-user"
+    assert events[0].matched_sources == ()

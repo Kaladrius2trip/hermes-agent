@@ -121,6 +121,29 @@ def test_acl_parser_and_apply_support_group_revoke_show_groups_and_filtered_audi
     assert any(row.action == "group.revoke_access" for row in rows)
 
 
+def test_acl_parser_and_apply_support_global_and_guild_scopes(tmp_path):
+    ctx = ACLCommandContext(
+        platform="discord", channel_id="c1", scope="channel", guild_id="g1"
+    )
+    store = ACLStore(tmp_path / "acl.sqlite3")
+
+    global_grant = parse_acl_command("/acl grant @u1 developer in global", ctx)
+    assert (global_grant.scope, global_grant.scope_id) == ("global", None)
+    apply_acl_command(store, global_grant, platform="discord")
+
+    guild_grant = parse_acl_command("/acl grant @&team informer in this guild", ctx)
+    assert (guild_grant.subject_type, guild_grant.scope, guild_grant.scope_id) == (
+        "role", "guild", "g1",
+    )
+    apply_acl_command(store, guild_grant, platform="discord")
+
+    rows = store.list_memberships(platform="discord")
+    assert {(row.subject_id, row.scope, row.scope_id) for row in rows} == {
+        ("u1", "global", None),
+        ("team", "guild", "g1"),
+    }
+
+
 def test_audit_subject_filter_is_platform_and_type_scoped(tmp_path):
     store = ACLStore(tmp_path / "acl.sqlite3")
     for platform, subject_type in (("discord", "user"), ("telegram", "user"), ("discord", "role")):
@@ -320,7 +343,8 @@ def test_resolution_keeps_dm_and_channel_memberships_independent_and_uses_roles(
             role_ids=[],
             scope="channel",
             channel_id="c1",
-         guild_id="g1"),
+            guild_id="g1",
+        ),
         bootstrap=BootstrapSuperAdmins.empty(),
     )
     assert channel.can_chat is True
@@ -336,7 +360,8 @@ def test_resolution_keeps_dm_and_channel_memberships_independent_and_uses_roles(
             role_ids=[],
             scope="channel",
             channel_id="c9",
-         guild_id="g1"),
+            guild_id="g1",
+        ),
         bootstrap=BootstrapSuperAdmins.empty(),
     )
     assert other_channel.can_chat is False
@@ -350,7 +375,8 @@ def test_resolution_keeps_dm_and_channel_memberships_independent_and_uses_roles(
             role_ids=["r-dev"],
             scope="channel",
             channel_id="c2",
-         guild_id="g1"),
+            guild_id="g1",
+        ),
         bootstrap=BootstrapSuperAdmins.empty(),
     )
     assert via_role.can_chat is True
@@ -369,7 +395,8 @@ def test_unknown_user_denied_except_harmless_discovery_commands(tmp_path):
             role_ids=[],
             scope="channel",
             channel_id="c1",
-         guild_id="g1"),
+            guild_id="g1",
+        ),
         bootstrap=BootstrapSuperAdmins.empty(),
     )
 
@@ -422,7 +449,8 @@ def test_bootstrap_super_admins_include_legacy_allowlists_per_spec(monkeypatch, 
             role_ids=["role1"],
             scope="channel",
             channel_id="c1",
-         guild_id="g1"),
+            guild_id="g1",
+        ),
         bootstrap=bootstrap,
         catalog={"web_search": "runtime_safe", "terminal": "operator"},
     )
@@ -441,7 +469,8 @@ def test_bootstrap_super_admins_include_legacy_allowlists_per_spec(monkeypatch, 
             role_ids=[],
             scope="channel",
             channel_id="c1",
-         guild_id="g1"),
+            guild_id="g1",
+        ),
         bootstrap=bootstrap,
     )
     # Legacy allowed_users entries are bootstrap super-admins per the spec.
@@ -457,7 +486,8 @@ def test_bootstrap_super_admins_include_legacy_allowlists_per_spec(monkeypatch, 
             role_ids=["role1"],
             scope="channel",
             channel_id="c1",
-         guild_id="g1"),
+            guild_id="g1",
+        ),
         bootstrap=bootstrap,
     )
     assert role_only.can_chat is False
@@ -506,7 +536,8 @@ def test_channel_scope_resolution_uses_parent_channel_not_thread_id(tmp_path):
             scope="channel",
             channel_id="parent-channel",
             thread_id="thread-123",
-         guild_id="g1"),
+            guild_id="g1",
+        ),
         bootstrap=BootstrapSuperAdmins.empty(),
     )
 
@@ -536,7 +567,8 @@ def test_group_grants_resolve_toolsets_and_exact_tool_names(tmp_path):
             role_ids=[],
             scope="channel",
             channel_id="c1",
-         guild_id="g1"),
+            guild_id="g1",
+        ),
         bootstrap=BootstrapSuperAdmins.empty(),
     )
 
@@ -726,6 +758,7 @@ def test_dm_scope_requires_explicit_dm_membership(tmp_path):
 def test_admin_group_includes_session_slash_commands():
     from gateway.acl import ADMIN_EXTRA_SLASH_COMMANDS
 
-    assert {"background", "queue", "stop", "resume", "clear", "model"} <= ADMIN_EXTRA_SLASH_COMMANDS
+    assert {"background", "queue", "stop", "resume", "clear"} <= ADMIN_EXTRA_SLASH_COMMANDS
+    assert "model" not in ADMIN_EXTRA_SLASH_COMMANDS
     assert "steer" not in ADMIN_EXTRA_SLASH_COMMANDS
     assert "acl" not in ADMIN_EXTRA_SLASH_COMMANDS
