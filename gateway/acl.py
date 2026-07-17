@@ -948,6 +948,164 @@ class ACLStore:
             return None
         return self._decision_from_row(row) if row is not None else None
 
+    def grant_subject_access(
+        self,
+        *,
+        platform: str,
+        subject_type: str,
+        subject_id: str,
+        access_name: str,
+        scope: str,
+        scope_id: Optional[str] = None,
+        expires_at: Optional[float] = None,
+        actor_platform: str = "",
+        actor_user_id: str = "",
+    ) -> None:
+        platform = _norm_platform(platform)
+        subject_type = _norm_subject_type(subject_type)
+        subject_id = _validate_subject_id(subject_id)
+        access_name = _validate_access_name(access_name)
+        scope, db_scope_id = _validate_selector_scope(scope, scope_id, subject_type)
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO subject_grants(
+                    platform, subject_type, subject_id, access_name, scope,
+                    scope_id, created_at, expires_at, actor_platform, actor_user_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    platform, subject_type, subject_id, access_name, scope,
+                    db_scope_id, time.time(),
+                    float(expires_at) if expires_at is not None else None,
+                    actor_platform, actor_user_id,
+                ),
+            )
+            self._bump_policy_epoch_conn(conn)
+            self._audit_conn(
+                conn,
+                "subject_grant.grant",
+                platform=platform,
+                actor_platform=actor_platform,
+                actor_user_id=actor_user_id,
+                subject_type=subject_type,
+                subject_id=subject_id,
+                scope=scope,
+                scope_id=db_scope_id or None,
+                access_name=access_name,
+            )
+
+    def revoke_subject_access(
+        self,
+        *,
+        platform: str,
+        subject_type: str,
+        subject_id: str,
+        access_name: str,
+        scope: str,
+        scope_id: Optional[str] = None,
+        actor_platform: str = "",
+        actor_user_id: str = "",
+    ) -> None:
+        platform = _norm_platform(platform)
+        subject_type = _norm_subject_type(subject_type)
+        subject_id = _validate_subject_id(subject_id)
+        access_name = _validate_access_name(access_name)
+        scope, db_scope_id = _validate_selector_scope(scope, scope_id, subject_type)
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """
+                DELETE FROM subject_grants
+                WHERE platform=? AND subject_type=? AND subject_id=? AND access_name=?
+                  AND scope=? AND scope_id=?
+                """,
+                (platform, subject_type, subject_id, access_name, scope, db_scope_id),
+            )
+            self._bump_policy_epoch_conn(conn)
+            self._audit_conn(
+                conn,
+                "subject_grant.revoke",
+                platform=platform,
+                actor_platform=actor_platform,
+                actor_user_id=actor_user_id,
+                subject_type=subject_type,
+                subject_id=subject_id,
+                scope=scope,
+                scope_id=db_scope_id or None,
+                access_name=access_name,
+            )
+
+    def resolve_subject_access(
+        self, request: ACLRequest, *, now: Optional[float] = None
+    ) -> set[str]:
+        """Non-expired selector grants matching the same scope matrix as
+        memberships (dm: user global+dm only; guild channel: user global +
+        user/role guild + exact channel; role rows never in DM)."""
+        platform = _norm_platform(request.platform)
+        user_id = str(request.user_id).strip() if request.user_id is not None else ""
+        role_ids = {str(r).strip() for r in (request.role_ids or []) if str(r).strip()}
+        scope = _norm_scope(request.scope or request.chat_type or "dm")
+        scope_id = _scope_id_from_request(scope, request)
+        guild_id = str(getattr(request, "guild_id", None) or "").strip()
+        if not user_id and not role_ids:
+            return set()
+        if scope == "channel" and not scope_id:
+            return set()
+        if scope == "channel" and platform in self._GUILD_PLATFORMS and not guild_id:
+            return set()
+        moment = time.time() if now is None else float(now)
+        names: set[str] = set()
+        expiry_clause = "(expires_at IS NULL OR expires_at > ?)"
+        with self._connect() as conn:
+            if user_id:
+                rows = conn.execute(
+                    f"""
+                    SELECT access_name FROM subject_grants
+                    WHERE platform=? AND subject_type='user' AND subject_id=?
+                      AND scope='global' AND {expiry_clause}
+                    """,
+                    (platform, user_id, moment),
+                ).fetchall()
+                names.update(str(r["access_name"]) for r in rows)
+                if scope == "dm":
+                    rows = conn.execute(
+                        f"""
+                        SELECT access_name FROM subject_grants
+                        WHERE platform=? AND subject_type='user' AND subject_id=?
+                          AND scope='dm' AND {expiry_clause}
+                        """,
+                        (platform, user_id, moment),
+                    ).fetchall()
+                    names.update(str(r["access_name"]) for r in rows)
+            if scope == "channel":
+                subjects = []
+                if user_id:
+                    subjects.append(("user", user_id))
+                subjects.extend(("role", rid) for rid in sorted(role_ids))
+                for subject_type, subject_id in subjects:
+                    rows = conn.execute(
+                        f"""
+                        SELECT access_name FROM subject_grants
+                        WHERE platform=? AND subject_type=? AND subject_id=?
+                          AND scope='channel' AND scope_id=? AND {expiry_clause}
+                        """,
+                        (platform, subject_type, subject_id, scope_id, moment),
+                    ).fetchall()
+                    names.update(str(r["access_name"]) for r in rows)
+                    if guild_id:
+                        rows = conn.execute(
+                            f"""
+                            SELECT access_name FROM subject_grants
+                            WHERE platform=? AND subject_type=? AND subject_id=?
+                              AND scope='guild' AND scope_id=? AND {expiry_clause}
+                            """,
+                            (platform, subject_type, subject_id, guild_id, moment),
+                        ).fetchall()
+                        names.update(str(r["access_name"]) for r in rows)
+        return names
+
     def list_memberships(
         self,
         *,
@@ -1212,6 +1370,14 @@ def resolve_acl(
                 allowed_tools.update(_catalog_all_runtime(catalog))
             else:
                 allowed_tools.update(_resolve_access_name(access_name))
+
+    for access_name in sorted(store.resolve_subject_access(request)):
+        if _is_slash_access(access_name):
+            allowed_slash.add(_slash_name(access_name))
+        elif _is_reserved_access(access_name):
+            allowed_tools.update(_catalog_all_runtime(catalog))
+        else:
+            allowed_tools.update(_resolve_access_name(access_name))
 
     if is_bootstrap_admin:
         allowed_slash.add("acl")
@@ -1553,6 +1719,18 @@ def _validate_scoped_scope(
             raise ValueError("guild ACL scope requires an explicit guild scope_id")
         return "guild", sid
     raise ValueError("scoped ACL membership scope must be 'global' or 'guild'")
+
+
+def _validate_selector_scope(
+    scope: str, scope_id: Optional[str], subject_type: str
+) -> tuple[str, str]:
+    value = str(scope or "").strip().lower()
+    if value in {"global", "guild"}:
+        return _validate_scoped_scope(value, scope_id, subject_type)
+    norm = _norm_scope(value)
+    if norm == "channel":
+        return "channel", _norm_scope_id(norm, scope_id) or ""
+    return "dm", ""
 
 
 def _norm_scope_id(scope: str, scope_id: Optional[str]) -> Optional[str]:
