@@ -80,7 +80,7 @@ def test_stale_policy_epoch_rejected(tmp_path):
     )
     with pytest.raises(PlannerError):
         apply_proposal(store, proposal, digest=proposal_digest(proposal),
-                       actor_platform="discord", actor_user_id="owner", now=NOW)
+                       actor_platform="discord", actor_user_id="owner", now=NOW, actor_is_bootstrap=True)
 
 
 def test_single_use_confirmation(tmp_path):
@@ -88,9 +88,9 @@ def test_single_use_confirmation(tmp_path):
     proposal = _proposal(store)
     digest = proposal_digest(proposal)
     apply_proposal(store, proposal, digest=digest,
-                   actor_platform="discord", actor_user_id="owner", now=NOW)
+                   actor_platform="discord", actor_user_id="owner", now=NOW, actor_is_bootstrap=True)
     fresh = _proposal(store)
     assert proposal_digest(fresh) != digest
     with pytest.raises(PlannerError):
         apply_proposal(store, proposal, digest=digest,
-                       actor_platform="discord", actor_user_id="owner", now=NOW)
+                       actor_platform="discord", actor_user_id="owner", now=NOW, actor_is_bootstrap=True)

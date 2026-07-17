@@ -369,10 +369,24 @@ def apply_proposal(
     actor_user_id: str,
     now: Optional[float] = None,
     catalog: Optional[Mapping[str, str]] = None,
+    actor_is_bootstrap: bool = False,
 ) -> dict[str, Any]:
     """Apply a confirmed proposal transactionally after revalidating gates."""
     moment = time.time() if now is None else float(now)
     steps = validate_proposal(store, proposal)
+    if not actor_is_bootstrap:
+        # SECURITY (owner decision 6B): a non-bootstrap actor may apply a
+        # proposal ONLY when every step is a membership ADD to a group
+        # explicitly flagged safe_delegable. Positive enumeration - any
+        # other op shape requires bootstrap authority.
+        for step in steps:
+            if step["op"] not in {"grant_membership", "grant_scoped_membership"}:
+                raise PlannerError("this proposal requires bootstrap authority")
+            if not store.is_safe_delegable(step["group_name"]):
+                raise PlannerError(
+                    f"group '{step['group_name']}' is not delegable; "
+                    "bootstrap authority required"
+                )
     if moment >= float(proposal.expires_at or 0):
         raise PlannerError("proposal confirmation expired")
     # SECURITY: the confirming actor must be the requester the proposal was

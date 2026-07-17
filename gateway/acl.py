@@ -1247,6 +1247,38 @@ class ACLStore:
             if fnmatch.fnmatchcase(str(tool), spec)
         }
 
+    def set_group_safe_delegable(
+        self, group_name: str, *, actor_platform: str = "", actor_user_id: str = ""
+    ) -> None:
+        group_name = _validate_name(group_name, "group")
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._ensure_group_conn(conn, group_name)
+            conn.execute(
+                "INSERT OR IGNORE INTO group_flags(group_name, flag_name, created_at)"
+                " VALUES (?, 'safe_delegable', ?)",
+                (group_name, time.time()),
+            )
+            self._audit_conn(
+                conn,
+                "group.flag.safe_delegable",
+                actor_platform=actor_platform,
+                actor_user_id=actor_user_id,
+                group_name=group_name,
+            )
+
+    def is_safe_delegable(self, group_name: str) -> bool:
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT 1 FROM group_flags WHERE group_name=?"
+                    " AND flag_name='safe_delegable'",
+                    (str(group_name or "").strip().lower(),),
+                ).fetchone()
+            return row is not None
+        except sqlite3.Error:
+            return False
+
     def list_memberships(
         self,
         *,
