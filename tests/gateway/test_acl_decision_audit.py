@@ -211,3 +211,31 @@ def test_parse_acl_trace_command(tmp_path):
         parse_acl_command("/acl trace", ctx)
     with pytest.raises(ValueError):
         parse_acl_command("/acl trace not-hex", ctx)
+
+
+def test_matched_sources_recorded(tmp_path):
+    store = _store(tmp_path)
+    event_id = _record(
+        store,
+        matched_groups=("informer",),
+        matched_sources=("group:informer", "direct_grant:tool:x", "definition:jenkins-pc"),
+    )
+    event = store.get_decision(event_id)
+    assert tuple(event.matched_sources) == (
+        "group:informer", "direct_grant:tool:x", "definition:jenkins-pc",
+    )
+
+
+def test_matched_sources_default_empty(tmp_path):
+    store = _store(tmp_path)
+    event = store.get_decision(_record(store))
+    assert tuple(event.matched_sources) == ()
+
+
+def test_matched_sources_survives_existing_store(tmp_path):
+    # column added by guard on an already-initialized store file
+    path = tmp_path / "acl.sqlite3"
+    ACLStore(path)
+    store = ACLStore(path)
+    event = store.get_decision(_record(store, matched_sources=("group:default",)))
+    assert tuple(event.matched_sources) == ("group:default",)

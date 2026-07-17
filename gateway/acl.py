@@ -174,6 +174,7 @@ class ACLDecisionEvent:
     policy_epoch: int
     tool_call_id: Optional[str]
     request_id: Optional[str] = None
+    matched_sources: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -372,7 +373,8 @@ class ACLStore:
                     CHECK (bootstrap_super_admin IN (0, 1)),
                 policy_epoch INTEGER NOT NULL DEFAULT 0,
                 tool_call_id TEXT,
-                request_id TEXT
+                request_id TEXT,
+                matched_sources TEXT NOT NULL DEFAULT '[]'
             ) STRICT
         """,
         "audit_log": """
@@ -424,6 +426,14 @@ class ACLStore:
             conn.execute(
                 "INSERT OR IGNORE INTO acl_meta(key, value) VALUES ('policy_epoch', '0')"
             )
+            decision_cols = {
+                str(r[1]) for r in conn.execute("PRAGMA table_info(acl_decisions)")
+            }
+            if "matched_sources" not in decision_cols:
+                conn.execute(
+                    "ALTER TABLE acl_decisions"
+                    " ADD COLUMN matched_sources TEXT NOT NULL DEFAULT '[]'"
+                )
             violations = conn.execute("PRAGMA foreign_key_check").fetchall()
             if violations:
                 raise sqlite3.IntegrityError(f"ACL migration foreign-key violations: {violations}")
@@ -759,6 +769,7 @@ class ACLStore:
         request_id: Optional[str] = None,
         role_ids: Iterable[str] = (),
         matched_groups: Iterable[str] = (),
+        matched_sources: Iterable[str] = (),
         bootstrap_super_admin: bool = False,
         policy_epoch: Optional[int] = None,
         tool_call_id: Optional[str] = None,
@@ -788,8 +799,8 @@ class ACLStore:
                         reason_code, platform, user_id, guild_id, channel_id,
                         thread_id, session_key, message_id, interaction_id,
                         role_ids, matched_groups, bootstrap_super_admin,
-                        policy_epoch, tool_call_id, request_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        policy_epoch, tool_call_id, request_id, matched_sources
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         event_id,
@@ -812,6 +823,7 @@ class ACLStore:
                         int(policy_epoch) if policy_epoch is not None else self._policy_epoch_conn(conn),
                         str(tool_call_id) if tool_call_id else None,
                         str(request_id) if request_id else None,
+                        json.dumps([str(x) for x in (matched_sources or ())]),
                     ),
                 )
                 if cur.lastrowid and cur.lastrowid % self._DECISION_PRUNE_INTERVAL == 0:
@@ -861,6 +873,7 @@ class ACLStore:
             policy_epoch=int(row["policy_epoch"]),
             tool_call_id=row["tool_call_id"],
             request_id=row["request_id"],
+            matched_sources=_ids(row["matched_sources"]) if "matched_sources" in row.keys() else (),
         )
 
     def get_decision(self, event_id: str) -> Optional["ACLDecisionEvent"]:
