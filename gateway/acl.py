@@ -56,6 +56,9 @@ BUILTIN_ACCESS_CAPABILITIES: "dict[str, frozenset[str]]" = {
     # Recipient-scoped outbound DM. A dedicated capability by contract:
     # never granted via generic messaging/communication/delegation names.
     "whisper": frozenset({"whisper"}),
+    # Restricted user-owned scheduler: the cronjob tool gated by the
+    # dispatch-time argument/ownership checks in gateway/scheduler_policy.py.
+    "scheduler_user": frozenset({"cronjob"}),
 }
 
 ADMIN_EXTRA_SLASH_COMMANDS = frozenset({
