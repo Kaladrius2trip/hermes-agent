@@ -53,6 +53,9 @@ TEAM_PRESET_GROUPS: "dict[str, tuple[str, ...]]" = {
 BUILTIN_ACCESS_CAPABILITIES: "dict[str, frozenset[str]]" = {
     "file_read": frozenset({"read_file", "search_files"}),
     "file_write": frozenset({"write_file", "patch"}),
+    # Recipient-scoped outbound DM. A dedicated capability by contract:
+    # never granted via generic messaging/communication/delegation names.
+    "whisper": frozenset({"whisper"}),
 }
 
 ADMIN_EXTRA_SLASH_COMMANDS = frozenset({
