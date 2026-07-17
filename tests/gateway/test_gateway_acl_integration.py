@@ -894,3 +894,86 @@ async def test_gateway_acl_telegram_mutation_flows_through_dispatch_and_requeste
         subject_id="t1",
     )
     assert any(row.action == "membership.grant" for row in audit_rows)
+
+
+def test_dynamic_matrix_end_to_end(tmp_path):
+    """S1-S6 stitched: catalog baseline, selector grants, definitions,
+    hardened planner, safe delegation and recommendation facts."""
+    import time as _time
+
+    from gateway.acl import ACLRequest, ACLStore, BootstrapSuperAdmins, resolve_acl
+    from gateway.acl_planner import (
+        ACLProposal, ACLProposalStep, apply_proposal, proposal_digest,
+    )
+    from gateway.acl_recommender import recommend_grant_paths
+
+    now = _time.time()
+    catalog = {
+        "web_search": "runtime_safe",
+        "todo": "runtime_safe",
+        "jenkins_build_pc": "runtime_safe",
+        "terminal": "operator",
+        "config_edit": "control_plane",
+    }
+    store = ACLStore(tmp_path / "acl.sqlite3")
+    store.set_group_safe_delegable("informer")
+
+    bootstrap_proposal = ACLProposal(
+        steps=(
+            ACLProposalStep(op="create_access_definition",
+                            access_name="jenkins-pc", spec="jenkins_*"),
+            ACLProposalStep(op="grant_user_access", platform="discord",
+                            subject_type="user", subject_id="dev1",
+                            access_name="def:jenkins-pc", scope="global"),
+            ACLProposalStep(op="grant_membership", platform="discord",
+                            subject_type="user", subject_id="boss",
+                            group_name="admin", scope="channel", scope_id="c1"),
+        ),
+        requester_platform="discord", requester_user_id="owner",
+        session_key="s", created_at=now, expires_at=now + 300,
+        policy_epoch=store.policy_epoch,
+    )
+    apply_proposal(store, bootstrap_proposal,
+                   digest=proposal_digest(bootstrap_proposal),
+                   actor_platform="discord", actor_user_id="owner", now=now,
+                   catalog=catalog, actor_is_bootstrap=True)
+
+    delegated = ACLProposal(
+        steps=(ACLProposalStep(op="grant_membership", platform="discord",
+                               subject_type="user", subject_id="newbie",
+                               group_name="informer", scope="channel",
+                               scope_id="c1"),),
+        requester_platform="discord", requester_user_id="lead",
+        session_key="s2", created_at=now, expires_at=now + 300,
+        policy_epoch=store.policy_epoch,
+    )
+    apply_proposal(store, delegated, digest=proposal_digest(delegated),
+                   actor_platform="discord", actor_user_id="lead", now=now,
+                   actor_is_bootstrap=False)
+
+    req = ACLRequest(platform="discord", user_id="boss", scope="channel",
+                     channel_id="c1", guild_id="g1")
+    admin_policy = resolve_acl(store, req, bootstrap=BootstrapSuperAdmins.empty(),
+                               catalog=catalog)
+    assert {"web_search", "todo", "jenkins_build_pc"} <= admin_policy.allowed_tool_names
+    assert "terminal" not in admin_policy.allowed_tool_names
+    assert "config_edit" not in admin_policy.allowed_tool_names
+
+    dev_policy = resolve_acl(
+        store,
+        ACLRequest(platform="discord", user_id="dev1", scope="dm"),
+        bootstrap=BootstrapSuperAdmins.empty(), catalog=catalog,
+    )
+    assert dev_policy.allowed_tool_names == {"jenkins_build_pc"}
+
+    newbie_groups = store.resolve_memberships(
+        ACLRequest(platform="discord", user_id="newbie", scope="channel",
+                   channel_id="c1", guild_id="g1"))
+    assert newbie_groups == {"informer"}
+
+    options = recommend_grant_paths(
+        store, {"platform": "discord", "user_id": "someone", "role_ids": ()},
+        "web", {"scope": "channel", "channel_id": "c1", "guild_id": "g1"},
+        catalog=catalog,
+    )
+    assert options[0]["kind"] in {"join_group", "direct_user_grant"}
