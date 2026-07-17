@@ -33,11 +33,24 @@ from gateway.acl import (
 _MEMBERSHIP_OPS = frozenset({"grant_membership", "revoke_membership"})
 _SCOPED_OPS = frozenset({"grant_scoped_membership", "revoke_scoped_membership"})
 _GRANT_OPS = frozenset({"grant_group_access", "revoke_group_access"})
-_OPS = _MEMBERSHIP_OPS | _SCOPED_OPS | _GRANT_OPS | {"create_group"}
+_USER_ACCESS_OPS = frozenset({"grant_user_access", "revoke_user_access"})
+_DEFINITION_OPS = frozenset({"create_access_definition", "approve_definition_expansion"})
+_OPS = (
+    _MEMBERSHIP_OPS | _SCOPED_OPS | _GRANT_OPS | _USER_ACCESS_OPS
+    | _DEFINITION_OPS | {"create_group"}
+)
 
 
 class PlannerError(RuntimeError):
     """Raised when a proposal fails validation or an apply gate."""
+
+
+def _reject_reserved(access_name: str) -> str:
+    from gateway.acl_catalog import RESERVED_ACCESS_NAMES
+
+    if str(access_name).strip().lower() in RESERVED_ACCESS_NAMES:
+        raise PlannerError("reserved access names cannot be granted by proposals")
+    return access_name
 
 
 @dataclass(frozen=True)
@@ -50,6 +63,8 @@ class ACLProposalStep:
     scope: Optional[str] = None
     scope_id: Optional[str] = None
     access_name: Optional[str] = None
+    spec: Optional[str] = None
+    expires_at: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -71,9 +86,40 @@ def _normalized_step(step: ACLProposalStep) -> dict[str, Any]:
     if op == "create_group":
         out["group_name"] = _validate_name(step.group_name or "", "group")
         return out
+    if op in _DEFINITION_OPS:
+        out["access_name"] = _validate_name(step.access_name or "", "definition")
+        if op == "create_access_definition":
+            spec = str(step.spec or "").strip()
+            if not spec:
+                raise PlannerError("create_access_definition requires a spec")
+            out["spec"] = spec
+        return out
+    if op in _USER_ACCESS_OPS:
+        out["platform"] = _norm_platform(step.platform)
+        out["subject_type"] = _norm_subject_type(str(step.subject_type or ""))
+        out["subject_id"] = _validate_subject_id(str(step.subject_id or ""))
+        out["access_name"] = _reject_reserved(_validate_access_name(step.access_name or ""))
+        scope = str(step.scope or "").strip().lower()
+        if scope == "global":
+            if out["subject_type"] != "user":
+                raise PlannerError("global subject grants are user-only")
+            out["scope"], out["scope_id"] = "global", ""
+        elif scope in {"guild", "channel"}:
+            sid = str(step.scope_id or "").strip()
+            if not sid or sid == "*":
+                raise PlannerError(f"{scope} subject grants require an explicit scope_id")
+            out["scope"], out["scope_id"] = scope, sid
+        elif scope == "dm":
+            out["scope"], out["scope_id"] = "dm", ""
+        else:
+            raise PlannerError(f"unsupported subject grant scope: {step.scope!r}")
+        out["expires_at"] = float(step.expires_at) if step.expires_at else None
+        return out
     out["group_name"] = _validate_name(step.group_name or "", "group")
     if op in _GRANT_OPS:
         out["access_name"] = _validate_access_name(step.access_name or "")
+        if op == "grant_group_access":
+            _reject_reserved(out["access_name"])
         return out
     out["platform"] = _norm_platform(step.platform)
     out["subject_type"] = _norm_subject_type(str(step.subject_type or ""))
@@ -153,6 +199,19 @@ def render_proposal(proposal: ACLProposal) -> str:
         if op == "create_group":
             lines.append(f"+ create group '{step['group_name']}'")
             continue
+        if op in _DEFINITION_OPS:
+            spec_txt = f" spec '{step.get('spec')}'" if step.get("spec") else ""
+            lines.append(f"+ {op} '{step['access_name']}'{spec_txt}")
+            continue
+        if op in _USER_ACCESS_OPS:
+            sign = "+" if op.startswith("grant") else "-"
+            verb = "grant" if sign == "+" else "revoke"
+            scope_txt = step["scope"] if not step["scope_id"] else f"{step['scope']}:{step['scope_id']}"
+            lines.append(
+                f"{sign} {verb} access '{step['access_name']}' to "
+                f"{step['subject_type']}:{step['subject_id']} [{step['platform']} {scope_txt}]"
+            )
+            continue
         if op in _GRANT_OPS:
             sign = "+" if verb == "grant" else "-"
             lines.append(
@@ -169,8 +228,87 @@ def render_proposal(proposal: ACLProposal) -> str:
     return "\n".join(lines)
 
 
-def _apply_step_conn(conn: sqlite3.Connection, step: Mapping[str, Any], now: float) -> None:
+def _definition_spec_conn(conn: sqlite3.Connection, name: str) -> str:
+    row = conn.execute(
+        "SELECT spec FROM access_definitions WHERE name=?", (str(name),)
+    ).fetchone()
+    if row is None:
+        raise PlannerError(f"unknown access definition: {name}")
+    return str(row["spec"])
+
+
+def _apply_step_conn(
+    conn: sqlite3.Connection,
+    step: Mapping[str, Any],
+    now: float,
+    *,
+    catalog: Optional[Mapping[str, str]] = None,
+) -> None:
     op = step["op"]
+    if op in _DEFINITION_OPS:
+        if not catalog:
+            raise PlannerError("definition operations require the capability catalog")
+        from gateway.acl_catalog import catalog_digest as _cat_digest
+
+        snapshot = sorted(ACLStore._match_definition_spec(
+            str(step.get("spec") or _definition_spec_conn(conn, step["access_name"])),
+            catalog,
+        ))
+        if op == "create_access_definition":
+            row = conn.execute(
+                "SELECT 1 FROM access_definitions WHERE name=?", (step["access_name"],)
+            ).fetchone()
+            if row is not None:
+                raise PlannerError(f"access definition already exists: {step['access_name']}")
+            conn.execute(
+                """
+                INSERT INTO access_definitions(
+                    name, kind, spec, catalog_digest, approved_snapshot,
+                    created_at, approved_at
+                ) VALUES (?, 'tool_glob', ?, ?, ?, ?, ?)
+                """,
+                (
+                    step["access_name"], step["spec"], _cat_digest(catalog),
+                    json.dumps(snapshot), now, now,
+                ),
+            )
+        else:
+            cur = conn.execute(
+                "UPDATE access_definitions SET approved_snapshot=?, catalog_digest=?,"
+                " approved_at=? WHERE name=?",
+                (json.dumps(snapshot), _cat_digest(catalog), now, step["access_name"]),
+            )
+            if not cur.rowcount:
+                raise PlannerError(f"unknown access definition: {step['access_name']}")
+        return
+    if op in _USER_ACCESS_OPS:
+        if op == "grant_user_access":
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO subject_grants(
+                    platform, subject_type, subject_id, access_name, scope,
+                    scope_id, created_at, expires_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    step["platform"], step["subject_type"], step["subject_id"],
+                    step["access_name"], step["scope"], step["scope_id"], now,
+                    step.get("expires_at"),
+                ),
+            )
+        else:
+            conn.execute(
+                """
+                DELETE FROM subject_grants
+                WHERE platform=? AND subject_type=? AND subject_id=?
+                  AND access_name=? AND scope=? AND scope_id=?
+                """,
+                (
+                    step["platform"], step["subject_type"], step["subject_id"],
+                    step["access_name"], step["scope"], step["scope_id"],
+                ),
+            )
+        return
     if op == "create_group":
         conn.execute(
             "INSERT OR IGNORE INTO groups(name, builtin, created_at) VALUES (?, 0, ?)",
@@ -230,6 +368,7 @@ def apply_proposal(
     actor_platform: str,
     actor_user_id: str,
     now: Optional[float] = None,
+    catalog: Optional[Mapping[str, str]] = None,
 ) -> dict[str, Any]:
     """Apply a confirmed proposal transactionally after revalidating gates."""
     moment = time.time() if now is None else float(now)
@@ -267,7 +406,7 @@ def apply_proposal(
             details=json.dumps({"digest": digest, "steps": len(steps)}),
         )
         for step in steps:
-            _apply_step_conn(conn, step, moment)
+            _apply_step_conn(conn, step, moment, catalog=catalog)
             store._audit_conn(
                 conn,
                 f"proposal.{step['op']}",

@@ -200,3 +200,98 @@ def test_apply_audits_before_and_after(tmp_path):
     )]
     assert "proposal.apply.begin" in actions
     assert "proposal.apply.commit" in actions
+
+
+# --- definition ops (S3) -----------------------------------------------------
+
+CATALOG = {"jenkins_build_pc": "runtime_safe", "jenkins_status": "runtime_safe"}
+
+
+def test_definition_ops_validate_render_apply(tmp_path):
+    store = _store(tmp_path)
+    proposal = _proposal(store=store, steps=[
+        ACLProposalStep(op="create_access_definition", access_name="jenkins-pc",
+                        spec="jenkins_*"),
+    ])
+    text = render_proposal(proposal)
+    assert "jenkins-pc" in text and "jenkins_*" in text
+    apply_proposal(store, proposal, digest=proposal_digest(proposal),
+                   actor_platform="discord", actor_user_id="owner", now=NOW,
+                   catalog=CATALOG)
+    assert store.resolve_definition("jenkins-pc") == {"jenkins_build_pc", "jenkins_status"}
+
+
+def test_definition_expansion_op(tmp_path):
+    store = _store(tmp_path)
+    store.create_access_definition(
+        name="jenkins-pc", spec="jenkins_*", catalog={"jenkins_status": "runtime_safe"},
+        actor_platform="discord", actor_user_id="owner",
+    )
+    proposal = _proposal(store=store, steps=[
+        ACLProposalStep(op="approve_definition_expansion", access_name="jenkins-pc"),
+    ])
+    apply_proposal(store, proposal, digest=proposal_digest(proposal),
+                   actor_platform="discord", actor_user_id="owner", now=NOW,
+                   catalog=CATALOG)
+    assert store.resolve_definition("jenkins-pc") == {"jenkins_build_pc", "jenkins_status"}
+
+
+def test_definition_op_requires_catalog(tmp_path):
+    store = _store(tmp_path)
+    proposal = _proposal(store=store, steps=[
+        ACLProposalStep(op="create_access_definition", access_name="jenkins-pc",
+                        spec="jenkins_*"),
+    ])
+    with pytest.raises(PlannerError):
+        apply_proposal(store, proposal, digest=proposal_digest(proposal),
+                       actor_platform="discord", actor_user_id="owner", now=NOW)
+
+
+def test_planner_refuses_reserved_all(tmp_path):
+    store = _store(tmp_path)
+    with pytest.raises(PlannerError):
+        validate_proposal(store, _proposal(store=store, steps=[
+            ACLProposalStep(op="grant_group_access", group_name="informer",
+                            access_name="all"),
+        ]))
+    with pytest.raises(PlannerError):
+        validate_proposal(store, _proposal(store=store, steps=[
+            ACLProposalStep(op="grant_user_access", platform="discord",
+                            subject_type="user", subject_id="u1",
+                            access_name="all_runtime", scope="global"),
+        ]))
+
+
+# --- user-grant ops (S2) -----------------------------------------------------
+
+def test_user_access_ops_apply(tmp_path):
+    from gateway.acl import ACLRequest
+
+    store = _store(tmp_path)
+    grant = _proposal(store=store, steps=[
+        ACLProposalStep(op="grant_user_access", platform="discord",
+                        subject_type="user", subject_id="solo",
+                        access_name="tool:special_tool", scope="global"),
+    ])
+    apply_proposal(store, grant, digest=proposal_digest(grant),
+                   actor_platform="discord", actor_user_id="owner", now=NOW)
+    req = ACLRequest(platform="discord", user_id="solo", scope="dm")
+    assert store.resolve_subject_access(req) == {"tool:special_tool"}
+    revoke = _proposal(store=store, steps=[
+        ACLProposalStep(op="revoke_user_access", platform="discord",
+                        subject_type="user", subject_id="solo",
+                        access_name="tool:special_tool", scope="global"),
+    ])
+    apply_proposal(store, revoke, digest=proposal_digest(revoke),
+                   actor_platform="discord", actor_user_id="owner", now=NOW)
+    assert store.resolve_subject_access(req) == set()
+
+
+def test_user_access_role_global_rejected(tmp_path):
+    store = _store(tmp_path)
+    with pytest.raises(PlannerError):
+        validate_proposal(store, _proposal(store=store, steps=[
+            ACLProposalStep(op="grant_user_access", platform="discord",
+                            subject_type="role", subject_id="team",
+                            access_name="web", scope="global"),
+        ]))
