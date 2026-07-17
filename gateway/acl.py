@@ -298,6 +298,54 @@ class ACLStore:
                 UNIQUE(migration_id, phase)
             ) STRICT
         """,
+        "subject_grants": """
+            CREATE TABLE subject_grants (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                platform TEXT NOT NULL CHECK (platform <> ''),
+                subject_type TEXT NOT NULL CHECK (subject_type IN ('user', 'role')),
+                subject_id TEXT NOT NULL CHECK (subject_id <> ''),
+                access_name TEXT NOT NULL CHECK (access_name <> ''),
+                scope TEXT NOT NULL CHECK (scope IN ('dm', 'channel', 'global', 'guild')),
+                scope_id TEXT NOT NULL DEFAULT '',
+                created_at REAL NOT NULL,
+                expires_at REAL,
+                actor_platform TEXT NOT NULL DEFAULT '',
+                actor_user_id TEXT NOT NULL DEFAULT '',
+                UNIQUE(platform, subject_type, subject_id, access_name, scope, scope_id),
+                CHECK (scope <> 'global' OR (subject_type = 'user' AND scope_id = '')),
+                CHECK (scope NOT IN ('guild', 'channel') OR (scope_id <> '' AND scope_id <> '*'))
+            ) STRICT
+        """,
+        "access_definitions": """
+            CREATE TABLE access_definitions (
+                name TEXT PRIMARY KEY CHECK (name <> ''),
+                kind TEXT NOT NULL CHECK (kind IN ('tool_glob')),
+                spec TEXT NOT NULL CHECK (spec <> ''),
+                creation_actor_platform TEXT NOT NULL DEFAULT '',
+                creation_actor_user_id TEXT NOT NULL DEFAULT '',
+                catalog_digest TEXT NOT NULL DEFAULT '',
+                approved_snapshot TEXT NOT NULL DEFAULT '[]',
+                created_at REAL NOT NULL,
+                approved_at REAL
+            ) STRICT
+        """,
+        "applied_proposals": """
+            CREATE TABLE applied_proposals (
+                digest TEXT PRIMARY KEY CHECK (digest <> ''),
+                applied_at REAL NOT NULL,
+                actor_platform TEXT NOT NULL DEFAULT '',
+                actor_user_id TEXT NOT NULL DEFAULT ''
+            ) STRICT
+        """,
+        "group_flags": """
+            CREATE TABLE group_flags (
+                group_name TEXT NOT NULL CHECK (group_name <> ''),
+                flag_name TEXT NOT NULL CHECK (flag_name <> ''),
+                created_at REAL NOT NULL,
+                PRIMARY KEY (group_name, flag_name),
+                FOREIGN KEY(group_name) REFERENCES groups(name) ON DELETE CASCADE
+            ) STRICT
+        """,
         "acl_decisions": """
             CREATE TABLE acl_decisions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
