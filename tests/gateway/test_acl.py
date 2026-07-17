@@ -719,3 +719,11 @@ def test_dm_scope_requires_explicit_dm_membership(tmp_path):
         ACLRequest(platform="telegram", user_id="u1", scope="dm"),
     )
     assert dm_after_grant.can_chat is True
+
+
+def test_admin_group_includes_session_slash_commands():
+    from gateway.acl import ADMIN_EXTRA_SLASH_COMMANDS
+
+    assert {"background", "queue", "stop", "resume", "clear", "model"} <= ADMIN_EXTRA_SLASH_COMMANDS
+    assert "steer" not in ADMIN_EXTRA_SLASH_COMMANDS
+    assert "acl" not in ADMIN_EXTRA_SLASH_COMMANDS

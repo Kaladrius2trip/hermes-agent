@@ -61,6 +61,12 @@ ADMIN_EXTRA_SLASH_COMMANDS = frozenset({
     "gateway",
     "commands",
     "usage",
+    "background",
+    "queue",
+    "stop",
+    "resume",
+    "clear",
+    "model",
 })
 
 _VALID_NAME_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,80}$")

@@ -568,7 +568,7 @@ async def test_slash_steer_queues_lower_policy_user_instead_of_steering_admin_ru
     assert pending.text == "use admin terminal now"
     assert pending.source.user_id == "limited"
     assert isinstance(output, str)
-    assert "queued for the next turn" in output
+    assert "queued for the next turn" in output.lower()
 
 
 def test_pending_event_merge_replaces_cross_user_event_to_preserve_requester_acl():
