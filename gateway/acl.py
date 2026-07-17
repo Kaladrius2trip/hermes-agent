@@ -8,6 +8,8 @@ Hermes outside this process.
 
 from __future__ import annotations
 
+import json
+import logging
 import os
 import re
 import sqlite3
@@ -145,6 +147,30 @@ class EffectiveACLPolicy:
 
 
 @dataclass(frozen=True)
+class ACLDecisionEvent:
+    event_id: str
+    ts: float
+    capability_type: str
+    capability_name: str
+    allowed: bool
+    reason_code: str
+    platform: str
+    user_id: str
+    guild_id: Optional[str]
+    channel_id: Optional[str]
+    thread_id: Optional[str]
+    session_key: str
+    message_id: Optional[str]
+    interaction_id: Optional[str]
+    role_ids: tuple[str, ...]
+    matched_groups: tuple[str, ...]
+    bootstrap_super_admin: bool
+    policy_epoch: int
+    tool_call_id: Optional[str]
+    request_id: Optional[str] = None
+
+
+@dataclass(frozen=True)
 class BootstrapSuperAdmins:
     platform_users: Mapping[str, frozenset[str]] = field(default_factory=dict)
 
@@ -178,6 +204,7 @@ class ACLCommand:
     access_name: Optional[str] = None
     scope: Optional[str] = None
     scope_id: Optional[str] = None
+    event_id: Optional[str] = None
     requires_confirmation: bool = False
     raw: str = ""
 
@@ -188,6 +215,9 @@ class ACLStore:
     def __init__(self, db_path: Optional[Path | str] = None):
         self.db_path = Path(db_path) if db_path is not None else get_hermes_home() / "gateway_acl.sqlite3"
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.decision_max_rows = 50_000
+        self._audit_degraded = False
+        self._audit_degraded_logged_at = 0.0
         self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
@@ -260,6 +290,35 @@ class ACLStore:
                 actor TEXT NOT NULL DEFAULT '',
                 payload TEXT NOT NULL DEFAULT '',
                 UNIQUE(migration_id, phase)
+            ) STRICT
+        """,
+        "acl_decisions": """
+            CREATE TABLE acl_decisions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id TEXT NOT NULL UNIQUE CHECK (event_id <> ''),
+                ts REAL NOT NULL,
+                capability_type TEXT NOT NULL CHECK (capability_type IN (
+                    'chat', 'slash', 'tool', 'schema', 'delegation',
+                    'scheduler', 'dm_recipient'
+                )),
+                capability_name TEXT NOT NULL DEFAULT '',
+                allowed INTEGER NOT NULL CHECK (allowed IN (0, 1)),
+                reason_code TEXT NOT NULL DEFAULT '',
+                platform TEXT NOT NULL DEFAULT '',
+                user_id TEXT NOT NULL DEFAULT '',
+                guild_id TEXT,
+                channel_id TEXT,
+                thread_id TEXT,
+                session_key TEXT NOT NULL DEFAULT '',
+                message_id TEXT,
+                interaction_id TEXT,
+                role_ids TEXT NOT NULL DEFAULT '[]',
+                matched_groups TEXT NOT NULL DEFAULT '[]',
+                bootstrap_super_admin INTEGER NOT NULL DEFAULT 0
+                    CHECK (bootstrap_super_admin IN (0, 1)),
+                policy_epoch INTEGER NOT NULL DEFAULT 0,
+                tool_call_id TEXT,
+                request_id TEXT
             ) STRICT
         """,
         "audit_log": """
@@ -378,6 +437,7 @@ class ACLStore:
                 "INSERT OR IGNORE INTO group_grants(group_name, access_name, created_at) VALUES (?, ?, ?)",
                 (group_name, access_name, time.time()),
             )
+            self._bump_policy_epoch_conn(conn)
             self._audit_conn(
                 conn,
                 "group.grant_access",
@@ -392,6 +452,7 @@ class ACLStore:
         access_name = _validate_access_name(access_name)
         with self._connect() as conn:
             conn.execute("DELETE FROM group_grants WHERE group_name=? AND access_name=?", (group_name, access_name))
+            self._bump_policy_epoch_conn(conn)
             self._audit_conn(
                 conn,
                 "group.revoke_access",
@@ -439,6 +500,7 @@ class ACLStore:
                 """,
                 (platform, subject_type, subject_id, group_name, scope, db_scope_id, time.time()),
             )
+            self._bump_policy_epoch_conn(conn)
             self._audit_conn(
                 conn,
                 "membership.grant",
@@ -480,6 +542,7 @@ class ACLStore:
                 """,
                 (platform, subject_type, subject_id, group_name, scope, db_scope_id, db_scope_id),
             )
+            self._bump_policy_epoch_conn(conn)
             self._audit_conn(
                 conn,
                 "membership.revoke",
@@ -616,6 +679,220 @@ class ACLStore:
                 scope=scope,
                 scope_id=db_scope_id or None,
             )
+
+    _DECISION_CAPABILITY_TYPES = frozenset({
+        "chat", "slash", "tool", "schema", "delegation", "scheduler", "dm_recipient"
+    })
+    _DECISION_NAME_MAX = 120
+    _DECISION_PRUNE_INTERVAL = 100
+    _DECISION_LIST_MAX = 500
+
+    def record_decision(
+        self,
+        *,
+        capability_type: str,
+        capability_name: str,
+        allowed: bool,
+        reason_code: str,
+        platform: str,
+        user_id: str,
+        guild_id: Optional[str] = None,
+        channel_id: Optional[str] = None,
+        thread_id: Optional[str] = None,
+        session_key: str = "",
+        message_id: Optional[str] = None,
+        interaction_id: Optional[str] = None,
+        request_id: Optional[str] = None,
+        role_ids: Iterable[str] = (),
+        matched_groups: Iterable[str] = (),
+        bootstrap_super_admin: bool = False,
+        policy_epoch: Optional[int] = None,
+        tool_call_id: Optional[str] = None,
+    ) -> str:
+        capability_type = str(capability_type or "").strip().lower()
+        if capability_type not in self._DECISION_CAPABILITY_TYPES:
+            raise ValueError(f"unknown ACL decision capability_type: {capability_type!r}")
+        reason_code = str(reason_code or "").strip()
+        if not reason_code:
+            raise ValueError("ACL decisions require a stable reason_code")
+        capability_name = str(capability_name or "")
+        if not capability_name:
+            raise ValueError("ACL decisions require the exact capability_name")
+        if len(capability_name) > self._DECISION_NAME_MAX:
+            raise ValueError("capability_name exceeds the decision-log bound; pass the capability, not arguments")
+        if not str(platform or "").strip():
+            raise ValueError("ACL decisions require the platform")
+        if not str(user_id or "").strip():
+            raise ValueError("ACL decisions require the acting user_id")
+        event_id = uuid.uuid4().hex
+        try:
+            with self._connect() as conn:
+                cur = conn.execute(
+                    """
+                    INSERT INTO acl_decisions(
+                        event_id, ts, capability_type, capability_name, allowed,
+                        reason_code, platform, user_id, guild_id, channel_id,
+                        thread_id, session_key, message_id, interaction_id,
+                        role_ids, matched_groups, bootstrap_super_admin,
+                        policy_epoch, tool_call_id, request_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        event_id,
+                        time.time(),
+                        capability_type,
+                        capability_name,
+                        1 if allowed else 0,
+                        reason_code,
+                        _norm_platform(platform) if platform else "",
+                        str(user_id or ""),
+                        str(guild_id) if guild_id else None,
+                        str(channel_id) if channel_id else None,
+                        str(thread_id) if thread_id else None,
+                        str(session_key or ""),
+                        str(message_id) if message_id else None,
+                        str(interaction_id) if interaction_id else None,
+                        json.dumps([str(r) for r in (role_ids or ())]),
+                        json.dumps([str(g) for g in (matched_groups or ())]),
+                        1 if bootstrap_super_admin else 0,
+                        int(policy_epoch) if policy_epoch is not None else self._policy_epoch_conn(conn),
+                        str(tool_call_id) if tool_call_id else None,
+                        str(request_id) if request_id else None,
+                    ),
+                )
+                if cur.lastrowid and cur.lastrowid % self._DECISION_PRUNE_INTERVAL == 0:
+                    self._prune_decisions_conn(conn, self.decision_max_rows)
+            self._audit_degraded = False
+            return event_id
+        except (sqlite3.Error, OSError):
+            # Fail-soft by contract: an audit write failure must never break
+            # the message turn; the authorization decision itself already
+            # happened and fail-closed rules live in the resolver. The sticky
+            # degraded flag + rate-limited log make the evidence gap visible.
+            self._audit_degraded = True
+            now = time.time()
+            if now - self._audit_degraded_logged_at > 60.0:
+                self._audit_degraded_logged_at = now
+                logging.getLogger(__name__).error(
+                    "ACL decision audit write failed; decision log is degraded"
+                )
+            return ""
+
+    @staticmethod
+    def _decision_from_row(row: sqlite3.Row) -> "ACLDecisionEvent":
+        def _ids(raw: Any) -> tuple[str, ...]:
+            try:
+                return tuple(str(x) for x in json.loads(str(raw or "[]")))
+            except (ValueError, TypeError):
+                return ()
+
+        return ACLDecisionEvent(
+            event_id=str(row["event_id"]),
+            ts=float(row["ts"]),
+            capability_type=str(row["capability_type"]),
+            capability_name=str(row["capability_name"]),
+            allowed=bool(row["allowed"]),
+            reason_code=str(row["reason_code"]),
+            platform=str(row["platform"]),
+            user_id=str(row["user_id"]),
+            guild_id=row["guild_id"],
+            channel_id=row["channel_id"],
+            thread_id=row["thread_id"],
+            session_key=str(row["session_key"]),
+            message_id=row["message_id"],
+            interaction_id=row["interaction_id"],
+            role_ids=_ids(row["role_ids"]),
+            matched_groups=_ids(row["matched_groups"]),
+            bootstrap_super_admin=bool(row["bootstrap_super_admin"]),
+            policy_epoch=int(row["policy_epoch"]),
+            tool_call_id=row["tool_call_id"],
+            request_id=row["request_id"],
+        )
+
+    def get_decision(self, event_id: str) -> Optional["ACLDecisionEvent"]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM acl_decisions WHERE event_id=?", (str(event_id),)
+            ).fetchone()
+        return self._decision_from_row(row) if row is not None else None
+
+    def list_decisions(
+        self,
+        *,
+        user_id: Optional[str] = None,
+        allowed: Optional[bool] = None,
+        capability_type: Optional[str] = None,
+        limit: int = 50,
+    ) -> list["ACLDecisionEvent"]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if user_id is not None:
+            clauses.append("user_id=?")
+            params.append(str(user_id))
+        if allowed is not None:
+            clauses.append("allowed=?")
+            params.append(1 if allowed else 0)
+        if capability_type is not None:
+            clauses.append("capability_type=?")
+            params.append(str(capability_type))
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(min(self._DECISION_LIST_MAX, max(1, int(limit))))
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM acl_decisions {where} ORDER BY id DESC LIMIT ?",
+                params,
+            ).fetchall()
+        return [self._decision_from_row(r) for r in rows]
+
+    @property
+    def audit_degraded(self) -> bool:
+        return self._audit_degraded
+
+    @staticmethod
+    def _prune_decisions_conn(conn: sqlite3.Connection, max_rows: int) -> int:
+        cur = conn.execute(
+            """
+            DELETE FROM acl_decisions WHERE id NOT IN (
+                SELECT id FROM acl_decisions ORDER BY id DESC LIMIT ?
+            )
+            """,
+            (max(0, int(max_rows)),),
+        )
+        return int(cur.rowcount or 0)
+
+    def prune_decisions(self, *, max_rows: int) -> int:
+        with self._connect() as conn:
+            return self._prune_decisions_conn(conn, max_rows)
+
+    def get_decision_audited(
+        self,
+        event_id: str,
+        *,
+        actor_platform: str,
+        actor_user_id: str,
+    ) -> Optional["ACLDecisionEvent"]:
+        """Fetch a decision event, recording the read in the same transaction.
+
+        SECURITY: withholds the event when the audit-the-read row cannot be
+        persisted, so a trace can never be an unaudited disclosure channel.
+        """
+        try:
+            with self._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT * FROM acl_decisions WHERE event_id=?", (str(event_id),)
+                ).fetchone()
+                self._audit_conn(
+                    conn,
+                    "decision.trace",
+                    actor_platform=actor_platform,
+                    actor_user_id=actor_user_id,
+                    access_name=str(event_id),
+                    allowed=row is not None,
+                )
+        except (sqlite3.Error, OSError):
+            return None
+        return self._decision_from_row(row) if row is not None else None
 
     def list_memberships(
         self,
@@ -992,6 +1269,19 @@ def parse_acl_command(text: str, context: ACLCommandContext) -> ACLCommand:
             )
         subject_type, subject_id = _parse_subject(parts[1])
         return ACLCommand(action="show", subject_type=subject_type, subject_id=subject_id, requires_confirmation=False, raw=raw)
+
+    if head == "trace":
+        if len(parts) != 2:
+            raise ValueError("usage: /acl trace <event-id>")
+        event_id = parts[1].strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{32}", event_id):
+            raise ValueError("event-id must be a 32-char hex decision event id")
+        return ACLCommand(
+            action="trace",
+            event_id=event_id,
+            requires_confirmation=False,
+            raw=raw,
+        )
 
     if head == "audit":
         if len(parts) >= 2:
