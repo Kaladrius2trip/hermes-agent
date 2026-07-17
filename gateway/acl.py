@@ -1106,6 +1106,134 @@ class ACLStore:
                         names.update(str(r["access_name"]) for r in rows)
         return names
 
+    _DEFINITION_SPEC_MAX = 200
+
+    def create_access_definition(
+        self,
+        *,
+        name: str,
+        spec: str,
+        catalog: Mapping[str, str],
+        actor_platform: str = "",
+        actor_user_id: str = "",
+    ) -> set[str]:
+        """Create a reviewed tool_glob definition frozen to an approved snapshot."""
+        from gateway.acl_catalog import catalog_digest as _digest
+
+        name = _validate_name(name, "definition")
+        spec = str(spec or "").strip()
+        if not spec or len(spec) > self._DEFINITION_SPEC_MAX:
+            raise ValueError("definition spec must be a non-empty short glob")
+        snapshot = self._match_definition_spec(spec, catalog)
+        now = time.time()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT 1 FROM access_definitions WHERE name=?", (name,)
+            ).fetchone()
+            if row is not None:
+                raise ValueError(f"access definition already exists: {name}")
+            conn.execute(
+                """
+                INSERT INTO access_definitions(
+                    name, kind, spec, creation_actor_platform,
+                    creation_actor_user_id, catalog_digest, approved_snapshot,
+                    created_at, approved_at
+                ) VALUES (?, 'tool_glob', ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    name, spec, str(actor_platform or ""), str(actor_user_id or ""),
+                    _digest(catalog), json.dumps(sorted(snapshot)), now, now,
+                ),
+            )
+            self._bump_policy_epoch_conn(conn)
+            self._audit_conn(
+                conn,
+                "definition.create",
+                actor_platform=actor_platform,
+                actor_user_id=actor_user_id,
+                access_name=name,
+                details=json.dumps({"spec": spec, "snapshot": sorted(snapshot)}),
+            )
+        return snapshot
+
+    def approve_definition_expansion(
+        self,
+        name: str,
+        *,
+        catalog: Mapping[str, str],
+        actor_platform: str = "",
+        actor_user_id: str = "",
+    ) -> set[str]:
+        """Re-snapshot a definition against the current catalog (reviewed)."""
+        from gateway.acl_catalog import catalog_digest as _digest
+
+        name = _validate_name(name, "definition")
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT spec FROM access_definitions WHERE name=?", (name,)
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"unknown access definition: {name}")
+            snapshot = self._match_definition_spec(str(row["spec"]), catalog)
+            conn.execute(
+                """
+                UPDATE access_definitions
+                SET approved_snapshot=?, catalog_digest=?, approved_at=?
+                WHERE name=?
+                """,
+                (json.dumps(sorted(snapshot)), _digest(catalog), time.time(), name),
+            )
+            self._bump_policy_epoch_conn(conn)
+            self._audit_conn(
+                conn,
+                "definition.approve_expansion",
+                actor_platform=actor_platform,
+                actor_user_id=actor_user_id,
+                access_name=name,
+                details=json.dumps({"snapshot": sorted(snapshot)}),
+            )
+        return snapshot
+
+    def resolve_definition(self, name: str) -> set[str]:
+        """Approved snapshot only - reviewed expansion, never live matching."""
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT approved_snapshot FROM access_definitions WHERE name=?",
+                    (str(name or "").strip().lower(),),
+                ).fetchone()
+            if row is None:
+                return set()
+            return {str(t) for t in json.loads(str(row["approved_snapshot"]) or "[]")}
+        except (sqlite3.Error, ValueError, TypeError):
+            return set()
+
+    def pending_definition_matches(
+        self, name: str, *, catalog: Mapping[str, str]
+    ) -> set[str]:
+        """Current-catalog matches not yet in the approved snapshot."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT spec, approved_snapshot FROM access_definitions WHERE name=?",
+                (str(name or "").strip().lower(),),
+            ).fetchone()
+        if row is None:
+            return set()
+        approved = {str(t) for t in json.loads(str(row["approved_snapshot"]) or "[]")}
+        return self._match_definition_spec(str(row["spec"]), catalog) - approved
+
+    @staticmethod
+    def _match_definition_spec(spec: str, catalog: Mapping[str, str]) -> set[str]:
+        import fnmatch
+
+        return {
+            str(tool)
+            for tool in (catalog or {})
+            if fnmatch.fnmatchcase(str(tool), spec)
+        }
+
     def list_memberships(
         self,
         *,
@@ -1333,7 +1461,11 @@ def resolve_acl(
     allowed_tools: set[str] = set()
     allowed_slash: set[str] = set(DISCOVERY_SLASH_COMMANDS)
 
-    if not groups:
+    subject_access = store.resolve_subject_access(request)
+    # A standalone direct grant is a valid access path (owner decision 4):
+    # admission is denied only when neither memberships nor active
+    # subject grants select this principal.
+    if not groups and not subject_access:
         policy = EffectiveACLPolicy(
             platform=platform,
             user_id=user_id,
@@ -1368,14 +1500,22 @@ def resolve_acl(
                 allowed_slash.add(_slash_name(access_name))
             elif _is_reserved_access(access_name):
                 allowed_tools.update(_catalog_all_runtime(catalog))
+            elif str(access_name).lower().startswith("def:"):
+                allowed_tools.update(
+                    store.resolve_definition(str(access_name).split(":", 1)[1])
+                )
             else:
                 allowed_tools.update(_resolve_access_name(access_name))
 
-    for access_name in sorted(store.resolve_subject_access(request)):
+    for access_name in sorted(subject_access):
         if _is_slash_access(access_name):
             allowed_slash.add(_slash_name(access_name))
         elif _is_reserved_access(access_name):
             allowed_tools.update(_catalog_all_runtime(catalog))
+        elif str(access_name).lower().startswith("def:"):
+            allowed_tools.update(
+                store.resolve_definition(str(access_name).split(":", 1)[1])
+            )
         else:
             allowed_tools.update(_resolve_access_name(access_name))
 
