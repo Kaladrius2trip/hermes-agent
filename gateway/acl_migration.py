@@ -382,3 +382,56 @@ def main(argv: Optional[list[str]] = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+def migrate_reserved_all_grants(store: ACLStore, *, actor: str = "") -> dict[str, Any]:
+    """Convert persisted reserved 'all' group grants to 'all_runtime'.
+
+    'all' no longer live-expands anywhere; stored grants must become the
+    catalog-computed all_runtime instead (owner decision 1 baseline).
+    Idempotent: a second run is a ledger-guarded no-op. Empty stores are
+    a clean no-op without a ledger row.
+    """
+    migration_id = "reserved-all-grants"
+    conn = store._connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        prior = conn.execute(
+            "SELECT 1 FROM migration_ledger WHERE migration_id=? AND phase='copy'",
+            (migration_id,),
+        ).fetchone()
+        if prior is not None:
+            conn.rollback()
+            return {"converted": 0, "already_applied": True}
+        rows = conn.execute(
+            "SELECT id, group_name FROM group_grants WHERE lower(access_name)='all'"
+        ).fetchall()
+        if not rows:
+            conn.rollback()
+            return {"converted": 0, "already_applied": False}
+        for row in rows:
+            conn.execute(
+                "UPDATE group_grants SET access_name='all_runtime' WHERE id=?",
+                (int(row["id"]),),
+            )
+        _write_ledger(
+            conn,
+            migration_id=migration_id,
+            approved_hash=hashlib.sha256(b"reserved-all-grants-v1").hexdigest(),
+            phase="copy",
+            actor=actor,
+            payload={
+                "converted": [
+                    {"id": int(r["id"]), "group_name": str(r["group_name"])}
+                    for r in rows
+                ]
+            },
+        )
+        ACLStore._bump_policy_epoch_conn(conn)
+        conn.commit()
+        return {"converted": len(rows), "already_applied": False}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()

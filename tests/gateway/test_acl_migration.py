@@ -171,3 +171,43 @@ def test_rollback_restores_legacy_and_removes_target(tmp_path):
     assert store.resolve_memberships(_guild_req()) == {"informer"}
     groups_no_guild_rows = store.resolve_memberships(_guild_req(guild_id="g2"))
     assert groups_no_guild_rows == {"informer"}
+
+
+def test_reserved_all_grants_migrate_to_all_runtime(tmp_path):
+    import sqlite3
+
+    from gateway.acl_migration import migrate_reserved_all_grants
+
+    store = ACLStore(tmp_path / "acl.sqlite3")
+    store.grant_group_access("default", "web")
+    con = sqlite3.connect(store.db_path)
+    con.execute(
+        "INSERT INTO group_grants(group_name, access_name, created_at)"
+        " VALUES ('default', 'all', 1.0)"
+    )
+    con.commit()
+    con.close()
+    e0 = store.policy_epoch
+    report = migrate_reserved_all_grants(store, actor="operator")
+    assert report["converted"] == 1
+    assert store.policy_epoch > e0
+    con = sqlite3.connect(store.db_path)
+    rows = sorted(
+        con.execute("select access_name from group_grants where group_name='default'")
+    )
+    assert rows == [("all_runtime",), ("web",)]
+    ledger = con.execute(
+        "select count(*) from migration_ledger where migration_id='reserved-all-grants'"
+    ).fetchone()[0]
+    assert ledger == 1
+    report2 = migrate_reserved_all_grants(store, actor="operator")
+    assert report2["converted"] == 0
+    assert report2["already_applied"] is True
+
+
+def test_reserved_all_migration_noop_on_clean_store(tmp_path):
+    from gateway.acl_migration import migrate_reserved_all_grants
+
+    store = ACLStore(tmp_path / "acl.sqlite3")
+    report = migrate_reserved_all_grants(store, actor="operator")
+    assert report["converted"] == 0
