@@ -91,7 +91,7 @@ def test_store_seeds_team_presets_once_and_resolves_concrete_tools(tmp_path):
     )
     policy = resolve_acl(
         store,
-        ACLRequest(platform="discord", user_id="researcher-user", scope="channel", channel_id="c1"),
+        ACLRequest(platform="discord", user_id="researcher-user", scope="channel", channel_id="c1", guild_id="g1"),
     )
     assert {"read_file", "search_files"} <= policy.allowed_tool_names
     assert {"write_file", "patch"}.isdisjoint(policy.allowed_tool_names)
@@ -320,7 +320,7 @@ def test_resolution_keeps_dm_and_channel_memberships_independent_and_uses_roles(
             role_ids=[],
             scope="channel",
             channel_id="c1",
-        ),
+         guild_id="g1"),
         bootstrap=BootstrapSuperAdmins.empty(),
     )
     assert channel.can_chat is True
@@ -336,7 +336,7 @@ def test_resolution_keeps_dm_and_channel_memberships_independent_and_uses_roles(
             role_ids=[],
             scope="channel",
             channel_id="c9",
-        ),
+         guild_id="g1"),
         bootstrap=BootstrapSuperAdmins.empty(),
     )
     assert other_channel.can_chat is False
@@ -350,7 +350,7 @@ def test_resolution_keeps_dm_and_channel_memberships_independent_and_uses_roles(
             role_ids=["r-dev"],
             scope="channel",
             channel_id="c2",
-        ),
+         guild_id="g1"),
         bootstrap=BootstrapSuperAdmins.empty(),
     )
     assert via_role.can_chat is True
@@ -369,7 +369,7 @@ def test_unknown_user_denied_except_harmless_discovery_commands(tmp_path):
             role_ids=[],
             scope="channel",
             channel_id="c1",
-        ),
+         guild_id="g1"),
         bootstrap=BootstrapSuperAdmins.empty(),
     )
 
@@ -422,7 +422,7 @@ def test_bootstrap_super_admins_include_legacy_allowlists_per_spec(monkeypatch, 
             role_ids=["role1"],
             scope="channel",
             channel_id="c1",
-        ),
+         guild_id="g1"),
         bootstrap=bootstrap,
     )
     assert policy.can_chat is True
@@ -439,7 +439,7 @@ def test_bootstrap_super_admins_include_legacy_allowlists_per_spec(monkeypatch, 
             role_ids=[],
             scope="channel",
             channel_id="c1",
-        ),
+         guild_id="g1"),
         bootstrap=bootstrap,
     )
     # Legacy allowed_users entries are bootstrap super-admins per the spec.
@@ -455,7 +455,7 @@ def test_bootstrap_super_admins_include_legacy_allowlists_per_spec(monkeypatch, 
             role_ids=["role1"],
             scope="channel",
             channel_id="c1",
-        ),
+         guild_id="g1"),
         bootstrap=bootstrap,
     )
     assert role_only.can_chat is False
@@ -476,7 +476,7 @@ def test_channel_resolution_does_not_honor_empty_scope_id_as_wildcard(tmp_path):
 
     policy = resolve_acl(
         store,
-        ACLRequest(platform="discord", user_id="u1", role_ids=[], scope="channel", channel_id="c1"),
+        ACLRequest(platform="discord", user_id="u1", role_ids=[], scope="channel", channel_id="c1", guild_id="g1"),
         bootstrap=BootstrapSuperAdmins.empty(),
     )
 
@@ -504,7 +504,7 @@ def test_channel_scope_resolution_uses_parent_channel_not_thread_id(tmp_path):
             scope="channel",
             channel_id="parent-channel",
             thread_id="thread-123",
-        ),
+         guild_id="g1"),
         bootstrap=BootstrapSuperAdmins.empty(),
     )
 
@@ -534,7 +534,7 @@ def test_group_grants_resolve_toolsets_and_exact_tool_names(tmp_path):
             role_ids=[],
             scope="channel",
             channel_id="c1",
-        ),
+         guild_id="g1"),
         bootstrap=BootstrapSuperAdmins.empty(),
     )
 
@@ -559,7 +559,7 @@ def test_slash_grants_normalize_underscores_like_runtime_commands(tmp_path):
 
     policy = resolve_acl(
         store,
-        ACLRequest(platform="discord", user_id="u1", scope="channel", channel_id="c1"),
+        ACLRequest(platform="discord", user_id="u1", scope="channel", channel_id="c1", guild_id="g1"),
         bootstrap=BootstrapSuperAdmins.empty(),
     )
 

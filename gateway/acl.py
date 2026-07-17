@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import re
 import sqlite3
+import uuid
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -120,6 +121,7 @@ class ACLRequest:
     channel_id: Optional[str] = None
     thread_id: Optional[str] = None
     chat_type: Optional[str] = None
+    guild_id: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -134,6 +136,7 @@ class EffectiveACLPolicy:
     allowed_tool_names: set[str]
     bootstrap_super_admin: bool = False
     denied_reason: Optional[str] = None
+    policy_epoch: int = 0
 
     @property
     def allowed_concrete_tool_names(self) -> set[str]:
@@ -225,6 +228,40 @@ class ACLStore:
                 FOREIGN KEY(group_name) REFERENCES groups(name) ON DELETE CASCADE
             ) STRICT
         """,
+        "scoped_memberships": """
+            CREATE TABLE scoped_memberships (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                platform TEXT NOT NULL CHECK (platform <> ''),
+                subject_type TEXT NOT NULL CHECK (subject_type IN ('user', 'role')),
+                subject_id TEXT NOT NULL CHECK (subject_id <> ''),
+                group_name TEXT NOT NULL CHECK (group_name <> ''),
+                scope TEXT NOT NULL CHECK (scope IN ('global', 'guild')),
+                scope_id TEXT NOT NULL DEFAULT '',
+                created_at REAL NOT NULL,
+                UNIQUE(platform, subject_type, subject_id, group_name, scope, scope_id),
+                CHECK (scope <> 'global' OR (subject_type = 'user' AND scope_id = '')),
+                CHECK (scope <> 'guild' OR (scope_id <> '' AND scope_id <> '*')),
+                FOREIGN KEY(group_name) REFERENCES groups(name) ON DELETE CASCADE
+            ) STRICT
+        """,
+        "acl_meta": """
+            CREATE TABLE acl_meta (
+                key TEXT PRIMARY KEY CHECK (key <> ''),
+                value TEXT NOT NULL
+            ) STRICT
+        """,
+        "migration_ledger": """
+            CREATE TABLE migration_ledger (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                migration_id TEXT NOT NULL CHECK (migration_id <> ''),
+                manifest_hash TEXT NOT NULL CHECK (manifest_hash <> ''),
+                phase TEXT NOT NULL CHECK (phase IN ('copy', 'cleanup', 'rollback')),
+                ts REAL NOT NULL,
+                actor TEXT NOT NULL DEFAULT '',
+                payload TEXT NOT NULL DEFAULT '',
+                UNIQUE(migration_id, phase)
+            ) STRICT
+        """,
         "audit_log": """
             CREATE TABLE audit_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -267,6 +304,13 @@ class ACLStore:
                     (name, now),
                 )
             self._seed_preset_groups(conn, now)
+            conn.execute(
+                "INSERT OR IGNORE INTO acl_meta(key, value) VALUES ('store_id', ?)",
+                (uuid.uuid4().hex,),
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO acl_meta(key, value) VALUES ('policy_epoch', '0')"
+            )
             violations = conn.execute("PRAGMA foreign_key_check").fetchall()
             if violations:
                 raise sqlite3.IntegrityError(f"ACL migration foreign-key violations: {violations}")
@@ -449,6 +493,130 @@ class ACLStore:
                 scope_id=scope_id,
             )
 
+    @property
+    def store_id(self) -> str:
+        with self._connect() as conn:
+            row = conn.execute("SELECT value FROM acl_meta WHERE key='store_id'").fetchone()
+        return str(row["value"]) if row else ""
+
+    @property
+    def policy_epoch(self) -> int:
+        with self._connect() as conn:
+            return self._policy_epoch_conn(conn)
+
+    @staticmethod
+    def _policy_epoch_conn(conn: sqlite3.Connection) -> int:
+        row = conn.execute("SELECT value FROM acl_meta WHERE key='policy_epoch'").fetchone()
+        try:
+            return int(row["value"]) if row else 0
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def _bump_policy_epoch_conn(conn: sqlite3.Connection) -> None:
+        conn.execute(
+            "UPDATE acl_meta SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)"
+            " WHERE key='policy_epoch'"
+        )
+
+    def grant_scoped_membership(
+        self,
+        *,
+        platform: str,
+        subject_type: str,
+        subject_id: str,
+        group_name: str,
+        scope: str,
+        scope_id: Optional[str] = None,
+        actor_platform: str = "",
+        actor_user_id: str = "",
+    ) -> None:
+        platform = _norm_platform(platform)
+        subject_type = _norm_subject_type(subject_type)
+        subject_id = _validate_subject_id(subject_id)
+        group_name = _validate_name(group_name, "group")
+        scope, db_scope_id = _validate_scoped_scope(scope, scope_id, subject_type)
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._ensure_group_conn(conn, group_name)
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO scoped_memberships(
+                    platform, subject_type, subject_id, group_name, scope, scope_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (platform, subject_type, subject_id, group_name, scope, db_scope_id, time.time()),
+            )
+            self._bump_policy_epoch_conn(conn)
+            self._audit_conn(
+                conn,
+                "scoped_membership.grant",
+                platform=platform,
+                actor_platform=actor_platform,
+                actor_user_id=actor_user_id,
+                subject_type=subject_type,
+                subject_id=subject_id,
+                group_name=group_name,
+                scope=scope,
+                scope_id=db_scope_id or None,
+            )
+
+    def revoke_scoped_membership(
+        self,
+        *,
+        platform: str,
+        subject_type: str,
+        subject_id: str,
+        group_name: str,
+        scope: str,
+        scope_id: Optional[str] = None,
+        legacy_rows: Optional[Iterable[Mapping[str, Any]]] = None,
+        actor_platform: str = "",
+        actor_user_id: str = "",
+    ) -> None:
+        platform = _norm_platform(platform)
+        subject_type = _norm_subject_type(subject_type)
+        subject_id = _validate_subject_id(subject_id)
+        group_name = _validate_name(group_name, "group")
+        scope, db_scope_id = _validate_scoped_scope(scope, scope_id, subject_type)
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """
+                DELETE FROM scoped_memberships
+                WHERE platform=? AND subject_type=? AND subject_id=? AND group_name=?
+                  AND scope=? AND scope_id=?
+                """,
+                (platform, subject_type, subject_id, group_name, scope, db_scope_id),
+            )
+            for row in legacy_rows or ():
+                legacy_scope = _norm_scope(str(row.get("scope") or ""))
+                if legacy_scope == "channel":
+                    legacy_scope_id = _norm_scope_id(legacy_scope, row.get("scope_id")) or ""
+                else:
+                    legacy_scope_id = ""
+                conn.execute(
+                    """
+                    DELETE FROM memberships
+                    WHERE platform=? AND subject_type=? AND subject_id=? AND group_name=?
+                      AND scope=? AND scope_id=?
+                    """,
+                    (platform, subject_type, subject_id, group_name, legacy_scope, legacy_scope_id),
+                )
+            self._bump_policy_epoch_conn(conn)
+            self._audit_conn(
+                conn,
+                "scoped_membership.revoke",
+                platform=platform,
+                actor_platform=actor_platform,
+                actor_user_id=actor_user_id,
+                subject_type=subject_type,
+                subject_id=subject_id,
+                group_name=group_name,
+                scope=scope,
+                scope_id=db_scope_id or None,
+            )
+
     def list_memberships(
         self,
         *,
@@ -490,23 +658,55 @@ class ACLStore:
             for row in rows
         ]
 
+    _GUILD_PLATFORMS = frozenset({"discord"})
+
     def resolve_memberships(self, request: ACLRequest) -> set[str]:
+        return self.resolve_memberships_with_epoch(request)[0]
+
+    def resolve_memberships_with_epoch(self, request: ACLRequest) -> tuple[set[str], int]:
         platform = _norm_platform(request.platform)
         user_id = str(request.user_id).strip() if request.user_id is not None else ""
         role_ids = {str(r).strip() for r in (request.role_ids or []) if str(r).strip()}
         scope = _norm_scope(request.scope or request.chat_type or "dm")
         scope_id = _scope_id_from_request(scope, request)
+        guild_id = str(getattr(request, "guild_id", None) or "").strip()
         subjects: list[tuple[str, str]] = []
         if user_id:
             subjects.append(("user", user_id))
         subjects.extend(("role", rid) for rid in sorted(role_ids))
         if not subjects:
-            return set()
+            return set(), self.policy_epoch
         if scope == "channel" and not scope_id:
-            return set()
+            return set(), self.policy_epoch
+        # SECURITY: on guild platforms a channel/thread request without guild
+        # identity is contradictory context and fails closed (handoff P0).
+        if scope == "channel" and platform in self._GUILD_PLATFORMS and not guild_id:
+            return set(), self.policy_epoch
 
         groups: set[str] = set()
         with self._connect() as conn:
+            epoch = self._policy_epoch_conn(conn)
+            if user_id:
+                rows = conn.execute(
+                    """
+                    SELECT group_name FROM scoped_memberships
+                    WHERE platform=? AND subject_type='user' AND subject_id=?
+                      AND scope='global'
+                    """,
+                    (platform, user_id),
+                ).fetchall()
+                groups.update(str(row["group_name"]) for row in rows)
+            if scope == "channel" and guild_id:
+                for subject_type, subject_id in subjects:
+                    rows = conn.execute(
+                        """
+                        SELECT group_name FROM scoped_memberships
+                        WHERE platform=? AND subject_type=? AND subject_id=?
+                          AND scope='guild' AND scope_id=?
+                        """,
+                        (platform, subject_type, subject_id, guild_id),
+                    ).fetchall()
+                    groups.update(str(row["group_name"]) for row in rows)
             for subject_type, subject_id in subjects:
                 if scope == "channel":
                     rows = conn.execute(
@@ -527,7 +727,7 @@ class ACLStore:
                         (platform, subject_type, subject_id, scope),
                     ).fetchall()
                 groups.update(str(row["group_name"]) for row in rows)
-        return groups
+        return groups, epoch
 
     def audit_denial(self, request: ACLRequest, *, reason: str, details: str = "") -> None:
         scope = _norm_scope(request.scope or request.chat_type or "dm")
@@ -636,7 +836,7 @@ def resolve_acl(
     bootstrap = bootstrap or BootstrapSuperAdmins.empty()
     is_bootstrap_admin = bootstrap.is_super_admin(platform, user_id)
 
-    groups = store.resolve_memberships(request)
+    groups, policy_epoch = store.resolve_memberships_with_epoch(request)
     if is_bootstrap_admin:
         groups.add("admin")
 
@@ -655,6 +855,7 @@ def resolve_acl(
             allowed_tool_names=set(),
             bootstrap_super_admin=False,
             denied_reason="no_acl_membership",
+            policy_epoch=policy_epoch,
         )
         try:
             store.audit_denial(request, reason="no_acl_membership")
@@ -689,6 +890,7 @@ def resolve_acl(
         allowed_tool_names=allowed_tools,
         bootstrap_super_admin=is_bootstrap_admin,
         denied_reason=None,
+        policy_epoch=policy_epoch,
     )
 
 
@@ -983,6 +1185,24 @@ def _norm_scope(scope: str) -> str:
     if val in {"channel", "group", "guild", "thread"}:
         return "channel"
     raise ValueError("ACL scope must be 'dm' or 'channel'")
+
+
+def _validate_scoped_scope(
+    scope: str, scope_id: Optional[str], subject_type: str
+) -> tuple[str, str]:
+    value = str(scope or "").strip().lower()
+    if value == "global":
+        if subject_type != "user":
+            raise ValueError("global ACL scope is user-only; role IDs are platform-local")
+        if scope_id not in (None, ""):
+            raise ValueError("global ACL scope takes no scope_id")
+        return "global", ""
+    if value == "guild":
+        sid = str(scope_id or "").strip()
+        if not sid or sid == "*":
+            raise ValueError("guild ACL scope requires an explicit guild scope_id")
+        return "guild", sid
+    raise ValueError("scoped ACL membership scope must be 'global' or 'guild'")
 
 
 def _norm_scope_id(scope: str, scope_id: Optional[str]) -> Optional[str]:

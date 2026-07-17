@@ -12986,6 +12986,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             channel_id=channel_id,
             thread_id=getattr(source, "thread_id", None),
             chat_type=getattr(source, "chat_type", None),
+            guild_id=getattr(source, "guild_id", None),
         )
         return resolve_acl(store, request, bootstrap=bootstrap)
 
