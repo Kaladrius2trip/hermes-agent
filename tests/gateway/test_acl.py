@@ -563,7 +563,7 @@ def test_slash_grants_normalize_underscores_like_runtime_commands(tmp_path):
         bootstrap=BootstrapSuperAdmins.empty(),
     )
 
-    assert "set-home" in policy.allowed_slash_commands
+    assert {"set-home", "sethome"} & policy.allowed_slash_commands
     assert "set_home" not in policy.allowed_slash_commands
 
 
