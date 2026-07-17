@@ -202,7 +202,9 @@ def test_acl_agent_cache_keys_change_with_allowed_tool_names(tmp_path):
 
     assert default_keys["acl.allowed_tool_names"] != admin_keys["acl.allowed_tool_names"]
     assert "terminal" not in default_keys["acl.allowed_tool_names"]
-    assert "terminal" in admin_keys["acl.allowed_tool_names"]
+    # Owner decision 2: operator-class tools left the ordinary admin set.
+    assert "terminal" not in admin_keys["acl.allowed_tool_names"]
+    assert "web_search" in admin_keys["acl.allowed_tool_names"]
 
 
 @pytest.mark.asyncio

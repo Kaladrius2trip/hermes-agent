@@ -1159,6 +1159,7 @@ def resolve_acl(
     request: ACLRequest,
     *,
     bootstrap: Optional[BootstrapSuperAdmins] = None,
+    catalog: Optional[Mapping[str, str]] = None,
 ) -> EffectiveACLPolicy:
     platform = _norm_platform(request.platform)
     scope = _norm_scope(request.scope or request.chat_type or "dm")
@@ -1199,11 +1200,16 @@ def resolve_acl(
             allowed_tools.update(DEFAULT_SAFE_TOOL_NAMES)
             allowed_slash.update(DEFAULT_SAFE_SLASH_COMMANDS)
         elif group == "admin":
-            allowed_tools.update(_resolve_access_name("all"))
+            # SECURITY: ordinary admin gets the catalog-classified
+            # all_runtime set only; missing catalog fails closed
+            # (owner decision 1 baseline + decision 2 operator split).
+            allowed_tools.update(_catalog_all_runtime(catalog))
             allowed_slash.update(ADMIN_EXTRA_SLASH_COMMANDS)
         for access_name in store.list_group_grants(group):
             if _is_slash_access(access_name):
                 allowed_slash.add(_slash_name(access_name))
+            elif _is_reserved_access(access_name):
+                allowed_tools.update(_catalog_all_runtime(catalog))
             else:
                 allowed_tools.update(_resolve_access_name(access_name))
 
@@ -1615,9 +1621,25 @@ def _flatten_group_mapping(raw: Any) -> list[Any]:
     return list(_coerce_id_list(raw))
 
 
+def _is_reserved_access(access_name: str) -> bool:
+    from gateway.acl_catalog import RESERVED_ACCESS_NAMES
+
+    return str(access_name or "").strip().lower() in RESERVED_ACCESS_NAMES
+
+
+def _catalog_all_runtime(catalog: Optional[Mapping[str, str]]) -> frozenset[str]:
+    from gateway.acl_catalog import resolve_all_runtime
+
+    return resolve_all_runtime(catalog)
+
+
 def _resolve_access_name(access_name: str) -> set[str]:
     access = str(access_name or "").strip()
     lower = access.lower()
+    if lower in {"all", "all_runtime"}:
+        # Reserved computed names: never live-expand outside the
+        # catalog-aware resolver path (fail closed everywhere else).
+        return set()
     if lower in {"chat", "safe_chat"}:
         return set(DEFAULT_SAFE_TOOL_NAMES)
     if lower in BUILTIN_ACCESS_CAPABILITIES:

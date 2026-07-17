@@ -12988,7 +12988,43 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             chat_type=getattr(source, "chat_type", None),
             guild_id=getattr(source, "guild_id", None),
         )
-        return resolve_acl(store, request, bootstrap=bootstrap)
+        return resolve_acl(
+            store, request, bootstrap=bootstrap,
+            catalog=self._acl_capability_catalog(),
+        )
+
+    def _acl_capability_catalog(self) -> dict:
+        # SECURITY: wiring-curated capability catalog for the canonical
+        # resolver. Operator-class and control-plane tools are enumerated
+        # explicitly so they never enter the ordinary-admin all_runtime
+        # set (owner decisions 1+2); the rest of the live registry is
+        # runtime_safe for this fork.
+        cached = getattr(self, "_acl_catalog_cache", None)
+        if cached is not None:
+            return cached
+        operator_names = {"terminal", "process", "execute_code", "write_file", "patch"}
+        control_plane_names = {"skill_manage"}
+        catalog: dict = {}
+        try:
+            from toolsets import resolve_toolset
+
+            for name in resolve_toolset("all"):
+                if name in operator_names:
+                    catalog[name] = "operator"
+                elif name in control_plane_names:
+                    catalog[name] = "control_plane"
+                else:
+                    catalog[name] = "runtime_safe"
+            for name in operator_names | control_plane_names:
+                catalog.setdefault(
+                    name,
+                    "operator" if name in operator_names else "control_plane",
+                )
+        except Exception:
+            catalog = {}
+        self._acl_catalog_cache = catalog
+        return catalog
+
 
     def _check_acl_access(
         self,

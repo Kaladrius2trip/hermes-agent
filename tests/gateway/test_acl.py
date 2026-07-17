@@ -424,11 +424,13 @@ def test_bootstrap_super_admins_include_legacy_allowlists_per_spec(monkeypatch, 
             channel_id="c1",
          guild_id="g1"),
         bootstrap=bootstrap,
+        catalog={"web_search": "runtime_safe", "terminal": "operator"},
     )
     assert policy.can_chat is True
     assert policy.bootstrap_super_admin is True
     assert "admin" in policy.groups
-    assert "terminal" in policy.allowed_tool_names
+    assert "web_search" in policy.allowed_tool_names
+    assert "terminal" not in policy.allowed_tool_names
     assert "acl" in policy.allowed_slash_commands
 
     chat_allowlisted = resolve_acl(
