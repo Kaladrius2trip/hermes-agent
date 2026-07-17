@@ -46,7 +46,7 @@ def _step(**kw) -> ACLProposalStep:
     return ACLProposalStep(**base)
 
 
-def _proposal(steps=None, **kw) -> ACLProposal:
+def _proposal(steps=None, store=None, **kw) -> ACLProposal:
     base = dict(
         steps=tuple(steps if steps is not None else [_step()]),
         requester_platform="discord",
@@ -54,6 +54,7 @@ def _proposal(steps=None, **kw) -> ACLProposal:
         session_key="agent:main:discord:dm:owner",
         created_at=NOW,
         expires_at=NOW + 300,
+        policy_epoch=store.policy_epoch if store is not None else None,
     )
     base.update(kw)
     return ACLProposal(**base)
@@ -124,7 +125,7 @@ def test_render_exact_diff():
 
 def test_apply_happy_path(tmp_path):
     store = _store(tmp_path)
-    proposal = _proposal([
+    proposal = _proposal(store=store, steps=[
         _step(),
         _step(op="grant_scoped_membership", scope="guild", scope_id="g1"),
     ])
@@ -146,7 +147,7 @@ def test_apply_happy_path(tmp_path):
 
 def test_apply_rejects_expired(tmp_path):
     store = _store(tmp_path)
-    proposal = _proposal(expires_at=NOW - 1)
+    proposal = _proposal(store=store, expires_at=NOW - 1)
     with pytest.raises(PlannerError):
         apply_proposal(store, proposal, digest=proposal_digest(proposal),
                        actor_platform="discord", actor_user_id="owner", now=NOW)
@@ -154,7 +155,7 @@ def test_apply_rejects_expired(tmp_path):
 
 def test_apply_rejects_digest_mismatch(tmp_path):
     store = _store(tmp_path)
-    proposal = _proposal()
+    proposal = _proposal(store=store)
     with pytest.raises(PlannerError):
         apply_proposal(store, proposal, digest="0" * 64,
                        actor_platform="discord", actor_user_id="owner", now=NOW)
@@ -162,7 +163,7 @@ def test_apply_rejects_digest_mismatch(tmp_path):
 
 def test_apply_rejects_foreign_actor(tmp_path):
     store = _store(tmp_path)
-    proposal = _proposal()
+    proposal = _proposal(store=store)
     with pytest.raises(PlannerError):
         apply_proposal(store, proposal, digest=proposal_digest(proposal),
                        actor_platform="discord", actor_user_id="mallory", now=NOW)
@@ -173,7 +174,7 @@ def test_apply_rejects_foreign_actor(tmp_path):
 
 def test_apply_is_transactional(tmp_path):
     store = _store(tmp_path)
-    proposal = _proposal([
+    proposal = _proposal(store=store, steps=[
         _step(),
         _step(op="revoke_group_access", group_name="ghost_group",
               subject_type=None, subject_id=None, scope=None, scope_id=None,
@@ -190,7 +191,7 @@ def test_apply_audits_before_and_after(tmp_path):
     import sqlite3
 
     store = _store(tmp_path)
-    proposal = _proposal()
+    proposal = _proposal(store=store)
     apply_proposal(store, proposal, digest=proposal_digest(proposal),
                    actor_platform="discord", actor_user_id="owner", now=NOW)
     con = sqlite3.connect(store.db_path)

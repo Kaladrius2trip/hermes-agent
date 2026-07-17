@@ -60,6 +60,7 @@ class ACLProposal:
     session_key: str
     created_at: float
     expires_at: float
+    policy_epoch: Optional[int] = None
 
 
 def _normalized_step(step: ACLProposalStep) -> dict[str, Any]:
@@ -100,13 +101,40 @@ def _normalized_steps(proposal: ACLProposal) -> list[dict[str, Any]]:
 
 
 def proposal_digest(proposal: ACLProposal) -> str:
-    canon = json.dumps(_normalized_steps(proposal), sort_keys=True, separators=(",", ":"))
+    canon = json.dumps(
+        {
+            "steps": _normalized_steps(proposal),
+            "requester_platform": str(proposal.requester_platform or ""),
+            "requester_user_id": str(proposal.requester_user_id or ""),
+            "session_key": str(proposal.session_key or ""),
+            "expires_at": float(proposal.expires_at or 0),
+            "policy_epoch": proposal.policy_epoch,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     return hashlib.sha256(canon.encode("utf-8")).hexdigest()
 
 
 def validate_proposal(store: ACLStore, proposal: ACLProposal) -> list[dict[str, Any]]:
     """Deterministically validate every step; unknown semantics fail closed."""
     steps = _normalized_steps(proposal)
+    # SECURITY: the rendered diff must equal the applied diff - membership
+    # grants may only target groups that exist or are created by an earlier
+    # step of this same proposal (no implicit creation at apply time).
+    known_groups = {
+        str(row["name"])
+        for row in store._connect().execute("SELECT name FROM groups").fetchall()
+    }
+    for step in steps:
+        if step["op"] == "create_group":
+            known_groups.add(step["group_name"])
+        elif step["op"].startswith("grant") and "membership" in step["op"]:
+            if step["group_name"] not in known_groups:
+                raise PlannerError(
+                    f"group does not exist and is not created by this proposal: "
+                    f"{step['group_name']}"
+                )
     if not str(proposal.requester_platform or "").strip():
         raise PlannerError("proposal missing requester_platform")
     if not str(proposal.requester_user_id or "").strip():
@@ -170,10 +198,6 @@ def _apply_step_conn(conn: sqlite3.Connection, step: Mapping[str, Any], now: flo
     table = "scoped_memberships" if step["op"] in _SCOPED_OPS else "memberships"
     if op.startswith("grant"):
         conn.execute(
-            "INSERT OR IGNORE INTO groups(name, builtin, created_at) VALUES (?, 0, ?)",
-            (step["group_name"], now),
-        )
-        conn.execute(
             f"""
             INSERT OR IGNORE INTO {table}(
                 platform, subject_type, subject_id, group_name, scope, scope_id, created_at
@@ -221,10 +245,20 @@ def apply_proposal(
         raise PlannerError("confirmation actor does not match the proposal requester")
     if proposal_digest(proposal) != str(digest or ""):
         raise PlannerError("proposal digest mismatch; re-render and re-confirm")
+    if proposal.policy_epoch is None or int(proposal.policy_epoch) != store.policy_epoch:
+        raise PlannerError("policy changed since this proposal was rendered; re-render")
 
     conn = store._connect()
     try:
         conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute(
+                "INSERT INTO applied_proposals(digest, applied_at, actor_platform, actor_user_id)"
+                " VALUES (?, ?, ?, ?)",
+                (str(digest), moment, str(actor_platform or ""), str(actor_user_id or "")),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise PlannerError("proposal confirmation already used") from exc
         store._audit_conn(
             conn,
             "proposal.apply.begin",
