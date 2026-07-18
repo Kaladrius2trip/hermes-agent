@@ -12994,16 +12994,65 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
 
     def _acl_capability_catalog(self) -> dict:
-        # SECURITY: wiring-curated capability catalog for the canonical
-        # resolver. Operator-class and control-plane tools are enumerated
-        # explicitly so they never enter the ordinary-admin all_runtime
-        # set (owner decisions 1+2); the rest of the live registry is
-        # runtime_safe for this fork.
+        # SECURITY: positive classification. New tools stay unclassified until
+        # explicitly reviewed; side-effecting and durable-control tools never
+        # enter ordinary-admin all_runtime by default (owner decisions 1+2).
+        # Fail closed to an empty catalog so admin loses all_runtime on error.
+        try:
+            from tools.registry import registry as tool_registry
+
+            generation = int(getattr(tool_registry, "_generation", 0))
+        except Exception:
+            generation = None
         cached = getattr(self, "_acl_catalog_cache", None)
-        if cached is not None:
-            return cached
-        operator_names = {"terminal", "process", "execute_code", "write_file", "patch"}
-        control_plane_names = {"skill_manage"}
+        if (
+            generation is not None
+            and isinstance(cached, tuple)
+            and len(cached) == 2
+            and cached[0] == generation
+        ):
+            return cached[1]
+        runtime_safe_names = {
+            "browser_get_images", "browser_snapshot", "browser_vision",
+            "clarify", "feishu_doc_read", "feishu_drive_list_comment_replies",
+            "feishu_drive_list_comments", "forgejo_get_issue",
+            "forgejo_get_pull_request", "forgejo_get_pull_request_diff",
+            "forgejo_get_release", "forgejo_get_repo", "forgejo_list_branches",
+            "forgejo_list_commits", "forgejo_list_issue_comments",
+            "forgejo_list_issues", "forgejo_list_pull_requests",
+            "forgejo_list_pull_review_comments", "forgejo_list_pull_reviews",
+            "forgejo_list_releases", "forgejo_list_repos", "forgejo_list_statuses",
+            "ha_get_state", "ha_list_entities", "ha_list_services", "image_generate",
+            "jenkins_find_latest_unsuccessful_build", "jenkins_get_build",
+            "jenkins_get_build_log", "jenkins_get_job", "jenkins_get_job_parameters",
+            "jenkins_get_last_build", "jenkins_get_pipeline_job_config",
+            "jenkins_get_queue_item", "jenkins_list_jobs", "jenkins_search_build_log",
+            "jenkins_validate_build_parameters", "jenkins_validate_pipeline_job_update",
+            "kanban_list", "kanban_show", "project_list", "read_file", "read_terminal",
+            "search_files", "session_search", "skill_view", "skills_list",
+            "spotify_devices", "spotify_search", "text_to_speech", "todo",
+            "video_analyze", "video_generate", "vision_analyze", "web_extract",
+            "web_search", "x_search", "xai_video_edit", "xai_video_extend",
+            "yb_query_group_info", "yb_query_group_members", "yb_search_sticker",
+        }
+        operator_names = {
+            "browser_back", "browser_cdp", "browser_click", "browser_console",
+            "browser_dialog", "browser_navigate", "browser_press", "browser_scroll",
+            "browser_type", "close_terminal", "computer_use", "delegate_task",
+            "discord", "discord_admin", "execute_code", "feishu_drive_add_comment",
+            "feishu_drive_reply_comment", "forgejo_create_issue_comment",
+            "forgejo_submit_pull_review", "ha_call_service",
+            "jenkins_trigger_build_with_parameters", "jenkins_update_pipeline_job",
+            "kanban_block", "kanban_comment", "kanban_complete", "kanban_create",
+            "kanban_heartbeat", "kanban_link", "kanban_unblock", "patch", "process",
+            "spotify_albums", "spotify_library", "spotify_playback",
+            "spotify_playlists", "spotify_queue", "terminal", "write_file",
+            "yb_send_dm", "yb_send_sticker",
+        }
+        control_plane_names = {
+            "cronjob", "identify", "memory", "project_create", "project_switch",
+            "skill_manage",
+        }
         catalog: dict = {}
         try:
             from toolsets import resolve_toolset
@@ -13013,16 +13062,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     catalog[name] = "operator"
                 elif name in control_plane_names:
                     catalog[name] = "control_plane"
-                else:
+                elif name in runtime_safe_names:
                     catalog[name] = "runtime_safe"
-            for name in operator_names | control_plane_names:
+                else:
+                    catalog[name] = "unclassified"
+            for name in runtime_safe_names | operator_names | control_plane_names:
                 catalog.setdefault(
                     name,
-                    "operator" if name in operator_names else "control_plane",
+                    "runtime_safe" if name in runtime_safe_names else (
+                        "operator" if name in operator_names else "control_plane"
+                    ),
                 )
         except Exception:
-            catalog = {}
-        self._acl_catalog_cache = catalog
+            return {}
+        if generation is not None:
+            self._acl_catalog_cache = (generation, catalog)
         return catalog
 
 
@@ -13187,6 +13241,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             channel_id=self._acl_channel_id_for_source(source),
             scope=self._acl_scope_for_source(source),
             thread_id=getattr(source, "thread_id", None),
+            guild_id=getattr(source, "guild_id", None),
         )
 
     def _format_acl_command_target(self, command) -> str:
@@ -13307,6 +13362,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             command = parse_acl_command(event.text or "/acl show", self._acl_command_context_for_source(source))
         except ValueError as exc:
             return f"Usage error: {exc}"
+
+        if (
+            command.action in {"grant_membership", "revoke_membership"}
+            and str(platform).lower() == "discord"
+            and getattr(command, "scope", None) not in {"global", "guild"}
+        ):
+            # SECURITY: Discord memberships are global-user or guild-scoped only
+            # (channel/dm approximated global and caused duplicate-row drift).
+            # Reject obsolete scopes up front, not after the user confirms.
+            return (
+                "Usage error: Discord ACL writes require global user or guild "
+                "user/role scope (use 'in global' or 'in this guild')."
+            )
 
         if command.action == "show":
             if getattr(command, "subject_id", None):

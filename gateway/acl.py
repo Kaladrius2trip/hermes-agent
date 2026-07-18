@@ -2232,7 +2232,12 @@ def _validate_access_name(access_name: str) -> str:
 
 
 def _reject_unwired_access_name(access_name: str) -> str:
-    if access_name in UNWIRED_ACCESS_NAMES:
+    # SECURITY: an unwired capability must be rejected in every grantable form,
+    # including the tool: selector (tool:whisper), not just the bare name.
+    probe = str(access_name).strip().lower()
+    if probe.startswith("tool:"):
+        probe = probe.split(":", 1)[1].strip()
+    if probe in UNWIRED_ACCESS_NAMES:
         raise ValueError(f"ACL access {access_name!r} is unavailable until dispatch wiring exists")
     return access_name
 
@@ -2296,7 +2301,13 @@ def _resolve_access_name(access_name: str) -> set[str]:
     if lower in BUILTIN_ACCESS_CAPABILITIES:
         return set(BUILTIN_ACCESS_CAPABILITIES[lower])
     if lower.startswith("tool:"):
-        return {access.split(":", 1)[1]}
+        tool = access.split(":", 1)[1]
+        # SECURITY: fail closed if a stored grant references an unwired
+        # capability through the tool: selector (defense in depth vs the
+        # grant-time reject in _reject_unwired_access_name).
+        if tool.strip().lower() in UNWIRED_ACCESS_NAMES:
+            return set()
+        return {tool}
     if lower.startswith("toolset:"):
         return _resolve_toolset(access.split(":", 1)[1])
     resolved = _resolve_toolset(access)

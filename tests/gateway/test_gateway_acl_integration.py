@@ -268,7 +268,7 @@ async def test_acl_command_requires_bootstrap_admin_and_requester_bound_confirma
     runner = _runner(tmp_path, bootstrap_users={"owner"})
     owner = _source("owner")
     stranger_event = MessageEvent(
-        text="/acl grant <@u1> default in global",
+        text="/acl grant <@u1> default in this guild",
         message_type=MessageType.TEXT,
         source=_source("stranger"),
     )
@@ -277,7 +277,7 @@ async def test_acl_command_requires_bootstrap_admin_and_requester_bound_confirma
     assert "bootstrap super-admin" in denied
 
     event = MessageEvent(
-        text="/acl grant <@u1> default in global",
+        text="/acl grant <@u1> default in this guild",
         message_type=MessageType.TEXT,
         source=owner,
     )
@@ -314,7 +314,7 @@ async def test_acl_command_requires_bootstrap_admin_and_requester_bound_confirma
         platform="discord", subject_type="user", subject_id="u1"
     )
     assert [(m.group_name, m.scope, m.scope_id) for m in memberships] == [
-        ("default", "global", None)
+        ("default", "guild", "g1")
     ]
 
 
@@ -646,7 +646,7 @@ async def test_gateway_text_approve_for_acl_confirm_is_requester_bound(tmp_path)
 
     prompt = await runner._handle_acl_command(
         MessageEvent(
-            text="/acl grant <@u1> default in global",
+            text="/acl grant <@u1> default in this guild",
             message_type=MessageType.TEXT,
             source=owner_source,
         )

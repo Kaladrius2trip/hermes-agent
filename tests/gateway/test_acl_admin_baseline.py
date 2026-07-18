@@ -80,3 +80,57 @@ def test_reserved_all_never_live_expands(tmp_path):
         store, _req(user_id="u1"), bootstrap=BootstrapSuperAdmins.empty(),
     )
     assert policy_none.allowed_tool_names == set()
+
+
+def test_gateway_catalog_uses_positive_classification(monkeypatch):
+    """Unknown and side-effecting tools must never enter all_runtime by default."""
+    import toolsets
+    from gateway.run import GatewayRunner
+
+    monkeypatch.setattr(
+        toolsets,
+        "resolve_toolset",
+        lambda _name: {
+            "web_search",
+            "jenkins_trigger_build_with_parameters",
+            "memory",
+            "brand_new_tool",
+        },
+    )
+    runner = object.__new__(GatewayRunner)
+    catalog = runner._acl_capability_catalog()
+
+    assert catalog["web_search"] == "runtime_safe"
+    assert catalog["jenkins_trigger_build_with_parameters"] == "operator"
+    assert catalog["memory"] == "control_plane"
+    assert catalog["brand_new_tool"] == "unclassified"
+
+
+def test_gateway_catalog_refreshes_on_registry_generation(monkeypatch):
+    import toolsets
+    from gateway.run import GatewayRunner
+    from tools.registry import registry
+
+    names = {"web_search"}
+    monkeypatch.setattr(toolsets, "resolve_toolset", lambda _name: set(names))
+    runner = object.__new__(GatewayRunner)
+    first = runner._acl_capability_catalog()
+    names.add("brand_new_tool")
+    monkeypatch.setattr(registry, "_generation", registry._generation + 1)
+    second = runner._acl_capability_catalog()
+    assert "brand_new_tool" not in first
+    assert second["brand_new_tool"] == "unclassified"
+
+
+def test_gateway_catalog_excludes_dangerous_tools():
+    """Regression: durable/side-effecting tools never classify runtime_safe."""
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    catalog = runner._acl_capability_catalog()
+    for name in (
+        "terminal", "execute_code", "computer_use", "delegate_task",
+        "cronjob", "memory", "discord_admin", "kanban_create", "identify",
+        "write_file", "patch", "skill_manage",
+    ):
+        assert catalog.get(name) != "runtime_safe", name

@@ -762,3 +762,17 @@ def test_admin_group_includes_session_slash_commands():
     assert "model" not in ADMIN_EXTRA_SLASH_COMMANDS
     assert "steer" not in ADMIN_EXTRA_SLASH_COMMANDS
     assert "acl" not in ADMIN_EXTRA_SLASH_COMMANDS
+
+
+def test_unwired_capability_rejected_including_tool_prefix(tmp_path):
+    """whisper/scheduler_user are unwired: neither bare nor tool: form grantable, and resolve fails closed."""
+    import pytest
+
+    from gateway.acl import ACLStore, _resolve_access_name
+
+    store = ACLStore(tmp_path / "acl.sqlite3")
+    for name in ("whisper", "tool:whisper", "scheduler_user", "tool:scheduler_user"):
+        with pytest.raises(ValueError):
+            store.grant_group_access("wg", name)
+    assert _resolve_access_name("tool:whisper") == set()
+    assert _resolve_access_name("tool:scheduler_user") == set()
